@@ -17,6 +17,7 @@ from repo_rivet.config import AppConfig, ConfigurationError, load_config
 from repo_rivet.context.manager import ContextManager
 from repo_rivet.llm.openai_compatible import OpenAICompatibleClient
 from repo_rivet.memory.budget_manager import TokenBudgetConfig, TokenBudgetManager
+from repo_rivet.memory.compactor import ConversationCompactor
 from repo_rivet.memory.models import MemoryConfig, MemoryState
 from repo_rivet.memory.store import MemoryStore
 from repo_rivet.memory.token_calibrator import TokenCalibrationStore
@@ -163,6 +164,7 @@ def _chat_agent(
             console,
             prompt_reader,
             initial_task=initial_task or None,
+            memory_store=runtime.store,
         )
         runtime.store.save_state(runtime.memory, status=runtime.memory.status)
         return exit_code
@@ -273,6 +275,7 @@ def _chat_loop(
     prompt_reader: PromptReader,
     *,
     initial_task: str | None = None,
+    memory_store: MemoryStore | None = None,
 ) -> int:
     pending_task = initial_task
 
@@ -292,7 +295,9 @@ def _chat_loop(
         if not request:
             continue
         if request.startswith("/"):
-            should_exit = _handle_chat_command(request, memory, console)
+            should_exit, memory_changed = _handle_chat_command(request, memory, console)
+            if memory_changed and memory_store is not None:
+                memory_store.save_state(memory, status=memory.status)
             if should_exit:
                 return 0
             continue
@@ -305,19 +310,21 @@ def _handle_chat_command(
     command: str,
     memory: MemoryState,
     console: Console,
-) -> bool:
+) -> tuple[bool, bool]:
     normalized = command.lower()
     if normalized in {"/exit", "/quit"}:
         console.print("Conversation ended.")
-        return True
+        return True, False
     if normalized == "/help":
         console.print(
             "/help     Show commands\n"
             "/history  Show remembered conversation\n"
             "/clear    Clear remembered conversation\n"
+            "/compact  Compress recent conversation safely\n"
+            "/compact aggressive  Keep a smaller recent window\n"
             "/exit     End interactive mode"
         )
-        return False
+        return False, False
     if normalized == "/history":
         if memory.fixed is None and not memory.messages:
             console.print("No conversation history.")
@@ -331,13 +338,39 @@ def _handle_chat_command(
                     continue
                 label = "You" if message.role == "user" else "RepoRivet"
                 console.print(f"[bold]{label}:[/bold] {message.content}")
-        return False
+        return False, False
     if normalized == "/clear":
         memory.clear_recent_conversation()
         console.print("Recent conversation cleared; fixed task and structured state preserved.")
-        return False
+        return False, True
+    if normalized in {"/compact", "/compact aggressive"}:
+        before_messages = len(memory.messages)
+        before_characters = sum(len(message.content or "") for message in memory.messages)
+        recovery_level = 2 if normalized.endswith(" aggressive") else 1
+        removed = ConversationCompactor().compact(
+            memory,
+            aggressive=True,
+            recovery_level=recovery_level,
+        )
+        after_characters = sum(len(message.content or "") for message in memory.messages)
+        reduced_characters = before_characters - after_characters
+        if removed or reduced_characters:
+            console.print(
+                "Manual compaction complete: "
+                f"removed {removed} messages, reduced {reduced_characters} characters, "
+                f"and kept {len(memory.messages)} recent messages. "
+                "Fixed task and structured memory were preserved."
+            )
+            return False, True
+        console.print(
+            f"No eligible recent history to compact ({before_messages} messages retained)."
+        )
+        return False, False
+    if normalized.startswith("/compact"):
+        console.print("Usage: /compact or /compact aggressive")
+        return False, False
     console.print(f"Unknown command: {command}. Type /help for commands.")
-    return False
+    return False, False
 
 
 def _print_result(console: Console, result: AgentResult) -> None:

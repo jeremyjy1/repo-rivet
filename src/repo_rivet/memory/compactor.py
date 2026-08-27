@@ -59,20 +59,24 @@ class ConversationCompactor:
             return 0
 
         memory.messages = new_messages
+        shrunken = 0
         if recovery_level >= 2:
-            self._shrink_current_tool_results(memory)
-        if removed > 0:
+            shrunken = self._shrink_current_tool_results(memory)
+        if removed > 0 or shrunken > 0:
             memory.compaction_count += 1
         return removed
 
     @staticmethod
-    def _shrink_current_tool_results(memory: MemoryState) -> None:
+    def _shrink_current_tool_results(memory: MemoryState) -> int:
         limit = max(500, memory.config.max_tool_output_chars // 4)
+        shrunken = 0
         for message in memory.messages:
             if message.role == "tool" and message.content and len(message.content) > limit:
                 marker = "\n... aggressively truncated after context overflow ...\n"
                 side = max(1, (limit - len(marker)) // 2)
                 message.content = f"{message.content[:side]}{marker}{message.content[-side:]}"
+                shrunken += 1
+        return shrunken
 
 
 def group_messages(messages: list[Message]) -> list[TurnGroup]:

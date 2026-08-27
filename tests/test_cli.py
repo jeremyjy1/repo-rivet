@@ -6,7 +6,8 @@ from rich.console import Console
 from repo_rivet.agent.controller import AgentResult
 from repo_rivet.cli import _chat_loop, build_parser, cli
 from repo_rivet.memory.context_manager import SYSTEM_PROMPT
-from repo_rivet.memory.models import MemoryState, Message
+from repo_rivet.memory.models import MemoryConfig, MemoryState, Message
+from repo_rivet.memory.store import MemoryStore
 
 
 class FakeConversationAgent:
@@ -134,3 +135,74 @@ def test_chat_loop_history_and_help_commands_do_not_call_agent() -> None:
     assert "Original task: task" in output
     assert "RepoRivet: completed task" in output
     assert "/clear" in output
+    assert "/compact" in output
+
+
+def test_chat_manual_aggressive_compaction_preserves_tool_group_and_saves_state(
+    tmp_path: Path,
+) -> None:
+    store = MemoryStore.create(tmp_path / "sessions")
+    memory = MemoryState(
+        session_id=store.session_id,
+        config=MemoryConfig(recent_message_limit=10),
+    )
+    for index in range(20):
+        memory.messages.append(Message(role="assistant", content=f"old {index}"))
+    memory.messages.extend(
+        [
+            Message(
+                role="assistant",
+                tool_calls=[
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "run_command", "arguments": "{}"},
+                    }
+                ],
+            ),
+            Message(role="tool", tool_call_id="call-1", content="x" * 10_000),
+        ]
+    )
+    inputs = iter(["/compact aggressive", "/exit"])
+    buffer = StringIO()
+    console = Console(file=buffer, force_terminal=False, color_system=None)
+
+    exit_code = _chat_loop(
+        FakeConversationAgent(),
+        memory,
+        console,
+        lambda _: next(inputs),
+        memory_store=store,
+    )
+    restored = store.load_state()
+
+    assert exit_code == 0
+    assert restored.compaction_count == 1
+    assert len(restored.messages) == 2
+    assert restored.messages[0].tool_calls
+    assert restored.messages[1].tool_call_id == "call-1"
+    assert "aggressively truncated" in (restored.messages[1].content or "")
+    assert "Manual compaction complete" in buffer.getvalue()
+
+
+def test_chat_manual_compaction_reduces_recent_window() -> None:
+    memory = MemoryState(
+        session_id="manual-compact",
+        config=MemoryConfig(recent_message_limit=10),
+    )
+    for index in range(8):
+        memory.messages.append(Message(role="assistant", content=f"recent {index}"))
+    inputs = iter(["/compact", "/exit"])
+    buffer = StringIO()
+    console = Console(file=buffer, force_terminal=False, color_system=None)
+
+    _chat_loop(
+        FakeConversationAgent(),
+        memory,
+        console,
+        lambda _: next(inputs),
+    )
+
+    assert len(memory.messages) == 5
+    assert memory.messages[0].content == "recent 3"
+    assert memory.compaction_count == 1
