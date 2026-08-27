@@ -2,5 +2,18 @@
 api_key = "replace-with-your-api-key"
 base_url = "https://api.openai.com/v1"
 model = "replace-with-model-name"
+context_window_tokens = 128000
+max_output_tokens = 4096
+# Optional optimization; unavailable or unknown encodings fall back to conservative estimation.
+# tokenizer_encoding = "o200k_base"
 timeout_seconds = 60
 max_retries = 3
+
+[token]
+reserved_tool_result_tokens = 2048
+safety_margin_ratio = 0.15
+soft_limit_ratio = 0.70
+hard_limit_ratio = 0.85
+default_correction_factor = 1.25
+calibration_window = 20
+max_context_overflow_retries = 2

@@ -7,6 +7,10 @@ from typing import Any, Protocol
 from repo_rivet.tools.base import ToolCall
 
 
+class ModelContextLengthError(RuntimeError):
+    """A provider rejected the request because its context was too large."""
+
+
 @dataclass(frozen=True, slots=True)
 class ModelResponse:
     """A normalized response returned by any model adapter."""
@@ -14,6 +18,8 @@ class ModelResponse:
     content: str | None = None
     tool_calls: list[ToolCall] = field(default_factory=list)
     finish_reason: str | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
 
     def as_assistant_message(self) -> dict[str, Any]:
         """Serialize the normalized response into conversation history."""

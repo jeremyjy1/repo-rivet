@@ -19,6 +19,7 @@ class SessionState:
     messages: list[dict[str, Any]] = field(default_factory=list)
     step_count: int = 0
     tool_call_count: int = 0
+    initial_tool_call_count: int = 0
     modified_files: set[str] = field(default_factory=set)
     last_change_step: int | None = None
     last_verification_step: int | None = None

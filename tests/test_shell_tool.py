@@ -4,7 +4,7 @@ from pathlib import Path
 
 from repo_rivet.safety.command_policy import CommandPolicy
 from repo_rivet.safety.path_policy import WorkspacePathPolicy
-from repo_rivet.tools.shell import RunCommandTool
+from repo_rivet.tools.shell import RunCommandTool, _truncate_lines
 
 
 def create_tool(workspace: Path) -> RunCommandTool:
@@ -49,3 +49,16 @@ def test_run_command_rejects_cwd_escape(tmp_path: Path) -> None:
 
     assert not result.ok
     assert "escapes workspace" in (result.error or "")
+
+
+def test_long_output_keeps_exact_head_and_error_tail() -> None:
+    lines = [f"line-{index}" for index in range(250)]
+
+    output, truncated = _truncate_lines("\n".join(lines))
+    kept = output.splitlines()
+
+    assert truncated
+    assert kept[:80] == lines[:80]
+    assert kept[80] == "... (50 lines omitted) ..."
+    assert kept[81:] == lines[-120:]
+    assert kept[-1] == "line-249"

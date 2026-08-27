@@ -69,3 +69,12 @@ def test_read_file_rejects_binary_content(tmp_path: Path) -> None:
 
     assert not result.ok
     assert "Binary files" in (result.error or "")
+
+
+def test_read_file_rejects_sensitive_configuration(tmp_path: Path) -> None:
+    (tmp_path / ".env").write_text("API_KEY=secret", encoding="utf-8")
+
+    result = ReadFileTool(WorkspacePathPolicy(tmp_path)).execute({"path": ".env"})
+
+    assert not result.ok
+    assert "Sensitive configuration" in (result.error or "")

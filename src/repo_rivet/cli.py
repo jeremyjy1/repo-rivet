@@ -2,20 +2,53 @@
 
 import argparse
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 from rich.console import Console
 from rich.panel import Panel
+from rich.prompt import Prompt
 
 from repo_rivet import __version__
 from repo_rivet.agent.controller import AgentController, AgentResult
 from repo_rivet.agent.termination import TerminationConfig, TerminationPolicy
-from repo_rivet.config import ConfigurationError, load_config
+from repo_rivet.config import AppConfig, ConfigurationError, load_config
 from repo_rivet.context.manager import ContextManager
 from repo_rivet.llm.openai_compatible import OpenAICompatibleClient
+from repo_rivet.memory.budget_manager import TokenBudgetConfig, TokenBudgetManager
+from repo_rivet.memory.models import MemoryConfig, MemoryState
+from repo_rivet.memory.store import MemoryStore
+from repo_rivet.memory.token_calibrator import TokenCalibrationStore
+from repo_rivet.memory.token_estimator import create_token_estimator
 from repo_rivet.safety.path_policy import PathPolicyError
-from repo_rivet.storage.event_logger import create_session_logger
-from repo_rivet.tools.registry import create_default_registry
+from repo_rivet.tools.registry import ToolRegistry, create_default_registry
+
+
+class PromptReader(Protocol):
+    def __call__(self, prompt: str) -> str:
+        """Read one line of interactive input."""
+        ...
+
+
+class ConversationAgent(Protocol):
+    def run(
+        self,
+        task: str,
+        *,
+        memory: MemoryState | None = None,
+    ) -> AgentResult:
+        """Run one task with optional prior conversation."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class Runtime:
+    config: AppConfig
+    registry: ToolRegistry
+    store: MemoryStore
+    memory: MemoryState
+    controller: AgentController
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -29,35 +62,60 @@ def build_parser() -> argparse.ArgumentParser:
 
     run_parser = subparsers.add_parser("run", help="Run the coding agent")
     run_parser.add_argument("task", nargs="+", help="Programming task for the agent")
-    run_parser.add_argument(
+    _add_runtime_arguments(run_parser)
+
+    chat_parser = subparsers.add_parser("chat", help="Start an interactive coding conversation")
+    chat_parser.add_argument(
+        "initial_task",
+        nargs="*",
+        help="Optional first request before the interactive prompt",
+    )
+    _add_runtime_arguments(chat_parser)
+    return parser
+
+
+def _add_runtime_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
         "--workspace",
         type=Path,
         default=Path.cwd(),
         help="Target workspace (default: current directory)",
     )
-    run_parser.add_argument(
+    parser.add_argument(
         "--config",
         type=Path,
         default=Path("reporivet.toml"),
         help="Local API configuration file (default: reporivet.toml)",
     )
-    run_parser.add_argument("--max-steps", type=int, default=30)
-    run_parser.add_argument("--max-seconds", type=float, default=600)
-    run_parser.add_argument(
+    parser.add_argument("--max-steps", type=int, default=30)
+    parser.add_argument("--max-seconds", type=float, default=600)
+    parser.add_argument(
         "--log-dir",
         type=Path,
         default=Path(".reporivet/sessions"),
         help="Ignored directory for JSONL session logs",
     )
-    return parser
+    parser.add_argument(
+        "--resume",
+        type=Path,
+        help="Resume memory from an existing session directory",
+    )
 
 
-def cli(argv: Sequence[str] | None = None, *, console: Console | None = None) -> int:
+def cli(
+    argv: Sequence[str] | None = None,
+    *,
+    console: Console | None = None,
+    prompt_reader: PromptReader | None = None,
+) -> int:
     """Run the CLI and return a process exit code."""
     output = console or Console()
     arguments = build_parser().parse_args(argv)
     if arguments.command == "run":
         return _run_agent(arguments, output)
+    if arguments.command == "chat":
+        reader = prompt_reader or (lambda prompt: Prompt.ask(prompt, console=output))
+        return _chat_agent(arguments, output, reader)
     output.print("[red]Unknown command.[/red]")
     return 2
 
@@ -69,42 +127,217 @@ def _run_agent(arguments: argparse.Namespace, console: Console) -> int:
         return 2
 
     try:
-        termination = TerminationConfig(
-            max_steps=arguments.max_steps,
-            max_seconds=arguments.max_seconds,
-        )
-        config = load_config(arguments.config)
-        registry = create_default_registry(arguments.workspace)
-        logger = create_session_logger(
-            arguments.log_dir,
-            secrets=(config.api.api_key.get_secret_value(),),
-        )
-        controller = AgentController(
-            model_client=OpenAICompatibleClient(config.api),
-            tool_registry=registry,
-            context_manager=ContextManager(),
-            termination_policy=TerminationPolicy(termination),
-            event_logger=logger,
-        )
+        runtime = _build_runtime(arguments)
     except (ConfigurationError, PathPolicyError, OSError, ValueError) as error:
         console.print(f"[bold red]Configuration error:[/bold red] {error}")
         return 2
 
-    console.print(
-        Panel.fit(
-            f"Workspace: {arguments.workspace.resolve()}\n"
-            f"Model: {config.api.model}\n"
-            f"Session log: {logger.path}",
-            title="RepoRivet",
-        )
-    )
+    _print_runtime(console, arguments.workspace, runtime)
     try:
-        result = controller.run(task)
+        result = runtime.controller.run(task, memory=runtime.memory)
     except OSError as error:
         console.print(f"[bold red]Runtime error:[/bold red] {error}")
         return 1
     _print_result(console, result)
     return 0 if result.status == "success" else 1
+
+
+def _chat_agent(
+    arguments: argparse.Namespace,
+    console: Console,
+    prompt_reader: PromptReader,
+) -> int:
+    try:
+        runtime = _build_runtime(arguments)
+    except (ConfigurationError, PathPolicyError, OSError, ValueError) as error:
+        console.print(f"[bold red]Configuration error:[/bold red] {error}")
+        return 2
+
+    _print_runtime(console, arguments.workspace, runtime)
+    console.print("Interactive mode. Type [bold]/help[/bold] for commands.")
+    initial_task = " ".join(arguments.initial_task).strip()
+    try:
+        exit_code = _chat_loop(
+            runtime.controller,
+            runtime.memory,
+            console,
+            prompt_reader,
+            initial_task=initial_task or None,
+        )
+        runtime.store.save_state(runtime.memory, status=runtime.memory.status)
+        return exit_code
+    except OSError as error:
+        console.print(f"[bold red]Runtime error:[/bold red] {error}")
+        return 1
+
+
+def _build_runtime(arguments: argparse.Namespace) -> Runtime:
+    termination = TerminationConfig(
+        max_steps=arguments.max_steps,
+        max_seconds=arguments.max_seconds,
+    )
+    config = load_config(arguments.config)
+    memory_config = _memory_config(
+        config,
+    )
+    token_budget_config = _token_budget_config(memory_config)
+    estimator = create_token_estimator(
+        model=config.api.model,
+        tokenizer_encoding=config.api.tokenizer_encoding,
+    )
+    calibration_store = TokenCalibrationStore(arguments.log_dir.parent / "token-calibration.json")
+    token_manager = TokenBudgetManager(
+        estimator=estimator,
+        config=token_budget_config,
+        calibration_store=calibration_store,
+        base_url=str(config.api.base_url),
+        model=config.api.model,
+    )
+    registry = create_default_registry(arguments.workspace)
+    secrets = (config.api.api_key.get_secret_value(),)
+    if arguments.resume:
+        store = MemoryStore(arguments.resume, secrets=secrets)
+        memory = store.load_state()
+        memory.config = memory_config
+        changed_files = store.validate_workspace(memory, arguments.workspace)
+        if changed_files:
+            store.log("external_files_changed", paths=changed_files)
+    else:
+        store = MemoryStore.create(arguments.log_dir, secrets=secrets)
+        memory = MemoryState(session_id=store.session_id, config=memory_config)
+    controller = AgentController(
+        model_client=OpenAICompatibleClient(config.api),
+        tool_registry=registry,
+        context_manager=ContextManager(token_manager=token_manager),
+        termination_policy=TerminationPolicy(termination),
+        event_logger=store,
+        memory_store=store,
+    )
+    return Runtime(
+        config=config,
+        registry=registry,
+        store=store,
+        memory=memory,
+        controller=controller,
+    )
+
+
+def _memory_config(config: AppConfig) -> MemoryConfig:
+    return MemoryConfig(
+        max_context_tokens=config.api.context_window_tokens,
+        reserved_output_tokens=config.api.max_output_tokens,
+        reserved_tool_result_tokens=config.token.reserved_tool_result_tokens,
+        safety_margin_ratio=config.token.safety_margin_ratio,
+        compaction_threshold=config.token.soft_limit_ratio,
+        hard_limit_threshold=config.token.hard_limit_ratio,
+        default_correction_factor=config.token.default_correction_factor,
+        calibration_window=config.token.calibration_window,
+        max_context_overflow_retries=config.token.max_context_overflow_retries,
+    )
+
+
+def _token_budget_config(memory_config: MemoryConfig) -> TokenBudgetConfig:
+    return TokenBudgetConfig(
+        context_limit=memory_config.max_context_tokens,
+        reserved_output_tokens=memory_config.reserved_output_tokens,
+        reserved_tool_result_tokens=memory_config.reserved_tool_result_tokens,
+        safety_margin_ratio=memory_config.safety_margin_ratio,
+        soft_limit_ratio=memory_config.compaction_threshold,
+        hard_limit_ratio=memory_config.hard_limit_threshold,
+        default_correction_factor=memory_config.default_correction_factor,
+        calibration_window=memory_config.calibration_window,
+        max_context_overflow_retries=memory_config.max_context_overflow_retries,
+    )
+
+
+def _print_runtime(console: Console, workspace: Path, runtime: Runtime) -> None:
+    console.print(
+        Panel.fit(
+            f"Workspace: {workspace.resolve()}\n"
+            f"Model: {runtime.config.api.model}\n"
+            f"Context window: {runtime.config.api.context_window_tokens} tokens\n"
+            f"Maximum output: {runtime.config.api.max_output_tokens} tokens\n"
+            f"Token estimator: {runtime.controller.context_manager.token_manager.name}\n"
+            f"Safe prompt budget: "
+            f"{runtime.controller.context_manager.token_manager.config.prompt_budget} tokens\n"
+            f"Session: {runtime.store.session_dir}",
+            title="RepoRivet",
+        )
+    )
+
+
+def _chat_loop(
+    agent: ConversationAgent,
+    memory: MemoryState,
+    console: Console,
+    prompt_reader: PromptReader,
+    *,
+    initial_task: str | None = None,
+) -> int:
+    pending_task = initial_task
+
+    while True:
+        if pending_task is not None:
+            user_input = pending_task
+            pending_task = None
+            console.print(f"[bold cyan]You:[/bold cyan] {user_input}")
+        else:
+            try:
+                user_input = prompt_reader("[bold cyan]You[/bold cyan]")
+            except (EOFError, KeyboardInterrupt):
+                console.print("\nConversation ended.")
+                return 0
+
+        request = user_input.strip()
+        if not request:
+            continue
+        if request.startswith("/"):
+            should_exit = _handle_chat_command(request, memory, console)
+            if should_exit:
+                return 0
+            continue
+
+        result = agent.run(request, memory=memory)
+        _print_result(console, result)
+
+
+def _handle_chat_command(
+    command: str,
+    memory: MemoryState,
+    console: Console,
+) -> bool:
+    normalized = command.lower()
+    if normalized in {"/exit", "/quit"}:
+        console.print("Conversation ended.")
+        return True
+    if normalized == "/help":
+        console.print(
+            "/help     Show commands\n"
+            "/history  Show remembered conversation\n"
+            "/clear    Clear remembered conversation\n"
+            "/exit     End interactive mode"
+        )
+        return False
+    if normalized == "/history":
+        if memory.fixed is None and not memory.messages:
+            console.print("No conversation history.")
+        else:
+            if memory.fixed is not None:
+                console.print(f"[bold]Original task:[/bold] {memory.fixed.original_task}")
+            for update in memory.task_updates:
+                console.print(f"[bold]Task update:[/bold] {update}")
+            for message in memory.messages:
+                if message.role not in {"user", "assistant"} or not message.content:
+                    continue
+                label = "You" if message.role == "user" else "RepoRivet"
+                console.print(f"[bold]{label}:[/bold] {message.content}")
+        return False
+    if normalized == "/clear":
+        memory.clear_recent_conversation()
+        console.print("Recent conversation cleared; fixed task and structured state preserved.")
+        return False
+    console.print(f"Unknown command: {command}. Type /help for commands.")
+    return False
 
 
 def _print_result(console: Console, result: AgentResult) -> None:

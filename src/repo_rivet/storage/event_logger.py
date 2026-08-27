@@ -49,6 +49,10 @@ class EventLogger:
             json.dump(event, log_file, ensure_ascii=False, default=str)
             log_file.write("\n")
 
+    def sanitize(self, value: Any) -> Any:
+        """Return a redacted value suitable for local persistence."""
+        return self._sanitize(value)
+
     def _sanitize(self, value: Any, *, key: str = "") -> Any:
         normalized_key = key.lower()
         if any(part in normalized_key for part in _SENSITIVE_KEY_PARTS):

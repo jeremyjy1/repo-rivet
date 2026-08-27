@@ -62,6 +62,7 @@ def run_process(argv: tuple[str, ...], *, cwd: Path, timeout_seconds: float) -> 
 
     duration_seconds = time.monotonic() - started_at
     output, truncated = _format_output(process.returncode, stdout, stderr)
+    raw_output = _format_raw_output(process.returncode, stdout, stderr)
     metadata = {
         "exit_code": process.returncode,
         "duration_seconds": round(duration_seconds, 3),
@@ -74,8 +75,9 @@ def run_process(argv: tuple[str, ...], *, cwd: Path, timeout_seconds: float) -> 
             output=output,
             error=f"Command timed out after {timeout_seconds:g} seconds",
             metadata=metadata,
+            raw_output=raw_output,
         )
-    return ToolResult(ok=True, output=output, metadata=metadata)
+    return ToolResult(ok=True, output=output, metadata=metadata, raw_output=raw_output)
 
 
 def _kill_process(process: subprocess.Popen[str]) -> None:
@@ -104,5 +106,14 @@ def _truncate_lines(output: str) -> tuple[str, bool]:
     if len(lines) <= MAX_OUTPUT_LINES:
         return "\n".join(lines), False
     omitted = len(lines) - MAX_OUTPUT_LINES
-    kept = [*lines[:100], f"... ({omitted} lines omitted) ...", *lines[-100:]]
+    kept = [*lines[:80], f"... ({omitted} lines omitted) ...", *lines[-120:]]
     return "\n".join(kept), True
+
+
+def _format_raw_output(exit_code: int | None, stdout: str, stderr: str) -> str:
+    sections = [f"Exit code: {exit_code}"]
+    if stdout:
+        sections.extend(("STDOUT:", stdout.rstrip("\n")))
+    if stderr:
+        sections.extend(("STDERR:", stderr.rstrip("\n")))
+    return "\n".join(sections)

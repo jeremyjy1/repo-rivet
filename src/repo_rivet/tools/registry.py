@@ -21,8 +21,14 @@ from repo_rivet.tools.shell import RunCommandTool
 class ToolRegistry:
     """Own the available tools and dispatch validated model calls."""
 
-    def __init__(self, tools: Iterable[BaseTool[Any]] = ()) -> None:
+    def __init__(
+        self,
+        tools: Iterable[BaseTool[Any]] = (),
+        *,
+        workspace: Path | None = None,
+    ) -> None:
         self._tools: dict[str, BaseTool[Any]] = {}
+        self.workspace = workspace
         for tool in tools:
             self.register(tool)
 
@@ -66,5 +72,6 @@ def create_default_registry(workspace: str | Path) -> ToolRegistry:
             ReplaceTextTool(path_policy),
             RunCommandTool(path_policy, command_policy),
             GitDiffTool(path_policy),
-        ]
+        ],
+        workspace=path_policy.workspace,
     )

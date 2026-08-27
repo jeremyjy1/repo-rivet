@@ -2,11 +2,20 @@ from typing import cast
 
 from repo_rivet.agent.controller import AgentController
 from repo_rivet.agent.termination import TerminationConfig, TerminationPolicy
-from repo_rivet.llm.base import ModelResponse
+from repo_rivet.llm.base import ModelContextLengthError, ModelResponse
 from repo_rivet.llm.parser import ResponseParseError
+from repo_rivet.memory.models import MemoryState, Message
 from repo_rivet.tools.base import ToolCall, ToolResult
 from repo_rivet.tools.registry import ToolRegistry
 from tests.fakes import FakeModelClient, FakeToolRegistry
+
+
+class RecordingSink:
+    def __init__(self) -> None:
+        self.events: list[tuple[str, dict[str, object]]] = []
+
+    def log(self, event_type: str, **data: object) -> None:
+        self.events.append((event_type, data))
 
 
 def call(call_id: str, name: str, arguments: dict) -> ToolCall:  # type: ignore[type-arg]
@@ -18,11 +27,13 @@ def controller(
     tools: FakeToolRegistry,
     *,
     termination: TerminationPolicy | None = None,
+    event_logger: RecordingSink | None = None,
 ) -> AgentController:
     return AgentController(
         model_client=model,
         tool_registry=cast(ToolRegistry, tools),
         termination_policy=termination,
+        event_logger=event_logger,
     )
 
 
@@ -103,3 +114,71 @@ def test_agent_returns_error_after_model_client_retries_fail() -> None:
 
     assert result.status == "error"
     assert result.reason == "model API failed after retries: RuntimeError"
+
+
+def test_agent_passes_prior_conversation_to_context() -> None:
+    model = FakeModelClient(
+        [ModelResponse(content="First result."), ModelResponse(content="Continued.")]
+    )
+    tools = FakeToolRegistry([])
+    memory = MemoryState(session_id="test-session")
+
+    controller(model, tools).run("first request", memory=memory)
+    result = controller(model, tools).run("continue", memory=memory)
+
+    assert result.status == "success"
+    contents = [message.get("content") for message in model.requests[1]["messages"]]
+    task_spec = next(str(content) for content in contents if "Original task" in str(content))
+    assert "first request" in task_spec
+    assert "continue" in task_spec
+    assert any("First result." in str(content) for content in contents)
+
+
+def test_agent_prefers_provider_usage_for_persistent_token_totals() -> None:
+    model = FakeModelClient([ModelResponse(content="Done.", input_tokens=321, output_tokens=12)])
+    tools = FakeToolRegistry([])
+    memory = MemoryState(session_id="test-session")
+    events = RecordingSink()
+
+    result = controller(model, tools, event_logger=events).run("task", memory=memory)
+
+    assert result.status == "success"
+    assert memory.total_input_tokens == 321
+    assert memory.total_output_tokens == 12
+    usage = next(data for event, data in events.events if event == "model_usage")
+    assert usage["actual_prompt_tokens"] == 321
+    assert usage["completion_tokens"] == 12
+    assert usage["raw_estimated_prompt_tokens"]
+
+
+def test_agent_compacts_and_retries_after_provider_context_overflow() -> None:
+    model = FakeModelClient(
+        [
+            ModelContextLengthError("too long"),
+            ModelResponse(content="Recovered.", input_tokens=200, output_tokens=10),
+        ]
+    )
+    tools = FakeToolRegistry([])
+    memory = MemoryState(session_id="test-session")
+    for index in range(20):
+        memory.messages.append(Message(role="assistant", content=f"old {index}"))
+
+    result = controller(model, tools).run("task", memory=memory)
+
+    assert result.status == "success"
+    assert len(model.requests) == 2
+    assert memory.context_overflow_count == 1
+    assert memory.compaction_count >= 1
+
+
+def test_agent_stops_after_bounded_context_overflow_retries() -> None:
+    model = FakeModelClient([ModelContextLengthError("too long")] * 3)
+    tools = FakeToolRegistry([])
+    memory = MemoryState(session_id="test-session")
+
+    result = controller(model, tools).run("task", memory=memory)
+
+    assert result.status == "stopped"
+    assert "after 2 compression retries" in (result.reason or "")
+    assert len(model.requests) == 3
+    assert memory.context_overflow_count == 3

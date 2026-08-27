@@ -1,5 +1,6 @@
 """Workspace-confined file listing, search, read, and edit tools."""
 
+import hashlib
 import re
 from pathlib import Path
 from typing import ClassVar
@@ -11,11 +12,13 @@ from repo_rivet.tools.base import BaseTool, ToolArguments, ToolResult
 
 MAX_TEXT_FILE_BYTES = 1_000_000
 MAX_READ_LINES = 300
+MAX_READ_CHARS = 20_000
 MAX_SEARCH_MATCHES = 200
 MAX_LIST_ENTRIES = 1_000
 _EXCLUDED_DIRECTORY_NAMES = frozenset(
     {".git", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".venv", "__pycache__"}
 )
+_SENSITIVE_FILE_NAMES = frozenset({".npmrc", ".pypirc", "reporivet.toml"})
 
 
 class ListFilesArguments(ToolArguments):
@@ -175,6 +178,8 @@ class SearchTextTool(WorkspaceTool):
                 continue
             if any(part in _EXCLUDED_DIRECTORY_NAMES for part in relative.parts):
                 continue
+            if _is_sensitive_path(relative.as_posix()):
+                continue
             try:
                 resolved = self.path_policy.resolve(relative)
             except PathPolicyError:
@@ -189,6 +194,8 @@ class ReadFileTool(WorkspaceTool):
     arguments_type = ReadFileArguments
 
     def run(self, arguments: ReadFileArguments) -> ToolResult:
+        if _is_sensitive_path(arguments.path):
+            raise ValueError(f"Sensitive configuration files cannot be read: {arguments.path}")
         file_path = self.path_policy.resolve(arguments.path)
         content = _read_text(file_path)
         lines = content.splitlines()
@@ -202,15 +209,22 @@ class ReadFileTool(WorkspaceTool):
             f"{line_number:>6} | {line}"
             for line_number, line in enumerate(selected, start=arguments.start_line)
         )
+        chars_truncated = len(output) > MAX_READ_CHARS
+        if chars_truncated:
+            output = f"{output[:MAX_READ_CHARS]}\n... output truncated by character limit ..."
+        sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
         return ToolResult(
             ok=True,
             output=output,
             metadata={
+                "path": arguments.path,
+                "sha256": sha256,
                 "total_lines": len(lines),
                 "start_line": arguments.start_line,
                 "end_line": actual_end,
-                "truncated": actual_end < len(lines),
+                "truncated": actual_end < len(lines) or chars_truncated,
             },
+            raw_output=content,
         )
 
 
@@ -222,6 +236,8 @@ class WriteFileTool(WorkspaceTool):
     arguments_type = WriteFileArguments
 
     def run(self, arguments: WriteFileArguments) -> ToolResult:
+        if _is_sensitive_path(arguments.path):
+            raise ValueError(f"Sensitive configuration files cannot be written: {arguments.path}")
         encoded_content = arguments.content.encode("utf-8")
         if len(encoded_content) > MAX_TEXT_FILE_BYTES:
             raise ValueError(f"Content exceeds {MAX_TEXT_FILE_BYTES} bytes")
@@ -235,6 +251,7 @@ class WriteFileTool(WorkspaceTool):
 
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text(arguments.content, encoding="utf-8")
+        sha256 = hashlib.sha256(encoded_content).hexdigest()
         return ToolResult(
             ok=True,
             output=f"Wrote {len(encoded_content)} bytes to {arguments.path}",
@@ -242,7 +259,9 @@ class WriteFileTool(WorkspaceTool):
                 "path": arguments.path,
                 "bytes": len(encoded_content),
                 "created": not existed,
+                "sha256": sha256,
             },
+            raw_output=arguments.content,
         )
 
 
@@ -252,6 +271,8 @@ class ReplaceTextTool(WorkspaceTool):
     arguments_type = ReplaceTextArguments
 
     def run(self, arguments: ReplaceTextArguments) -> ToolResult:
+        if _is_sensitive_path(arguments.path):
+            raise ValueError(f"Sensitive configuration files cannot be modified: {arguments.path}")
         file_path = self.path_policy.resolve(arguments.path)
         content = _read_text(file_path)
         actual_count = content.count(arguments.old_text)
@@ -266,10 +287,12 @@ class ReplaceTextTool(WorkspaceTool):
         if len(encoded_content) > MAX_TEXT_FILE_BYTES:
             raise ValueError(f"Updated content exceeds {MAX_TEXT_FILE_BYTES} bytes")
         file_path.write_text(updated, encoding="utf-8")
+        sha256 = hashlib.sha256(encoded_content).hexdigest()
         return ToolResult(
             ok=True,
             output=f"Replaced {actual_count} occurrence(s) in {arguments.path}",
-            metadata={"path": arguments.path, "replacements": actual_count},
+            metadata={"path": arguments.path, "replacements": actual_count, "sha256": sha256},
+            raw_output=updated,
         )
 
 
@@ -285,3 +308,8 @@ def _read_text(file_path: Path) -> str:
     if b"\x00" in data:
         raise ValueError(f"Binary files are not supported: {file_path.name}")
     return data.decode("utf-8")
+
+
+def _is_sensitive_path(path: str) -> bool:
+    name = Path(path).name.lower()
+    return name in _SENSITIVE_FILE_NAMES or name == ".env" or name.startswith(".env.")

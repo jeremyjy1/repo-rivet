@@ -60,4 +60,6 @@ class GitDiffTool(BaseTool[GitDiffArguments]):
                 "unstaged": unstaged.metadata,
                 "staged": staged.metadata,
             },
+            raw_output=f"UNSTAGED:\n{unstaged.raw_output or unstaged.output}\n\n"
+            f"STAGED:\n{staged.raw_output or staged.output}",
         )

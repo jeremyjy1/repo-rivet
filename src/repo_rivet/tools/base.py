@@ -25,6 +25,7 @@ class ToolResult:
     output: str
     error: str | None = None
     metadata: dict[str, Any] | None = None
+    raw_output: str | None = None
 
     def as_tool_message(self, tool_call_id: str) -> dict[str, Any]:
         """Serialize this result for a Chat Completions tool message."""
