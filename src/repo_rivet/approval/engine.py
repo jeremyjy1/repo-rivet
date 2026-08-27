@@ -22,8 +22,7 @@ from repo_rivet.approval.risk_analyzer import RiskAnalyzer
 
 
 class EventSink(Protocol):
-    def log(self, event_type: str, **data: Any) -> None:
-        ...
+    def log(self, event_type: str, **data: Any) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,9 +83,7 @@ class ApprovalEngine:
         if fixed is None:
             return
         prefix = "Current approval mode:"
-        fixed.safety_rules[:] = [
-            rule for rule in fixed.safety_rules if not rule.startswith(prefix)
-        ]
+        fixed.safety_rules[:] = [rule for rule in fixed.safety_rules if not rule.startswith(prefix)]
         if self.mode == ApprovalMode.READ_ONLY:
             fixed.safety_rules.append(
                 "Current approval mode: read-only. Only typed, workspace-confined file "

@@ -31,9 +31,7 @@ class RiskAnalyzer:
     def assess(self, request: ApprovalRequest) -> RiskAssessment:
         capabilities = set(request.declared_capabilities)
         reasons: list[str] = []
-        affected_paths = list(
-            request.normalized_arguments.get("_resolved_paths", {}).values()
-        )
+        affected_paths = list(request.normalized_arguments.get("_resolved_paths", {}).values())
         outside_paths = request.normalized_arguments.get("_outside_workspace_paths", [])
         if outside_paths:
             capabilities.add(Capability.OUTSIDE_WORKSPACE)
@@ -56,10 +54,7 @@ class RiskAnalyzer:
             or Capability.DEVICE_ACCESS in capabilities
         ):
             level = RiskLevel.CRITICAL
-        elif (
-            Capability.OUTSIDE_WORKSPACE in capabilities
-            or Capability.SECRET_READ in capabilities
-        ):
+        elif Capability.OUTSIDE_WORKSPACE in capabilities or Capability.SECRET_READ in capabilities:
             level = max(level, RiskLevel.HIGH)
 
         if not reasons:

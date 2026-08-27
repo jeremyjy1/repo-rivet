@@ -345,9 +345,7 @@ def test_read_only_mode_allows_typed_reads_and_denies_writes_and_commands(
     engine, _ = create_engine(tmp_path, mode=ApprovalMode.READ_ONLY)
     registry = create_default_registry(tmp_path, approval_engine=engine)
 
-    read = registry.execute(
-        ToolCall(id="read-1", name="read_file", arguments={"path": "main.py"})
-    )
+    read = registry.execute(ToolCall(id="read-1", name="read_file", arguments={"path": "main.py"}))
     write = registry.execute(
         ToolCall(
             id="write-1",

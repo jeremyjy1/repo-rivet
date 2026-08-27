@@ -74,9 +74,7 @@ class ToolRegistry:
             decision = outcome.decision
             if decision.action != ApprovalAction.ALLOW:
                 error_code = (
-                    "hard_policy_denied"
-                    if decision.source == "hard_policy"
-                    else "approval_denied"
+                    "hard_policy_denied" if decision.source == "hard_policy" else "approval_denied"
                 )
                 return ToolResult(
                     ok=False,

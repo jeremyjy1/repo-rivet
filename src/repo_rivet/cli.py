@@ -293,9 +293,7 @@ def _build_approval_engine(
     prompt_reader: PromptReader | None,
 ) -> ApprovalEngine:
     mode = ApprovalMode(
-        arguments.approval_mode
-        or memory.approval_mode_override
-        or config.approval.mode
+        arguments.approval_mode or memory.approval_mode_override or config.approval.mode
     )
     interactive = arguments.command == "chat" or prompt_reader is not None or sys.stdin.isatty()
     human_approver = (
