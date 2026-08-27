@@ -35,6 +35,16 @@ class CommandPolicy:
 
     def validate(self, command: str) -> tuple[str, ...]:
         """Return a shell-free argv tuple when the command passes policy checks."""
+        arguments = self.parse(command)
+        executable = Path(arguments[0]).name.lower()
+        if executable in self._BLOCKED_EXECUTABLES or executable.startswith("mkfs"):
+            raise CommandPolicyError(f"Blocked executable: {executable}")
+        if executable == "git":
+            self._validate_git(list(arguments))
+        return arguments
+
+    def parse(self, command: str) -> tuple[str, ...]:
+        """Reject shell syntax and return canonical argv before approval analysis."""
         if not command.strip():
             raise CommandPolicyError("Command must not be empty")
         if len(command) > self._max_command_length:
@@ -53,15 +63,10 @@ class CommandPolicy:
             raise CommandPolicyError("Shell operators are not supported")
 
         executable = Path(arguments[0]).name.lower()
-        if executable in self._BLOCKED_EXECUTABLES or executable.startswith("mkfs"):
-            raise CommandPolicyError(f"Blocked executable: {executable}")
         if executable in self._SHELL_EXECUTABLES and self._uses_command_string(
             executable, arguments
         ):
             raise CommandPolicyError(f"Shell command strings are not allowed: {executable}")
-        if executable == "git":
-            self._validate_git(arguments)
-
         return tuple(arguments)
 
     @staticmethod

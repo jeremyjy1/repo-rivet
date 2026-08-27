@@ -17,3 +17,23 @@ hard_limit_ratio = 0.85
 default_correction_factor = 1.25
 calibration_window = 20
 max_context_overflow_retries = 2
+
+[approval]
+mode = "safe-auto"
+non_interactive = "deny"
+approval_timeout_seconds = 120
+remember_session_approvals = true
+remember_session_denials = true
+
+[approval.llm]
+enabled = true
+# model = "approval-model"
+max_auto_approve_risk = "medium"
+minimum_confidence = 0.90
+timeout_seconds = 10
+
+[approval.safety]
+deny_outside_workspace_write = true
+deny_privilege_escalation = true
+deny_secret_access = true
+deny_device_access = true

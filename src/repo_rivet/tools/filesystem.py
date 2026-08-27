@@ -7,6 +7,7 @@ from typing import ClassVar
 
 from pydantic import Field, model_validator
 
+from repo_rivet.approval.models import Capability
 from repo_rivet.safety.path_policy import PathPolicyError, WorkspacePathPolicy
 from repo_rivet.tools.base import BaseTool, ToolArguments, ToolResult
 
@@ -74,6 +75,7 @@ class ListFilesTool(WorkspaceTool):
     name = "list_files"
     description = "List files and directories inside the workspace to a limited depth."
     arguments_type = ListFilesArguments
+    capabilities = frozenset({Capability.FILESYSTEM_READ})
 
     def run(self, arguments: ListFilesArguments) -> ToolResult:
         root = self.path_policy.resolve(arguments.path)
@@ -124,6 +126,7 @@ class SearchTextTool(WorkspaceTool):
     name = "search_text"
     description = "Search text files in the workspace using a literal string or regular expression."
     arguments_type = SearchTextArguments
+    capabilities = frozenset({Capability.FILESYSTEM_READ})
 
     def run(self, arguments: SearchTextArguments) -> ToolResult:
         root = self.path_policy.resolve(arguments.path)
@@ -192,6 +195,7 @@ class ReadFileTool(WorkspaceTool):
     name = "read_file"
     description = "Read up to 300 numbered lines from a UTF-8 text file in the workspace."
     arguments_type = ReadFileArguments
+    capabilities = frozenset({Capability.FILESYSTEM_READ})
 
     def run(self, arguments: ReadFileArguments) -> ToolResult:
         if _is_sensitive_path(arguments.path):
@@ -234,6 +238,7 @@ class WriteFileTool(WorkspaceTool):
         "Create a UTF-8 text file, or overwrite one only when overwrite is explicitly true."
     )
     arguments_type = WriteFileArguments
+    capabilities = frozenset({Capability.FILESYSTEM_WRITE})
 
     def run(self, arguments: WriteFileArguments) -> ToolResult:
         if _is_sensitive_path(arguments.path):
@@ -269,6 +274,7 @@ class ReplaceTextTool(WorkspaceTool):
     name = "replace_text"
     description = "Replace exact text only when its occurrence count matches expected_count."
     arguments_type = ReplaceTextArguments
+    capabilities = frozenset({Capability.FILESYSTEM_READ, Capability.FILESYSTEM_WRITE})
 
     def run(self, arguments: ReplaceTextArguments) -> ToolResult:
         if _is_sensitive_path(arguments.path):

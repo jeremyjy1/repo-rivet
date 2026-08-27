@@ -1,5 +1,6 @@
 """Read-only Git inspection tools."""
 
+from repo_rivet.approval.models import Capability
 from repo_rivet.safety.path_policy import WorkspacePathPolicy
 from repo_rivet.tools.base import BaseTool, ToolArguments, ToolResult
 from repo_rivet.tools.shell import run_process
@@ -13,6 +14,7 @@ class GitDiffTool(BaseTool[GitDiffArguments]):
     name = "git_diff"
     description = "Show unstaged and staged Git changes for a workspace path."
     arguments_type = GitDiffArguments
+    capabilities = frozenset({Capability.FILESYSTEM_READ})
 
     def __init__(self, path_policy: WorkspacePathPolicy) -> None:
         self.path_policy = path_policy

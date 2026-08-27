@@ -82,6 +82,7 @@ class AgentController:
             safety_rules=[
                 "All file operations must stay inside the configured workspace.",
                 "Commands run without a shell and obvious destructive commands are blocked.",
+                "Denied tool requests must not be repeated unchanged.",
                 "Never expose API keys, tokens, passwords, or local configuration contents.",
             ],
             completion_rules=[
@@ -196,10 +197,20 @@ class AgentController:
                             name=call.name,
                             ok=result.ok,
                             error=result.error,
+                            error_code=result.error_code,
+                            retryable=result.retryable,
                             metadata=result.metadata,
                             output_ref=output_ref,
                         )
                         self._save_memory(memory, state, status="running")
+
+                        if result.metadata and result.metadata.get("approval_abort"):
+                            return self._finish(
+                                state,
+                                memory,
+                                status="stopped",
+                                reason="agent aborted by user during tool approval",
+                            )
 
                         reason = self.termination_policy.check(state)
                         if reason:

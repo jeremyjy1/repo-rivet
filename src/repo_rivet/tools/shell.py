@@ -8,6 +8,7 @@ from pathlib import Path
 
 from pydantic import Field
 
+from repo_rivet.approval.models import Capability
 from repo_rivet.safety.command_policy import CommandPolicy
 from repo_rivet.safety.path_policy import WorkspacePathPolicy
 from repo_rivet.tools.base import BaseTool, ToolArguments, ToolResult
@@ -25,10 +26,30 @@ class RunCommandTool(BaseTool[RunCommandArguments]):
     name = "run_command"
     description = "Run one shell-free command in the workspace with a timeout."
     arguments_type = RunCommandArguments
+    capabilities = frozenset({Capability.PROCESS_EXECUTE})
 
     def __init__(self, path_policy: WorkspacePathPolicy, command_policy: CommandPolicy) -> None:
         self.path_policy = path_policy
         self.command_policy = command_policy
+
+    def validate_arguments(
+        self,
+        arguments: dict[str, object],
+    ) -> RunCommandArguments | ToolResult:
+        validated = super().validate_arguments(arguments)
+        if isinstance(validated, ToolResult):
+            return validated
+        try:
+            self.command_policy.parse(validated.command)
+        except ValueError as error:
+            return ToolResult(
+                ok=False,
+                output="",
+                error=str(error),
+                error_code="invalid_command",
+                retryable=False,
+            )
+        return validated
 
     def run(self, arguments: RunCommandArguments) -> ToolResult:
         argv = self.command_policy.validate(arguments.command)

@@ -1,5 +1,6 @@
 """Load and validate RepoRivet's local configuration."""
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,8 @@ from pydantic import (
     model_validator,
 )
 from pydantic.functional_validators import field_validator
+
+from repo_rivet.approval.models import ApprovalMode, NonInteractivePolicy
 
 DEFAULT_CONFIG_PATH = Path("reporivet.toml")
 _API_KEY_PLACEHOLDER = "replace-with-your-api-key"
@@ -89,6 +92,51 @@ class TokenConfig(BaseModel):
         return self
 
 
+class ApprovalLLMConfig(BaseModel):
+    """Independent reviewer limits; its decision can never bypass hard policy."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    enabled: bool = True
+    model: str | None = Field(default=None, min_length=1)
+    max_auto_approve_risk: str = "medium"
+    minimum_confidence: float = Field(default=0.90, ge=0, le=1)
+    timeout_seconds: float = Field(default=10, gt=0, le=120)
+
+    @field_validator("max_auto_approve_risk")
+    @classmethod
+    def validate_max_risk(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"safe", "low", "medium"}:
+            raise ValueError("must be safe, low, or medium")
+        return normalized
+
+
+class ApprovalSafetyConfig(BaseModel):
+    """Non-overridable safety switches for all approval modes."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    deny_outside_workspace_write: bool = True
+    deny_privilege_escalation: bool = True
+    deny_secret_access: bool = True
+    deny_device_access: bool = True
+
+
+class ApprovalConfig(BaseModel):
+    """Tool approval mode, persistence, and fallback policy."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    mode: ApprovalMode = ApprovalMode.SAFE_AUTO
+    non_interactive: NonInteractivePolicy = NonInteractivePolicy.DENY
+    approval_timeout_seconds: float = Field(default=120, gt=0, le=3_600)
+    remember_session_approvals: bool = True
+    remember_session_denials: bool = True
+    llm: ApprovalLLMConfig = Field(default_factory=ApprovalLLMConfig)
+    safety: ApprovalSafetyConfig = Field(default_factory=ApprovalSafetyConfig)
+
+
 class AppConfig(BaseModel):
     """Top-level RepoRivet configuration."""
 
@@ -96,6 +144,7 @@ class AppConfig(BaseModel):
 
     api: ApiConfig
     token: TokenConfig = Field(default_factory=TokenConfig)
+    approval: ApprovalConfig = Field(default_factory=ApprovalConfig)
 
     @model_validator(mode="after")
     def validate_prompt_budget(self) -> "AppConfig":
@@ -130,6 +179,7 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> AppConfig:
         ) from None
 
     try:
+        _apply_approval_environment(raw_config)
         return AppConfig.model_validate(raw_config)
     except ValidationError as error:
         details = "; ".join(_format_validation_error(item) for item in error.errors())
@@ -140,3 +190,25 @@ def _format_validation_error(error: dict[str, Any]) -> str:
     """Format a Pydantic error while deliberately omitting its input value."""
     location = ".".join(str(part) for part in error["loc"])
     return f"{location}: {error['msg']}"
+
+
+def _apply_approval_environment(raw_config: dict[str, Any]) -> None:
+    """Apply only documented approval overrides; API credentials remain file-configured."""
+    overrides = {
+        "mode": os.environ.get("REPORIVET_APPROVAL_MODE"),
+        "non_interactive": os.environ.get("REPORIVET_NON_INTERACTIVE_POLICY"),
+    }
+    llm_overrides = {
+        "model": os.environ.get("REPORIVET_APPROVAL_LLM_MODEL"),
+        "minimum_confidence": os.environ.get("REPORIVET_APPROVAL_MIN_CONFIDENCE"),
+    }
+    if not any((*overrides.values(), *llm_overrides.values())):
+        return
+    approval = raw_config.setdefault("approval", {})
+    if not isinstance(approval, dict):
+        return
+    llm = approval.setdefault("llm", {})
+    if not isinstance(llm, dict):
+        return
+    approval.update({key: value for key, value in overrides.items() if value})
+    llm.update({key: value for key, value in llm_overrides.items() if value})

@@ -1,6 +1,7 @@
 """Argparse and Rich command-line interface for RepoRivet."""
 
 import argparse
+import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +14,17 @@ from rich.prompt import Prompt
 from repo_rivet import __version__
 from repo_rivet.agent.controller import AgentController, AgentResult
 from repo_rivet.agent.termination import TerminationConfig, TerminationPolicy
+from repo_rivet.approval.engine import ApprovalEngine
+from repo_rivet.approval.grant_store import ApprovalGrantStore
+from repo_rivet.approval.hard_policy import HardSafetyPolicy, HardSafetySettings
+from repo_rivet.approval.human_approver import (
+    NonInteractiveHumanApprover,
+    TerminalHumanApprover,
+)
+from repo_rivet.approval.llm_reviewer import OpenAIApprovalReviewer
+from repo_rivet.approval.models import ApprovalMode, RiskLevel
+from repo_rivet.approval.normalizer import RequestNormalizer
+from repo_rivet.approval.risk_analyzer import RiskAnalyzer
 from repo_rivet.config import AppConfig, ConfigurationError, load_config
 from repo_rivet.context.manager import ContextManager
 from repo_rivet.llm.openai_compatible import OpenAICompatibleClient
@@ -23,6 +35,8 @@ from repo_rivet.memory.store import MemoryStore
 from repo_rivet.memory.token_calibrator import TokenCalibrationStore
 from repo_rivet.memory.token_estimator import create_token_estimator
 from repo_rivet.safety.path_policy import PathPolicyError
+from repo_rivet.storage.console_reporter import ConsoleEventReporter
+from repo_rivet.storage.event_sink import CompositeEventSink, EventSink
 from repo_rivet.tools.registry import ToolRegistry, create_default_registry
 
 
@@ -101,6 +115,11 @@ def _add_runtime_arguments(parser: argparse.ArgumentParser) -> None:
         type=Path,
         help="Resume memory from an existing session directory",
     )
+    parser.add_argument(
+        "--approval-mode",
+        choices=[mode.value for mode in ApprovalMode],
+        help="Override the configured tool approval mode",
+    )
 
 
 def cli(
@@ -116,7 +135,12 @@ def cli(
         return _run_agent(arguments, output)
     if arguments.command == "chat":
         reader = prompt_reader or (lambda prompt: Prompt.ask(prompt, console=output))
-        return _chat_agent(arguments, output, reader)
+        return _chat_agent(
+            arguments,
+            output,
+            reader,
+            approval_prompt_reader=prompt_reader,
+        )
     output.print("[red]Unknown command.[/red]")
     return 2
 
@@ -128,7 +152,7 @@ def _run_agent(arguments: argparse.Namespace, console: Console) -> int:
         return 2
 
     try:
-        runtime = _build_runtime(arguments)
+        runtime = _build_runtime(arguments, console)
     except (ConfigurationError, PathPolicyError, OSError, ValueError) as error:
         console.print(f"[bold red]Configuration error:[/bold red] {error}")
         return 2
@@ -147,9 +171,15 @@ def _chat_agent(
     arguments: argparse.Namespace,
     console: Console,
     prompt_reader: PromptReader,
+    *,
+    approval_prompt_reader: PromptReader | None = None,
 ) -> int:
     try:
-        runtime = _build_runtime(arguments)
+        runtime = _build_runtime(
+            arguments,
+            console,
+            approval_prompt_reader=approval_prompt_reader,
+        )
     except (ConfigurationError, PathPolicyError, OSError, ValueError) as error:
         console.print(f"[bold red]Configuration error:[/bold red] {error}")
         return 2
@@ -173,7 +203,12 @@ def _chat_agent(
         return 1
 
 
-def _build_runtime(arguments: argparse.Namespace) -> Runtime:
+def _build_runtime(
+    arguments: argparse.Namespace,
+    console: Console,
+    *,
+    approval_prompt_reader: PromptReader | None = None,
+) -> Runtime:
     termination = TerminationConfig(
         max_steps=arguments.max_steps,
         max_seconds=arguments.max_seconds,
@@ -195,7 +230,6 @@ def _build_runtime(arguments: argparse.Namespace) -> Runtime:
         base_url=str(config.api.base_url),
         model=config.api.model,
     )
-    registry = create_default_registry(arguments.workspace)
     secrets = (config.api.api_key.get_secret_value(),)
     if arguments.resume:
         store = MemoryStore(arguments.resume, secrets=secrets)
@@ -207,12 +241,28 @@ def _build_runtime(arguments: argparse.Namespace) -> Runtime:
     else:
         store = MemoryStore.create(arguments.log_dir, secrets=secrets)
         memory = MemoryState(session_id=store.session_id, config=memory_config)
+    runtime_events = CompositeEventSink(
+        store,
+        ConsoleEventReporter(console, secrets=secrets),
+    )
+    approval_engine = _build_approval_engine(
+        config=config,
+        arguments=arguments,
+        memory=memory,
+        event_logger=runtime_events,
+        console=console,
+        prompt_reader=approval_prompt_reader,
+    )
+    registry = create_default_registry(
+        arguments.workspace,
+        approval_engine=approval_engine,
+    )
     controller = AgentController(
         model_client=OpenAICompatibleClient(config.api),
         tool_registry=registry,
         context_manager=ContextManager(token_manager=token_manager),
         termination_policy=TerminationPolicy(termination),
-        event_logger=store,
+        event_logger=runtime_events,
         memory_store=store,
     )
     return Runtime(
@@ -221,6 +271,64 @@ def _build_runtime(arguments: argparse.Namespace) -> Runtime:
         store=store,
         memory=memory,
         controller=controller,
+    )
+
+
+def _build_approval_engine(
+    *,
+    config: AppConfig,
+    arguments: argparse.Namespace,
+    memory: MemoryState,
+    event_logger: EventSink,
+    console: Console,
+    prompt_reader: PromptReader | None,
+) -> ApprovalEngine:
+    mode = ApprovalMode(arguments.approval_mode or config.approval.mode)
+    interactive = arguments.command == "chat" or prompt_reader is not None or sys.stdin.isatty()
+    human_approver = (
+        TerminalHumanApprover(
+            console,
+            reader=prompt_reader,
+            timeout_seconds=config.approval.approval_timeout_seconds,
+        )
+        if interactive
+        else NonInteractiveHumanApprover(config.approval.non_interactive)
+    )
+    llm_reviewer = None
+    if mode == ApprovalMode.LLM_AUTO and config.approval.llm.enabled:
+        llm_reviewer = OpenAIApprovalReviewer(
+            config.api,
+            model=config.approval.llm.model,
+            timeout_seconds=config.approval.llm.timeout_seconds,
+        )
+    safety = config.approval.safety
+    risk_levels = {
+        "safe": RiskLevel.SAFE,
+        "low": RiskLevel.LOW,
+        "medium": RiskLevel.MEDIUM,
+    }
+    return ApprovalEngine(
+        mode=mode,
+        normalizer=RequestNormalizer(arguments.workspace),
+        risk_analyzer=RiskAnalyzer(),
+        hard_policy=HardSafetyPolicy(
+            HardSafetySettings(
+                deny_outside_workspace_write=safety.deny_outside_workspace_write,
+                deny_privilege_escalation=safety.deny_privilege_escalation,
+                deny_secret_access=safety.deny_secret_access,
+                deny_device_access=safety.deny_device_access,
+            )
+        ),
+        grant_store=ApprovalGrantStore(
+            memory,
+            remember_approvals=config.approval.remember_session_approvals,
+            remember_denials=config.approval.remember_session_denials,
+        ),
+        human_approver=human_approver,
+        llm_reviewer=llm_reviewer,
+        minimum_llm_confidence=config.approval.llm.minimum_confidence,
+        max_llm_risk=risk_levels[config.approval.llm.max_auto_approve_risk],
+        event_logger=event_logger,
     )
 
 
@@ -260,6 +368,7 @@ def _print_runtime(console: Console, workspace: Path, runtime: Runtime) -> None:
             f"Context window: {runtime.config.api.context_window_tokens} tokens\n"
             f"Maximum output: {runtime.config.api.max_output_tokens} tokens\n"
             f"Token estimator: {runtime.controller.context_manager.token_manager.name}\n"
+            f"Approval mode: {runtime.registry.approval_engine.mode.value}\n"
             f"Safe prompt budget: "
             f"{runtime.controller.context_manager.token_manager.config.prompt_budget} tokens\n"
             f"Session: {runtime.store.session_dir}",

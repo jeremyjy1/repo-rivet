@@ -180,6 +180,8 @@ class MemoryState(BaseModel):
     context_overflow_count: int = 0
     total_input_tokens: int = 0
     total_output_tokens: int = 0
+    approval_session_grants: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    denied_request_fingerprints: set[str] = Field(default_factory=set)
     status: str = "ready"
 
     def start_task(
@@ -194,6 +196,7 @@ class MemoryState(BaseModel):
     ) -> None:
         """Preserve the first task verbatim and version every later user request."""
         normalized = task.strip()
+        self.denied_request_fingerprints.clear()
         if self.fixed is None:
             self.fixed = FixedMemory(
                 system_prompt=system_prompt,

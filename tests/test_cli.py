@@ -95,6 +95,21 @@ def test_chat_parser_accepts_resume_session(tmp_path: Path) -> None:
     assert arguments.resume == tmp_path / "session"
 
 
+def test_parser_accepts_approval_mode_override(tmp_path: Path) -> None:
+    arguments = build_parser().parse_args(
+        [
+            "run",
+            "--workspace",
+            str(tmp_path),
+            "--approval-mode",
+            "always-ask",
+            "task",
+        ]
+    )
+
+    assert arguments.approval_mode == "always-ask"
+
+
 def test_chat_loop_remembers_turns_and_can_clear_history() -> None:
     agent = FakeConversationAgent()
     inputs = iter(["continue", "/clear", "fresh task", "/exit"])

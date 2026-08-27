@@ -54,6 +54,45 @@ max_context_overflow_retries = 1
     assert config.token.default_correction_factor == 1.30
     assert config.token.calibration_window == 10
     assert config.token.max_context_overflow_retries == 1
+    assert config.approval.mode.value == "safe-auto"
+    assert config.approval.non_interactive.value == "deny"
+
+
+def test_load_config_accepts_approval_settings(tmp_path: Path) -> None:
+    config_path = write_config(
+        tmp_path / "reporivet.toml",
+        """
+[api]
+api_key = "test-secret"
+base_url = "https://example.com/v1"
+model = "test-model"
+context_window_tokens = 32768
+
+[approval]
+mode = "llm-auto"
+non_interactive = "fail"
+remember_session_approvals = false
+
+[approval.llm]
+enabled = true
+model = "review-model"
+max_auto_approve_risk = "low"
+minimum_confidence = 0.95
+
+[approval.safety]
+deny_secret_access = false
+""",
+    )
+
+    config = load_config(config_path)
+
+    assert config.approval.mode.value == "llm-auto"
+    assert config.approval.non_interactive.value == "fail"
+    assert not config.approval.remember_session_approvals
+    assert config.approval.llm.model == "review-model"
+    assert config.approval.llm.max_auto_approve_risk == "low"
+    assert config.approval.llm.minimum_confidence == 0.95
+    assert not config.approval.safety.deny_secret_access
 
 
 def test_load_config_reports_missing_file(tmp_path: Path) -> None:
