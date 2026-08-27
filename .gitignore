@@ -33,7 +33,6 @@ htmlcov/
 .reporivet/
 logs/
 sessions/
-*.jsonl
 
 # Editors and operating systems
 .idea/
