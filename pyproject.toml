@@ -1,0 +1,38 @@
+[project]
+name = "repo-rivet"
+version = "0.1.0"
+description = "A local-first coding agent that reads files, edits code, runs commands, and verifies its changes."
+requires-python = ">=3.12"
+dependencies = [
+    "openai",
+    "pydantic>=2",
+    "rich",
+]
+
+[project.scripts]
+reporivet = "repo_rivet.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ruff.format]
+quote-style = "double"

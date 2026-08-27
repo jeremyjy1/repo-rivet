@@ -1,0 +1,41 @@
+# Local task materials
+.local/
+
+# Python environments
+.venv/
+venv/
+env/
+
+# Python bytecode and packaging
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Test, lint, type-check, and coverage caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+/reporivet.toml
+
+# RepoRivet runtime data
+.reporivet/
+logs/
+sessions/
+*.jsonl
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
