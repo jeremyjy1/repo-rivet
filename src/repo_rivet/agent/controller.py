@@ -92,6 +92,9 @@ class AgentController:
             ],
             max_steps=self.termination_policy.config.max_steps,
         )
+        approval_engine = getattr(self.tool_registry, "approval_engine", None)
+        if approval_engine is not None:
+            approval_engine.sync_memory_rule()
         state = SessionState(
             task=task.strip(),
             tool_call_count=memory.tool_event_step,

@@ -14,6 +14,7 @@ class ApprovalMode(StrEnum):
     LLM_AUTO = "llm-auto"
     SAFE_AUTO = "safe-auto"
     ALWAYS_ASK = "always-ask"
+    READ_ONLY = "read-only"
 
 
 class ApprovalAction(StrEnum):

@@ -19,6 +19,7 @@ calibration_window = 20
 max_context_overflow_retries = 2
 
 [approval]
+# allow-all, llm-auto, safe-auto, always-ask, or read-only
 mode = "safe-auto"
 non_interactive = "deny"
 approval_timeout_seconds = 120

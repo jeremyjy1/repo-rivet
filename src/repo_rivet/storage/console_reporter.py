@@ -19,6 +19,7 @@ _SOURCE_LABELS = {
     "llm_reviewer": "LLM reviewer",
     "non_interactive_policy": "non-interactive policy",
     "prior_denial": "prior denial",
+    "read_only_mode": "read-only mode",
     "safe_rule": "safe rule",
     "session_grant": "exact session grant",
 }

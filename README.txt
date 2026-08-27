@@ -11,13 +11,13 @@ RepoRivet 是一个本地优先的单智能体编程工具。它使用模型原�
 3. 在 `[approval]` 中选择审批模式（默认 `safe-auto`），然后运行：
    uv run reporivet run --approval-mode safe-auto --workspace ./examples/buggy_project "修复负数价格未被拒绝的问题，并运行测试"
 
-交互对话：uv run reporivet chat --workspace ./examples/buggy_project。支持 /help、/history、/clear、/compact、/compact aggressive 和 /exit。手动压缩只处理近期原文并立即保存，固定任务和结构化状态不变。会话采用固定任务、近期工作记忆、结构化摘要和本地持久化四层记忆；原始任务不会被压缩覆盖，文件内容通过 SHA-256 判断是否需要重新注入，长命令只把头尾送入模型，完整脱敏输出保存在 .reporivet/sessions。
+交互对话：uv run reporivet chat --workspace ./examples/buggy_project。支持 /help、/history、/clear、/compact、/compact aggressive、/approval、/approval <mode> 和 /exit。手动压缩只处理近期原文并立即保存，固定任务和结构化状态不变。会话采用固定任务、近期工作记忆、结构化摘要和本地持久化四层记忆；原始任务不会被压缩覆盖，文件内容通过 SHA-256 判断是否需要重新注入，长命令只把头尾送入模型，完整脱敏输出保存在 .reporivet/sessions。
 
 恢复会话：uv run reporivet chat --workspace ./examples/buggy_project --resume .reporivet/sessions/<session-id>。恢复时会核对工作区和已读文件哈希，外部变化的文件会被标记为失效并要求重新读取。/clear 只清除近期原文，保留固定任务和结构化状态。
 
-核心能力：浏览、搜索和读取代码；安全创建、精确替换文件；限时执行本地命令；查看 Git Diff；修改后强制验证；带安全余量、服务端 usage 校准和超限恢复的上下文管理；会话恢复；四模式工具审批；工具请求、审批风险、审批决定和执行结果的实时终端显示；最大步数、运行时间、重复调用与连续失败保护；JSONL 事件日志及凭据过滤。
+核心能力：浏览、搜索和读取代码；安全创建、精确替换文件；限时执行本地命令；查看 Git Diff；修改后强制验证；带安全余量、服务端 usage 校准和超限恢复的上下文管理；会话恢复；五模式工具审批；工具请求、审批风险、审批决定和执行结果的实时终端显示；最大步数、运行时间、重复调用与连续失败保护；JSONL 事件日志及凭据过滤。
 
-审批模式：`allow-all` 在硬性安全规则外自动批准；`llm-auto` 仅允许审批模型高置信批准中低风险请求；`safe-auto` 自动放行窄范围只读工具并人工确认其余操作；`always-ask` 每次询问且不复用会话授权。人工界面使用数字 `1`～`5` 选择本次批准、当前会话精确批准、本次拒绝、当前会话精确拒绝或中止 Agent。单次 `run` 在无交互终端遇到询问时默认拒绝，可在配置中改为失败。
+审批模式：`allow-all` 在硬性安全规则外自动批准；`llm-auto` 仅允许审批模型高置信批准中低风险请求；`safe-auto` 自动放行窄范围只读工具并人工确认其余操作；`always-ask` 每次询问且不复用会话授权；`read-only` 只允许类型化文件检查，直接拒绝写入、替换和通用命令。交互对话中使用 `/approval` 查看当前模式，使用 `/approval <mode>` 即时切换并保存到会话。人工界面使用数字 `1`～`5` 选择本次批准、当前会话精确批准、本次拒绝、当前会话精确拒绝或中止 Agent。单次 `run` 在无交互终端遇到询问时默认拒绝，可在配置中改为失败。
 
 实时状态行只显示工具名、风险、审批来源、目标路径、命令程序名、参数数量、退出码和耗时；不显示文件内容、完整命令参数或原始输出。完整结构化事件仍写入会话的 `events.jsonl`。
 

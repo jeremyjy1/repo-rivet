@@ -4,6 +4,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from repo_rivet.approval.models import ApprovalMode
 from repo_rivet.memory.token_estimator import ApproximateTokenEstimator
 from repo_rivet.tools.base import ToolCall, ToolResult
 
@@ -182,6 +183,7 @@ class MemoryState(BaseModel):
     total_output_tokens: int = 0
     approval_session_grants: dict[str, dict[str, Any]] = Field(default_factory=dict)
     denied_request_fingerprints: set[str] = Field(default_factory=set)
+    approval_mode_override: ApprovalMode | None = None
     status: str = "ready"
 
     def start_task(

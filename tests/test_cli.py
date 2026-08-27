@@ -4,6 +4,7 @@ from pathlib import Path
 from rich.console import Console
 
 from repo_rivet.agent.controller import AgentResult
+from repo_rivet.approval.models import ApprovalMode
 from repo_rivet.cli import _chat_loop, build_parser, cli
 from repo_rivet.memory.context_manager import SYSTEM_PROMPT
 from repo_rivet.memory.models import MemoryConfig, MemoryState, Message
@@ -42,6 +43,14 @@ class FakeConversationAgent:
             tool_call_count=0,
             verification_success=False,
         )
+
+
+class FakeApprovalEngine:
+    def __init__(self) -> None:
+        self.mode = ApprovalMode.SAFE_AUTO
+
+    def set_mode(self, mode: ApprovalMode) -> None:
+        self.mode = mode
 
 
 def test_run_parser_accepts_workspace_config_and_task(tmp_path: Path) -> None:
@@ -110,6 +119,14 @@ def test_parser_accepts_approval_mode_override(tmp_path: Path) -> None:
     assert arguments.approval_mode == "always-ask"
 
 
+def test_parser_accepts_read_only_approval_mode(tmp_path: Path) -> None:
+    arguments = build_parser().parse_args(
+        ["chat", "--workspace", str(tmp_path), "--approval-mode", "read-only"]
+    )
+
+    assert arguments.approval_mode == "read-only"
+
+
 def test_chat_loop_remembers_turns_and_can_clear_history() -> None:
     agent = FakeConversationAgent()
     inputs = iter(["continue", "/clear", "fresh task", "/exit"])
@@ -151,6 +168,38 @@ def test_chat_loop_history_and_help_commands_do_not_call_agent() -> None:
     assert "RepoRivet: completed task" in output
     assert "/clear" in output
     assert "/compact" in output
+    assert "/approval" in output
+
+
+def test_chat_can_show_and_switch_approval_mode() -> None:
+    agent = FakeConversationAgent()
+    approval = FakeApprovalEngine()
+    inputs = iter(
+        [
+            "/approval",
+            "/approval read-only",
+            "/approval unsupported",
+            "/exit",
+        ]
+    )
+    buffer = StringIO()
+    console = Console(file=buffer, force_terminal=False, color_system=None, width=180)
+
+    exit_code = _chat_loop(
+        agent,
+        MemoryState(session_id="chat-test"),
+        console,
+        lambda _: next(inputs),
+        approval_engine=approval,
+    )
+
+    output = buffer.getvalue()
+    assert exit_code == 0
+    assert approval.mode == ApprovalMode.READ_ONLY
+    assert "Current approval mode: safe-auto" in output
+    assert "Approval mode changed: safe-auto → read-only" in output
+    assert "Unknown approval mode: unsupported" in output
+    assert agent.requests == []
 
 
 def test_chat_manual_aggressive_compaction_preserves_tool_group_and_saves_state(

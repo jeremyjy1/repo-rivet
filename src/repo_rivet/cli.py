@@ -57,6 +57,14 @@ class ConversationAgent(Protocol):
         ...
 
 
+class ApprovalModeManager(Protocol):
+    mode: ApprovalMode
+
+    def set_mode(self, mode: ApprovalMode) -> None:
+        """Apply and persist an approval-mode switch."""
+        ...
+
+
 @dataclass(frozen=True, slots=True)
 class Runtime:
     config: AppConfig
@@ -195,6 +203,7 @@ def _chat_agent(
             prompt_reader,
             initial_task=initial_task or None,
             memory_store=runtime.store,
+            approval_engine=runtime.registry.approval_engine,
         )
         runtime.store.save_state(runtime.memory, status=runtime.memory.status)
         return exit_code
@@ -283,7 +292,11 @@ def _build_approval_engine(
     console: Console,
     prompt_reader: PromptReader | None,
 ) -> ApprovalEngine:
-    mode = ApprovalMode(arguments.approval_mode or config.approval.mode)
+    mode = ApprovalMode(
+        arguments.approval_mode
+        or memory.approval_mode_override
+        or config.approval.mode
+    )
     interactive = arguments.command == "chat" or prompt_reader is not None or sys.stdin.isatty()
     human_approver = (
         TerminalHumanApprover(
@@ -307,7 +320,7 @@ def _build_approval_engine(
         "low": RiskLevel.LOW,
         "medium": RiskLevel.MEDIUM,
     }
-    return ApprovalEngine(
+    engine = ApprovalEngine(
         mode=mode,
         normalizer=RequestNormalizer(arguments.workspace),
         risk_analyzer=RiskAnalyzer(),
@@ -330,6 +343,9 @@ def _build_approval_engine(
         max_llm_risk=risk_levels[config.approval.llm.max_auto_approve_risk],
         event_logger=event_logger,
     )
+    if arguments.approval_mode is not None:
+        memory.approval_mode_override = mode
+    return engine
 
 
 def _memory_config(config: AppConfig) -> MemoryConfig:
@@ -385,6 +401,7 @@ def _chat_loop(
     *,
     initial_task: str | None = None,
     memory_store: MemoryStore | None = None,
+    approval_engine: ApprovalModeManager | None = None,
 ) -> int:
     pending_task = initial_task
 
@@ -404,7 +421,12 @@ def _chat_loop(
         if not request:
             continue
         if request.startswith("/"):
-            should_exit, memory_changed = _handle_chat_command(request, memory, console)
+            should_exit, memory_changed = _handle_chat_command(
+                request,
+                memory,
+                console,
+                approval_engine=approval_engine,
+            )
             if memory_changed and memory_store is not None:
                 memory_store.save_state(memory, status=memory.status)
             if should_exit:
@@ -419,6 +441,8 @@ def _handle_chat_command(
     command: str,
     memory: MemoryState,
     console: Console,
+    *,
+    approval_engine: ApprovalModeManager | None = None,
 ) -> tuple[bool, bool]:
     normalized = command.lower()
     if normalized in {"/exit", "/quit"}:
@@ -431,6 +455,8 @@ def _handle_chat_command(
             "/clear    Clear remembered conversation\n"
             "/compact  Compress recent conversation safely\n"
             "/compact aggressive  Keep a smaller recent window\n"
+            "/approval  Show the current approval mode\n"
+            "/approval <mode>  Switch approval mode immediately\n"
             "/exit     End interactive mode"
         )
         return False, False
@@ -478,6 +504,38 @@ def _handle_chat_command(
     if normalized.startswith("/compact"):
         console.print("Usage: /compact or /compact aggressive")
         return False, False
+    if normalized == "/approval":
+        if approval_engine is None:
+            console.print("Approval controls are unavailable in this runtime.")
+            return False, False
+        modes = ", ".join(mode.value for mode in ApprovalMode)
+        console.print(
+            f"Current approval mode: [bold]{approval_engine.mode.value}[/bold]\n"
+            f"Available modes: {modes}\n"
+            "Usage: /approval <mode>"
+        )
+        return False, False
+    if normalized.startswith("/approval "):
+        if approval_engine is None:
+            console.print("Approval controls are unavailable in this runtime.")
+            return False, False
+        parts = normalized.split()
+        if len(parts) != 2:
+            console.print("Usage: /approval <mode>")
+            return False, False
+        try:
+            mode = ApprovalMode(parts[1])
+        except ValueError:
+            modes = ", ".join(item.value for item in ApprovalMode)
+            console.print(f"Unknown approval mode: {parts[1]}. Available modes: {modes}")
+            return False, False
+        if mode == approval_engine.mode:
+            console.print(f"Approval mode is already {mode.value}.")
+            return False, False
+        previous = approval_engine.mode
+        approval_engine.set_mode(mode)
+        console.print(f"Approval mode changed: {previous.value} → {mode.value}")
+        return False, True
     console.print(f"Unknown command: {command}. Type /help for commands.")
     return False, False
 

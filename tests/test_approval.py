@@ -338,6 +338,96 @@ def test_session_grant_matches_only_exact_normalized_request(tmp_path: Path) -> 
     assert len(memory.approval_session_grants) == 2
 
 
+def test_read_only_mode_allows_typed_reads_and_denies_writes_and_commands(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "main.py").write_text("value = 1\n", encoding="utf-8")
+    engine, _ = create_engine(tmp_path, mode=ApprovalMode.READ_ONLY)
+    registry = create_default_registry(tmp_path, approval_engine=engine)
+
+    read = registry.execute(
+        ToolCall(id="read-1", name="read_file", arguments={"path": "main.py"})
+    )
+    write = registry.execute(
+        ToolCall(
+            id="write-1",
+            name="write_file",
+            arguments={"path": "new.py", "content": "value = 2\n"},
+        )
+    )
+    command = registry.execute(
+        ToolCall(id="command-1", name="run_command", arguments={"command": "pwd"})
+    )
+
+    assert read.ok
+    assert not write.ok
+    assert write.error_code == "approval_denied"
+    assert write.metadata and write.metadata["approval_source"] == "read_only_mode"
+    assert not command.ok
+    assert command.metadata and command.metadata["approval_source"] == "read_only_mode"
+    assert not (tmp_path / "new.py").exists()
+
+
+def test_read_only_mode_cannot_be_bypassed_by_prior_session_grant(tmp_path: Path) -> None:
+    human = FakeHumanApprover(scope=ApprovalScope.SESSION_EXACT)
+    engine, memory = create_engine(tmp_path, mode=ApprovalMode.SAFE_AUTO, human=human)
+    request = {
+        "tool_name": "write_file",
+        "arguments": {"path": "file.txt", "content": "value"},
+        "capabilities": {Capability.FILESYSTEM_WRITE},
+        "session_id": engine.session_id,
+    }
+    granted = engine.authorize(**request)
+
+    engine.set_mode(ApprovalMode.READ_ONLY)
+    denied = engine.authorize(**request)
+
+    assert granted.decision.scope == ApprovalScope.SESSION_EXACT
+    assert denied.decision.action == ApprovalAction.DENY
+    assert denied.decision.source == "read_only_mode"
+    assert memory.approval_mode_override == ApprovalMode.READ_ONLY
+
+
+def test_switch_to_read_only_invalidates_pending_write_approval(tmp_path: Path) -> None:
+    engine, _ = create_engine(tmp_path, mode=ApprovalMode.ALLOW_ALL)
+    approved = engine.authorize(
+        tool_name="write_file",
+        arguments={"path": "file.txt", "content": "value"},
+        capabilities={Capability.FILESYSTEM_WRITE},
+        session_id=engine.session_id,
+    )
+
+    engine.set_mode(ApprovalMode.READ_ONLY)
+    revalidated = engine.revalidate(approved)
+
+    assert revalidated is not None
+    assert revalidated.action == ApprovalAction.DENY
+    assert revalidated.source == "read_only_mode"
+
+
+def test_mode_switch_updates_fixed_model_safety_rule(tmp_path: Path) -> None:
+    engine, memory = create_engine(tmp_path, mode=ApprovalMode.SAFE_AUTO)
+    memory.start_task(
+        task="inspect project",
+        workspace=str(tmp_path),
+        system_prompt="system",
+        safety_rules=["stay in workspace"],
+        completion_rules=["report result"],
+        max_steps=10,
+    )
+
+    engine.set_mode(ApprovalMode.READ_ONLY)
+
+    assert memory.fixed is not None
+    approval_rules = [
+        rule for rule in memory.fixed.safety_rules if rule.startswith("Current approval mode:")
+    ]
+    assert approval_rules == [
+        "Current approval mode: read-only. Only typed, workspace-confined file inspection "
+        "tools are permitted; do not request writes or commands."
+    ]
+
+
 def test_symlink_change_invalidates_approval_before_execution(tmp_path: Path) -> None:
     target = tmp_path / "target"
     target.mkdir()

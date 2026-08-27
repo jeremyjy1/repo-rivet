@@ -59,10 +59,41 @@ class ApprovalEngine:
         self.minimum_llm_confidence = minimum_llm_confidence
         self.max_llm_risk = max_llm_risk
         self.event_logger = event_logger
+        self.sync_memory_rule()
 
     @property
     def session_id(self) -> str:
         return self.grant_store.memory.session_id
+
+    def set_mode(self, mode: ApprovalMode) -> None:
+        """Switch policy immediately and persist the explicit session override."""
+        previous_mode = self.mode
+        self.mode = mode
+        self.grant_store.memory.approval_mode_override = mode
+        self.grant_store.memory.denied_request_fingerprints.clear()
+        self.sync_memory_rule()
+        self._log(
+            "approval_mode_changed",
+            previous_mode=previous_mode.value,
+            mode=mode.value,
+        )
+
+    def sync_memory_rule(self) -> None:
+        """Keep the model's fixed safety context aligned with the active mode."""
+        fixed = self.grant_store.memory.fixed
+        if fixed is None:
+            return
+        prefix = "Current approval mode:"
+        fixed.safety_rules[:] = [
+            rule for rule in fixed.safety_rules if not rule.startswith(prefix)
+        ]
+        if self.mode == ApprovalMode.READ_ONLY:
+            fixed.safety_rules.append(
+                "Current approval mode: read-only. Only typed, workspace-confined file "
+                "inspection tools are permitted; do not request writes or commands."
+            )
+        else:
+            fixed.safety_rules.append(f"Current approval mode: {self.mode.value}.")
 
     def authorize(
         self,
@@ -82,6 +113,8 @@ class ApprovalEngine:
         self._log_request(request)
 
         decision = self.hard_policy.evaluate(request)
+        if decision is None and self.mode == ApprovalMode.READ_ONLY:
+            decision = self._decide_read_only(request)
         if decision is None and self.mode != ApprovalMode.ALWAYS_ASK:
             grant = self.grant_store.match(request)
             if grant is not None:
@@ -125,7 +158,12 @@ class ApprovalEngine:
         hard_decision = self.hard_policy.evaluate(refreshed)
         if hard_decision is not None:
             self._log_decision(refreshed, hard_decision)
-        return hard_decision
+            return hard_decision
+        if self.mode == ApprovalMode.READ_ONLY and not refreshed.assessment.obviously_safe:
+            read_only_decision = self._decide_read_only(refreshed)
+            self._log_decision(refreshed, read_only_decision)
+            return read_only_decision
+        return None
 
     def record_execution(self, outcome: ApprovalOutcome, *, ok: bool, metadata: Any) -> None:
         self._log(
@@ -157,6 +195,21 @@ class ApprovalEngine:
         if self.mode == ApprovalMode.SAFE_AUTO:
             return self.human_approver.ask(request)
         return self._review_with_llm_or_human(request)
+
+    def _decide_read_only(self, request: ApprovalRequest) -> ApprovalDecision:
+        if request.assessment.obviously_safe:
+            return self._decision(
+                request,
+                action=ApprovalAction.ALLOW,
+                source="read_only_mode",
+                reason="allowed as a typed, workspace-confined read-only operation",
+            )
+        return self._decision(
+            request,
+            action=ApprovalAction.DENY,
+            source="read_only_mode",
+            reason="read-only mode prohibits file changes and command execution",
+        )
 
     def _review_with_llm_or_human(self, request: ApprovalRequest) -> ApprovalDecision:
         if request.assessment.level > self.max_llm_risk or self.llm_reviewer is None:
