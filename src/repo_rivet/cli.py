@@ -83,6 +83,7 @@ class Runtime:
     controller: AgentController
     session_manager: FileSessionStore
     session_lock: SessionLock
+    loaded_existing_session: bool = False
 
     def close(self) -> None:
         self.session_lock.__exit__(None, None, None)
@@ -272,6 +273,7 @@ def _chat_agent(
             initial_task=initial_task or None,
             memory_store=runtime.store,
             approval_engine=runtime.registry.approval_engine,
+            show_history_on_start=runtime.loaded_existing_session,
         )
         runtime.memory.status = SessionStatus.PAUSED.value
         runtime.store.save_state(runtime.memory, status=SessionStatus.PAUSED.value)
@@ -565,6 +567,7 @@ def _build_runtime(
     if reference is None:
         active = session_manager.get_active(workspace)
         reference = active.session_id if active is not None else None
+    loaded_existing_session = reference is not None
     if reference is None:
         task_preview = _argument_task_preview(arguments)
         loaded = session_manager.create(
@@ -642,6 +645,7 @@ def _build_runtime(
         controller=controller,
         session_manager=session_manager,
         session_lock=session_lock,
+        loaded_existing_session=loaded_existing_session,
     )
 
 
@@ -771,7 +775,11 @@ def _chat_loop(
     initial_task: str | None = None,
     memory_store: MemoryStore | None = None,
     approval_engine: ApprovalModeManager | None = None,
+    show_history_on_start: bool = False,
 ) -> int:
+    if show_history_on_start:
+        _print_chat_history(memory, console, heading=True)
+
     pending_task = initial_task
 
     while True:
@@ -833,18 +841,7 @@ def _handle_chat_command(
         )
         return False, False
     if normalized == "/history":
-        if memory.fixed is None and not memory.messages:
-            console.print("No conversation history.")
-        else:
-            if memory.fixed is not None:
-                console.print(f"[bold]Original task:[/bold] {memory.fixed.original_task}")
-            for update in memory.task_updates:
-                console.print(f"[bold]Task update:[/bold] {update}")
-            for message in memory.messages:
-                if message.role not in {"user", "assistant"} or not message.content:
-                    continue
-                label = "You" if message.role == "user" else "RepoRivet"
-                console.print(f"[bold]{label}:[/bold] {message.content}")
+        _print_chat_history(memory, console)
         return False, False
     if normalized == "/clear":
         memory.clear_recent_conversation()
@@ -910,6 +907,42 @@ def _handle_chat_command(
         return False, True
     console.print(f"Unknown command: {command}. Type /help for commands.")
     return False, False
+
+
+def _print_chat_history(
+    memory: MemoryState,
+    console: Console,
+    *,
+    heading: bool = False,
+) -> None:
+    """Render the remembered user-visible conversation as literal terminal text."""
+    visible_messages = [
+        message
+        for message in memory.messages
+        if message.role in {"user", "assistant"} and message.content
+    ]
+    has_history = memory.fixed is not None or bool(memory.task_updates) or bool(visible_messages)
+
+    if heading:
+        console.print(Text("Conversation history", style="bold"))
+    if not has_history:
+        console.print("No conversation history.")
+        return
+
+    if memory.fixed is not None:
+        _print_history_entry(console, "Original task", memory.fixed.original_task)
+    for update in memory.task_updates:
+        _print_history_entry(console, "Task update", update)
+    for message in visible_messages:
+        label = "You" if message.role == "user" else "RepoRivet"
+        _print_history_entry(console, label, message.content or "")
+
+
+def _print_history_entry(console: Console, label: str, content: str) -> None:
+    line = Text()
+    line.append(f"{label}: ", style="bold")
+    line.append(_terminal_text(content))
+    console.print(line)
 
 
 def _print_result(console: Console, result: AgentResult) -> None:

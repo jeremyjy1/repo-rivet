@@ -216,6 +216,37 @@ def test_chat_loop_history_and_help_commands_do_not_call_agent() -> None:
     assert "/approval" in output
 
 
+def test_chat_loop_displays_loaded_session_history_on_start() -> None:
+    agent = FakeConversationAgent()
+    memory = MemoryState(session_id="chat-test")
+    memory.start_task(
+        task="inspect [bold]the project[/bold]",
+        workspace="/workspace",
+        system_prompt=SYSTEM_PROMPT,
+        safety_rules=["stay in workspace"],
+        completion_rules=["verify changes"],
+        max_steps=30,
+    )
+    memory.messages.append(Message(role="assistant", content="inspection complete"))
+    buffer = StringIO()
+    console = Console(file=buffer, force_terminal=False, color_system=None)
+
+    exit_code = _chat_loop(
+        agent,
+        memory,
+        console,
+        lambda _: "/exit",
+        show_history_on_start=True,
+    )
+
+    output = buffer.getvalue()
+    assert exit_code == 0
+    assert agent.requests == []
+    assert "Conversation history" in output
+    assert "Original task: inspect [bold]the project[/bold]" in output
+    assert "RepoRivet: inspection complete" in output
+
+
 def test_chat_can_show_and_switch_approval_mode() -> None:
     agent = FakeConversationAgent()
     approval = FakeApprovalEngine()
