@@ -346,7 +346,7 @@ def test_resume_without_workspace_pointer_explains_workspace_scope(
     )
 
     assert exit_code == 2
-    output = buffer.getvalue()
+    output = " ".join(buffer.getvalue().split())
     assert "Active sessions are workspace-scoped" in output
     assert "resume by ID" in output
 
