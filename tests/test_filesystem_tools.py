@@ -22,6 +22,7 @@ def test_list_search_and_read_files(tmp_path: Path) -> None:
 
     assert listed.ok and "src/service.py" in listed.output
     assert searched.ok and "src/service.py:2:needle here" in searched.output
+    assert searched.metadata and searched.metadata["match_locations"] == ["src/service.py:2"]
     assert read.ok and "2 | needle here" in read.output and "3 | last" in read.output
 
 
@@ -53,6 +54,7 @@ def test_replace_text_checks_expected_count_before_writing(tmp_path: Path) -> No
     assert not rejected.ok
     assert file_path.read_text(encoding="utf-8") == "new new"
     assert replaced.ok
+    assert replaced.metadata and replaced.metadata["line_numbers"] == [1, 1]
 
 
 def test_file_tools_reject_workspace_escape(tmp_path: Path) -> None:
@@ -69,6 +71,15 @@ def test_read_file_rejects_binary_content(tmp_path: Path) -> None:
 
     assert not result.ok
     assert "Binary files" in (result.error or "")
+
+
+def test_read_file_missing_path_returns_specific_retryable_error(tmp_path: Path) -> None:
+    result = ReadFileTool(WorkspacePathPolicy(tmp_path)).execute({"path": "missing.py"})
+
+    assert not result.ok
+    assert result.error == "File does not exist: missing.py"
+    assert result.error_code == "tool_error"
+    assert result.retryable
 
 
 def test_read_file_rejects_sensitive_configuration(tmp_path: Path) -> None:

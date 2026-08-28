@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from repo_rivet.approval.engine import ApprovalEngine
-from repo_rivet.approval.models import ApprovalAction
+from repo_rivet.approval.models import ApprovalAction, Capability
 from repo_rivet.safety.command_policy import CommandPolicy
 from repo_rivet.safety.path_policy import WorkspacePathPolicy
 from repo_rivet.tools.base import BaseTool, ToolCall, ToolResult
@@ -17,7 +17,19 @@ from repo_rivet.tools.filesystem import (
     WriteFileTool,
 )
 from repo_rivet.tools.git import GitDiffTool
+from repo_rivet.tools.meta import RecordDecisionTool
 from repo_rivet.tools.shell import RunCommandTool
+
+_STATE_CHANGING_CAPABILITIES = frozenset(
+    {
+        Capability.FILESYSTEM_WRITE,
+        Capability.FILESYSTEM_DELETE,
+        Capability.PROCESS_EXECUTE,
+        Capability.NETWORK_ACCESS,
+        Capability.GIT_WRITE,
+        Capability.GIT_HISTORY_REWRITE,
+    }
+)
 
 
 class ToolRegistry:
@@ -47,6 +59,11 @@ class ToolRegistry:
 
     def schemas(self) -> list[dict[str, Any]]:
         return [tool.schema for tool in self._tools.values()]
+
+    def is_state_changing(self, tool_name: str) -> bool:
+        """Return whether a registered tool declares any side-effect capability."""
+        tool = self._tools.get(tool_name)
+        return bool(tool and tool.capabilities & _STATE_CHANGING_CAPABILITIES)
 
     def execute(self, call: ToolCall) -> ToolResult:
         tool = self._tools.get(call.name)
@@ -120,11 +137,12 @@ def create_default_registry(
     *,
     approval_engine: ApprovalEngine | None = None,
 ) -> ToolRegistry:
-    """Create the seven minimum tools for one confined workspace."""
+    """Create the local workspace tools and the side-effect-free decision meta tool."""
     path_policy = WorkspacePathPolicy(workspace)
     command_policy = CommandPolicy()
     return ToolRegistry(
         [
+            RecordDecisionTool(),
             ListFilesTool(path_policy),
             SearchTextTool(path_policy),
             ReadFileTool(path_policy),

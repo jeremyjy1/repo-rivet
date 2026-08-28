@@ -1,11 +1,13 @@
 """Typed fixed, working, summary, file, and command memory models."""
 
+import json
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from repo_rivet.approval.models import ApprovalMode
 from repo_rivet.memory.token_estimator import ApproximateTokenEstimator
+from repo_rivet.reasoning.models import ObservationEvent, ReasoningEvent
 from repo_rivet.tools.base import ToolCall, ToolResult
 
 
@@ -68,7 +70,8 @@ class Message(BaseModel):
         )
 
     def as_chat_message(self) -> dict[str, Any]:
-        message: dict[str, Any] = {"role": self.role, "content": self.content}
+        content = self._model_visible_content()
+        message: dict[str, Any] = {"role": self.role, "content": content}
         if self.tool_call_id is not None:
             message["tool_call_id"] = self.tool_call_id
         if self.name is not None:
@@ -76,6 +79,26 @@ class Message(BaseModel):
         if self.tool_calls is not None:
             message["tool_calls"] = self.tool_calls
         return message
+
+    def _model_visible_content(self) -> str | None:
+        """Hide session-audit paths that workspace tools cannot read."""
+        if self.role != "tool" or not self.content:
+            return self.content
+        try:
+            payload = json.loads(self.content)
+        except (TypeError, json.JSONDecodeError):
+            return self.content
+        if not isinstance(payload, dict):
+            return self.content
+        metadata = payload.get("metadata")
+        if isinstance(metadata, dict):
+            metadata.pop("output_ref", None)
+        output = payload.get("output")
+        if isinstance(output, str):
+            payload["output"] = "\n".join(
+                line for line in output.splitlines() if not line.startswith("Full output: ")
+            )
+        return json.dumps(payload, ensure_ascii=False)
 
 
 class FixedMemory(BaseModel):
@@ -184,6 +207,9 @@ class MemoryState(BaseModel):
     approval_session_grants: dict[str, dict[str, Any]] = Field(default_factory=dict)
     denied_request_fingerprints: set[str] = Field(default_factory=set)
     approval_mode_override: ApprovalMode | None = None
+    reasoning_events: list[ReasoningEvent] = Field(default_factory=list)
+    observation_events: list[ObservationEvent] = Field(default_factory=list)
+    reflection_required: bool = False
     status: str = "ready"
 
     def start_task(
@@ -214,6 +240,7 @@ class MemoryState(BaseModel):
 
         self.messages.append(Message(role="user", content=normalized, step=self.tool_event_step))
         self.working.current_focus = normalized
+        self.working.pending_actions.clear()
         self.status = "running"
 
     def append_assistant(self, message: dict[str, Any], *, step: int) -> None:
@@ -244,10 +271,7 @@ class MemoryState(BaseModel):
                 existing = self.file_memories.get(path)
                 if existing and existing.sha256 == sha256:
                     existing.last_read_step = step
-                    context_output = (
-                        f"{path} is unchanged since its previous read "
-                        f"(sha256={sha256[:12]}). Full content is not repeated."
-                    )
+                    existing.content_preview = (result.raw_output or result.output)[:2_000]
                 else:
                     was_invalidated = path in self.invalidated_files
                     self.file_memories[path] = FileMemory(
@@ -302,7 +326,10 @@ class MemoryState(BaseModel):
                         f"Command succeeded: {command}\nSummary tail:\n{'\n'.join(raw_lines[-10:])}"
                     )
                 if full_output_path:
-                    context_output = f"{context_output}\nFull output: {full_output_path}"
+                    context_output = (
+                        f"{context_output}\nFull output is retained in session audit storage "
+                        "outside the workspace and cannot be read with workspace tools."
+                    )
                 command_memory.context_output = context_output
                 command_memory.estimated_tokens = ApproximateTokenEstimator().estimate_text(
                     context_output,
@@ -350,6 +377,8 @@ class MemoryState(BaseModel):
             output=context_output,
             error=result.error,
             metadata=metadata,
+            error_code=result.error_code,
+            retryable=result.retryable,
         )
         self.append_tool_message(context_result.as_tool_message(call.id), step=step)
 

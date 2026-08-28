@@ -16,6 +16,7 @@ from pydantic import (
 from pydantic.functional_validators import field_validator
 
 from repo_rivet.approval.models import ApprovalMode, NonInteractivePolicy
+from repo_rivet.reasoning.models import ReasoningConfig
 
 DEFAULT_CONFIG_PATH = Path("reporivet.toml")
 _API_KEY_PLACEHOLDER = "replace-with-your-api-key"
@@ -145,6 +146,7 @@ class AppConfig(BaseModel):
     api: ApiConfig
     token: TokenConfig = Field(default_factory=TokenConfig)
     approval: ApprovalConfig = Field(default_factory=ApprovalConfig)
+    reasoning: ReasoningConfig = Field(default_factory=ReasoningConfig)
 
     @model_validator(mode="after")
     def validate_prompt_budget(self) -> "AppConfig":

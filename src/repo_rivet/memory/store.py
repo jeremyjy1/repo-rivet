@@ -121,6 +121,7 @@ class MemoryStore:
                 add_unique(memory.working.unresolved_errors, issue, limit=20)
                 add_unique(memory.summary.unresolved_issues, issue)
         if changed:
+            memory.reflection_required = True
             memory.last_verification_success = False
             memory.working.last_verification_result = "invalidated by external file changes"
             memory.summary.verification_status = "invalidated by external file changes"
@@ -175,7 +176,11 @@ class MemoryStore:
         missing_results = [
             call_id for call_id in assistant_call_ids if call_id not in message_finished
         ]
-        uncertain = [call_id for call_id in event_started if call_id not in event_finished]
+        uncertain = [
+            call_id
+            for call_id in event_started
+            if call_id not in event_finished and started.get(call_id) != "record_decision"
+        ]
         if not missing_results and not uncertain:
             return []
         affected = list(dict.fromkeys([*missing_results, *uncertain]))
@@ -183,7 +188,12 @@ class MemoryStore:
         from repo_rivet.memory.models import Message
 
         for call_id in missing_results:
-            if call_id in event_finished:
+            if started.get(call_id) == "record_decision":
+                error = (
+                    "Decision metadata may already be checkpointed; this meta tool has no local "
+                    "side effects and was not repeated."
+                )
+            elif call_id in event_finished:
                 error = "Tool completed, but its result was not checkpointed before interruption."
             elif call_id in event_started:
                 error = (
@@ -205,12 +215,21 @@ class MemoryStore:
                     ),
                 )
             )
+        possible_side_effects = any(
+            started.get(call_id) != "record_decision" for call_id in affected
+        )
+        if possible_side_effects:
+            suffix = (
+                ". Some side effects may be unknown. Inspect current workspace state and request "
+                "approval again before repeating any write or command; nothing was retried "
+                "automatically."
+            )
+        else:
+            suffix = ". The interrupted meta tool had no local side effects and was not repeated."
         warning = (
             "The previous process stopped with incomplete tool-call checkpoints: "
             + ", ".join(descriptions)
-            + ". Some side effects may be unknown. Inspect current workspace state and request "
-            "approval again before repeating any write or command; nothing was retried "
-            "automatically."
+            + suffix
         )
         already_recorded = any(
             message.role == "system" and message.content == warning for message in memory.messages

@@ -82,6 +82,10 @@ class FileSessionStore:
         store = MemoryStore(session_dir, secrets=self.secrets)
         state = memory or MemoryState(session_id=session_id)
         state.session_id = session_id
+        for event in state.reasoning_events:
+            event.session_id = session_id
+        for event in state.observation_events:
+            event.session_id = session_id
         state.status = SessionStatus.CREATED.value
         now = datetime.now(UTC)
         preview = " ".join(task.strip().split())[:160]

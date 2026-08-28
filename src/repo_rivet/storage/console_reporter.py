@@ -6,12 +6,14 @@ from typing import Any
 from rich.console import Console
 from rich.text import Text
 
+from repo_rivet.reasoning.models import ReasoningDisplayMode
 from repo_rivet.storage.terminal_text import escape_terminal_controls
 
 _INLINE_SECRET_PATTERN = re.compile(
     r"(?i)\b(api[_-]?key|authorization|password|secret|token)\b"
     r"(\s*[:=]\s*)(?:bearer\s+)?[^\s,;]+"
 )
+_INTERNAL_EVENT_ID_PATTERN = re.compile(r"\b(?:obs|reason)-[A-Za-z0-9_-]+\b")
 _SOURCE_LABELS = {
     "allow_all_mode": "allow-all mode",
     "execution_revalidation": "execution revalidation",
@@ -42,17 +44,88 @@ _PROGRESS_TOOLS = {"git_diff", "run_command"}
 class ConsoleEventReporter:
     """Render selected events without exposing tool arguments, contents, or raw output."""
 
-    def __init__(self, console: Console, *, secrets: tuple[str, ...] = ()) -> None:
+    def __init__(
+        self,
+        console: Console,
+        *,
+        secrets: tuple[str, ...] = (),
+        reasoning_mode: ReasoningDisplayMode = ReasoningDisplayMode.OFF,
+    ) -> None:
         self.console = console
         self._secrets = tuple(secret for secret in secrets if secret)
+        self.reasoning_mode = reasoning_mode
 
     def log(self, event_type: str, **data: Any) -> None:
         if event_type == "approval_decided":
             self._approval_decided(data)
         elif event_type == "approved_tool_started":
             self._tool_started(data)
+        elif event_type == "reasoning":
+            self._reasoning(data)
+        elif event_type == "action":
+            self._action(data)
+        elif event_type == "action_blocked":
+            self._action_blocked(data)
+        elif event_type == "observation":
+            self._observation(data)
         elif event_type == "tool_result":
             self._tool_result(data)
+
+    def _reasoning(self, data: dict[str, Any]) -> None:
+        if self.reasoning_mode == ReasoningDisplayMode.OFF:
+            return
+        phase = self._safe(data.get("phase", "decision")).upper()
+        if phase == "FINAL_ASSESSMENT":
+            phase = "VERIFY"
+        summary = self._safe(data.get("summary", ""), limit=500)
+        if self.reasoning_mode == ReasoningDisplayMode.SUMMARY:
+            self._print_trace_label(phase, summary, style="bold magenta")
+            return
+
+        lines = Text()
+        lines.append(f"[{phase}]", style="bold magenta")
+        lines.append(f"\nGoal: {self._safe(data.get('current_goal', ''), limit=300)}")
+        lines.append(f"\nSummary: {summary}")
+        assumptions = data.get("assumptions")
+        if isinstance(assumptions, list) and assumptions:
+            lines.append(f"\nAssumptions: {', '.join(self._safe(item) for item in assumptions)}")
+        questions = data.get("open_questions")
+        if isinstance(questions, list) and questions:
+            lines.append(f"\nOpen questions: {', '.join(self._safe(item) for item in questions)}")
+        next_action = data.get("next_action")
+        if isinstance(next_action, dict):
+            tool = self._safe(next_action.get("tool_name", ""))
+            argument = self._safe(next_action.get("argument_summary", ""), limit=300)
+            expected = self._safe(next_action.get("expected_result", ""), limit=300)
+            lines.append(f"\nNext: {tool} {argument}".rstrip())
+            lines.append(f"\nExpected: {expected}")
+        confidence = data.get("confidence")
+        if isinstance(confidence, (int, float)):
+            lines.append(f"\nConfidence: {confidence:.2f}")
+        self.console.print(lines)
+
+    def _action(self, data: dict[str, Any]) -> None:
+        if self.reasoning_mode == ReasoningDisplayMode.OFF:
+            return
+        tool = self._safe(data.get("tool", "unknown tool"))
+        argument = self._safe(data.get("argument_summary", ""), limit=200)
+        detail = f"{tool} {argument}".rstrip()
+        self._print_trace_label("ACTION", detail, style="bold cyan")
+
+    def _action_blocked(self, data: dict[str, Any]) -> None:
+        if self.reasoning_mode == ReasoningDisplayMode.OFF:
+            return
+        tool = self._safe(data.get("tool", "unknown tool"))
+        reason = self._safe(data.get("reason", "decision protocol rejected the call"), limit=300)
+        self._print_trace_label("BLOCKED", self._join(tool, reason), style="bold yellow")
+
+    def _observation(self, data: dict[str, Any]) -> None:
+        if self.reasoning_mode == ReasoningDisplayMode.OFF:
+            return
+        label = "VERIFY" if data.get("verification") is True else "OBSERVE"
+        summary = self._safe(data.get("result_summary", ""), limit=500)
+        style = "bold green" if data.get("ok") is True else "bold red"
+        self._print_trace_label(label, summary, style=style)
 
     def _approval_decided(self, data: dict[str, Any]) -> None:
         action = self._safe(data.get("action", "unknown")).lower()
@@ -83,6 +156,10 @@ class ConsoleEventReporter:
             self._print("…", tool, "running", style="bold cyan")
 
     def _tool_result(self, data: dict[str, Any]) -> None:
+        if data.get("name") == "record_decision":
+            return
+        if self.reasoning_mode != ReasoningDisplayMode.OFF:
+            return
         ok = data.get("ok") is True
         if not ok and data.get("error_code") in _APPROVAL_FAILURE_CODES:
             return
@@ -120,12 +197,20 @@ class ConsoleEventReporter:
             line.append(f" · {detail}")
         self.console.print(line)
 
+    def _print_trace_label(self, label: str, detail: str, *, style: str) -> None:
+        line = Text()
+        line.append(f"[{label}]", style=style)
+        if detail:
+            line.append(f" {detail}")
+        self.console.print(line)
+
     def _safe(self, value: Any, *, limit: int = 180) -> str:
         text = str(value)
         for secret in self._secrets:
             text = text.replace(secret, "[REDACTED]")
         text = escape_terminal_controls(text)
         text = _INLINE_SECRET_PATTERN.sub(r"\1\2[REDACTED]", text)
+        text = _INTERNAL_EVENT_ID_PATTERN.sub("", text)
         text = " ".join(text.split())
         if len(text) > limit:
             return f"{text[:limit]}…"

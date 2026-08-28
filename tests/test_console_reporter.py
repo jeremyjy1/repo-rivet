@@ -11,6 +11,7 @@ from repo_rivet.approval.models import ApprovalMode
 from repo_rivet.approval.normalizer import RequestNormalizer
 from repo_rivet.approval.risk_analyzer import RiskAnalyzer
 from repo_rivet.memory.models import MemoryState
+from repo_rivet.reasoning.models import ReasoningDisplayMode
 from repo_rivet.storage.console_reporter import ConsoleEventReporter
 from repo_rivet.storage.event_sink import CompositeEventSink
 from repo_rivet.tools.base import ToolCall
@@ -243,3 +244,98 @@ def test_composite_event_sink_forwards_each_event() -> None:
 
     assert first.events == [("tool_call", {"name": "read_file"})]
     assert second.events == first.events
+
+
+def test_console_reporter_shows_structured_summary_trace_without_tool_duplication() -> None:
+    buffer = StringIO()
+    reporter = ConsoleEventReporter(
+        Console(file=buffer, force_terminal=False, color_system=None, width=240),
+        reasoning_mode=ReasoningDisplayMode.SUMMARY,
+    )
+
+    reporter.log("reasoning", phase="plan", summary="Inspect, edit, and verify.")
+    reporter.log("action", tool="read_file", argument_summary="src/app.py")
+    reporter.log(
+        "observation",
+        event_id="obs-123",
+        ok=True,
+        result_summary="Read src/app.py:1-20.",
+        verification=False,
+    )
+    reporter.log("tool_result", name="read_file", ok=True)
+    reporter.log(
+        "observation",
+        event_id="obs-verify",
+        ok=True,
+        result_summary="Command finished with exit code 0.",
+        verification=True,
+    )
+
+    assert buffer.getvalue().splitlines() == [
+        "[PLAN] Inspect, edit, and verify.",
+        "[ACTION] read_file src/app.py",
+        "[OBSERVE] Read src/app.py:1-20.",
+        "[VERIFY] Command finished with exit code 0.",
+    ]
+
+
+def test_console_reporter_labels_unexecuted_action_as_blocked() -> None:
+    buffer = StringIO()
+    reporter = ConsoleEventReporter(
+        Console(file=buffer, force_terminal=False, color_system=None, width=240),
+        reasoning_mode=ReasoningDisplayMode.SUMMARY,
+    )
+
+    reporter.log(
+        "action_blocked",
+        tool="run_command",
+        reason="A matching decision is required.",
+        error_code="decision_validation_failed",
+    )
+    reporter.log(
+        "tool_result",
+        name="run_command",
+        ok=False,
+        error_code="decision_validation_failed",
+        executed=False,
+    )
+
+    assert buffer.getvalue().splitlines() == [
+        "[BLOCKED] run_command · A matching decision is required."
+    ]
+
+
+def test_console_reporter_trace_is_structured_bounded_and_secret_safe() -> None:
+    buffer = StringIO()
+    reporter = ConsoleEventReporter(
+        Console(file=buffer, force_terminal=False, color_system=None, width=240),
+        secrets=("opaque-secret",),
+        reasoning_mode=ReasoningDisplayMode.TRACE,
+    )
+
+    reporter.log(
+        "reasoning",
+        phase="decision",
+        current_goal="modify one branch",
+        summary="Use obs-1 and reason-2 without opaque-secret",
+        evidence_refs=["obs-1"],
+        assumptions=["public API remains stable"],
+        open_questions=["none"],
+        next_action={
+            "tool_name": "replace_text",
+            "argument_summary": "src/app.py",
+            "expected_result": "one replacement",
+        },
+        confidence=0.91,
+    )
+
+    output = buffer.getvalue()
+    assert "[DECISION]" in output
+    assert "Goal: modify one branch" in output
+    assert "Evidence:" not in output
+    assert "obs-1" not in output
+    assert "reason-2" not in output
+    assert "Next: replace_text src/app.py" in output
+    assert "Confidence: 0.91" in output
+    assert "opaque-secret" not in output
+    assert "[REDACTED]" in output

@@ -6,7 +6,7 @@ import pytest
 from pydantic import ValidationError
 
 from repo_rivet.memory.context_manager import SYSTEM_PROMPT
-from repo_rivet.memory.models import MemoryConfig, MemoryState
+from repo_rivet.memory.models import MemoryConfig, MemoryState, Message
 from repo_rivet.memory.store import MemoryStore
 from repo_rivet.tools.base import ToolCall, ToolResult
 
@@ -37,15 +37,14 @@ def read_result(content: str, sha256: str = "abc123") -> ToolResult:
     )
 
 
-def test_repeated_unchanged_file_read_does_not_repeat_content() -> None:
+def test_repeated_unchanged_file_read_still_returns_requested_content() -> None:
     memory = make_memory()
 
     memory.record_tool_result(read_call(), read_result("large file content"), step=1)
     memory.record_tool_result(read_call(), read_result("large file content"), step=2)
 
     latest_message = json.loads(memory.messages[-1].content or "{}")
-    assert "is unchanged" in latest_message["output"]
-    assert "large file content" not in latest_message["output"]
+    assert latest_message["output"] == "1 | large file content"
     assert memory.file_memories["src/app.py"].last_read_step == 2
 
 
@@ -109,11 +108,32 @@ def test_failed_verification_is_preserved_in_structured_summary() -> None:
     assert memory.summary.verification_status == "failed: pytest -q"
     assert any("Verification failed" in issue for issue in memory.summary.unresolved_issues)
     assert memory.command_outputs[-1].full_output_path == "command_outputs/step-3.log"
-    assert memory.command_outputs[-1].context_output.endswith(
-        "Full output: command_outputs/step-3.log"
-    )
+    assert "retained in session audit storage" in memory.command_outputs[-1].context_output
+    assert "command_outputs/step-3.log" not in memory.command_outputs[-1].context_output
     assert memory.command_outputs[-1].original_chars == len(result.raw_output or "")
     assert memory.command_outputs[-1].estimated_tokens > 0
+
+
+def test_model_message_hides_inaccessible_session_output_reference() -> None:
+    message = Message(
+        role="tool",
+        tool_call_id="read-1",
+        content=json.dumps(
+            {
+                "ok": True,
+                "output": "content\nFull output: file_snapshots/step-1.txt",
+                "metadata": {
+                    "evidence_ref": "obs-1",
+                    "output_ref": "file_snapshots/step-1.txt",
+                },
+            }
+        ),
+    )
+
+    visible = json.loads(message.as_chat_message()["content"])
+
+    assert visible["output"] == "content"
+    assert visible["metadata"] == {"evidence_ref": "obs-1"}
 
 
 def test_new_modification_invalidates_passed_verification() -> None:

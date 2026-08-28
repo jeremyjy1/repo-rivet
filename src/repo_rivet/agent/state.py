@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from repo_rivet.llm.base import ModelResponse
+from repo_rivet.reasoning.models import ReasoningEvent
 from repo_rivet.tools.base import ToolCall, ToolResult
 
 _FILE_MODIFICATION_TOOLS = frozenset({"replace_text", "write_file"})
@@ -27,10 +28,14 @@ class SessionState:
     consecutive_failures: int = 0
     repeated_tool_calls: int = 0
     empty_model_responses: int = 0
+    consecutive_protocol_failures: int = 0
     last_tool_signature: str | None = None
     recent_errors: list[str] = field(default_factory=list)
     started_at: float = field(default_factory=time.monotonic)
     interrupted: bool = False
+    reasoning_only_turns: int = 0
+    reflection_required: bool = False
+    pending_decision: ReasoningEvent | None = None
 
     def record_model_response(self, response: ModelResponse) -> None:
         """Advance one model step and track unusable empty responses."""
@@ -89,6 +94,16 @@ class SessionState:
 
         self.messages.append(result.as_tool_message(call.id))
 
+    def record_blocked_tool_result(self, call: ToolCall, result: ToolResult) -> None:
+        """Pair a rejected model call without counting it as an executed tool."""
+        self.messages.append(result.as_tool_message(call.id))
+
+    def record_protocol_failure(self, error: str) -> None:
+        """Track one invalid model turn independently from executor failures."""
+        self.consecutive_protocol_failures += 1
+        self.recent_errors.append(error)
+        self.recent_errors[:] = self.recent_errors[-5:]
+
     def state_summary(self) -> str:
         """Return a compact deterministic summary for the context manager."""
         modified = ", ".join(sorted(self.modified_files)) or "none"
@@ -100,9 +115,15 @@ class SessionState:
             else "not required"
         )
         errors = " | ".join(self.recent_errors) or "none"
+        pending_decision = (
+            self.pending_decision.next_action.tool_name
+            if self.pending_decision is not None and self.pending_decision.next_action is not None
+            else "none"
+        )
         return (
             f"Model steps: {self.step_count}. Tool calls: {self.tool_call_count}.\n"
             f"Modified files: {modified}.\n"
             f"Latest verification: {verification}.\n"
+            f"One-shot pending decision: {pending_decision}.\n"
             f"Recent errors: {errors}."
         )

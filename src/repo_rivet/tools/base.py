@@ -102,8 +102,30 @@ class BaseTool[ArgumentsT: ToolArguments](ABC):
         """Invoke the operation after validation and approval."""
         try:
             return self.run(arguments)
-        except (OSError, UnicodeError, ValueError) as error:
-            return ToolResult(ok=False, output="", error=str(error))
+        except UnicodeError as error:
+            return ToolResult(
+                ok=False,
+                output="",
+                error=str(error),
+                error_code="encoding_error",
+                retryable=False,
+            )
+        except OSError as error:
+            return ToolResult(
+                ok=False,
+                output="",
+                error=str(error),
+                error_code="io_error",
+                retryable=True,
+            )
+        except ValueError as error:
+            return ToolResult(
+                ok=False,
+                output="",
+                error=str(error),
+                error_code="tool_error",
+                retryable=True,
+            )
 
     @abstractmethod
     def run(self, arguments: ArgumentsT) -> ToolResult:

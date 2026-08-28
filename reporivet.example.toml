@@ -18,6 +18,16 @@ default_correction_factor = 1.25
 calibration_window = 20
 max_context_overflow_retries = 2
 
+[reasoning]
+enabled = true
+# off, summary, or trace; structured summaries never expose raw chain-of-thought.
+display = "summary"
+max_summary_chars = 1000
+recent_event_limit = 8
+require_for_mutating_tools = true
+require_for_commands = true
+max_reflection_only_turns = 2
+
 [approval]
 # allow-all, llm-auto, safe-auto, always-ask, or read-only
 mode = "safe-auto"

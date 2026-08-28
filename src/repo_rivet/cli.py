@@ -36,6 +36,8 @@ from repo_rivet.memory.models import MemoryConfig, MemoryState
 from repo_rivet.memory.store import MemoryStore
 from repo_rivet.memory.token_calibrator import TokenCalibrationStore
 from repo_rivet.memory.token_estimator import create_token_estimator
+from repo_rivet.reasoning.manager import ReasoningManager
+from repo_rivet.reasoning.models import ReasoningDisplayMode
 from repo_rivet.safety.path_policy import PathPolicyError
 from repo_rivet.session.errors import SessionError
 from repo_rivet.session.lock import SessionLock
@@ -177,6 +179,11 @@ def _add_model_runtime_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--max-steps", type=int, default=30)
     parser.add_argument("--max-seconds", type=float, default=600)
+    parser.add_argument(
+        "--reasoning",
+        choices=[mode.value for mode in ReasoningDisplayMode],
+        help="Display structured decision records: off, summary, or trace",
+    )
     parser.add_argument(
         "--approval-mode",
         choices=[mode.value for mode in ApprovalMode],
@@ -432,6 +439,7 @@ def _session_resume(
         max_steps=arguments.max_steps,
         max_seconds=arguments.max_seconds,
         approval_mode=arguments.approval_mode,
+        reasoning=arguments.reasoning,
         session=metadata.session_id,
     )
     reader = prompt_reader or (lambda prompt: Prompt.ask(prompt, console=console))
@@ -497,6 +505,17 @@ def _print_session_details(
     modified = ", ".join(sorted(memory.modified_files)) or "none"
     details.append(f"Modified:  {_terminal_text(modified)}\n")
     details.append(f"Verification: {_terminal_text(memory.summary.verification_status)}")
+    if memory.reasoning_events:
+        decision = memory.reasoning_events[-1]
+        details.append(f"\nLast {decision.phase.value}: {_terminal_text(decision.summary)}")
+        if decision.next_action is not None:
+            details.append(
+                f"\nNext action: {_terminal_text(decision.next_action.tool_name)} "
+                f"{_terminal_text(decision.next_action.argument_summary)}"
+            )
+    if memory.observation_events:
+        observation = memory.observation_events[-1]
+        details.append(f"\nLast observation: {_terminal_text(observation.result_summary)}")
     console.print(Panel(details, title="Session details"))
 
 
@@ -525,6 +544,14 @@ def _build_runtime(
     )
     secrets = (config.api.api_key.get_secret_value(),)
     session_manager = FileSessionStore(secrets=secrets)
+    configured_reasoning_mode = ReasoningDisplayMode(
+        arguments.reasoning or config.reasoning.display
+    )
+    reasoning_mode = (
+        configured_reasoning_mode if config.reasoning.enabled else ReasoningDisplayMode.OFF
+    )
+    reasoning_config = config.reasoning.model_copy(update={"display": reasoning_mode})
+    reasoning_manager = ReasoningManager(reasoning_config, secrets=secrets)
     calibration_store = TokenCalibrationStore(session_manager.root / "token-calibration.json")
     token_manager = TokenBudgetManager(
         estimator=estimator,
@@ -574,7 +601,11 @@ def _build_runtime(
     try:
         runtime_events = CompositeEventSink(
             store,
-            ConsoleEventReporter(console, secrets=secrets),
+            ConsoleEventReporter(
+                console,
+                secrets=secrets,
+                reasoning_mode=reasoning_mode,
+            ),
         )
         approval_engine = _build_approval_engine(
             config=config,
@@ -595,6 +626,7 @@ def _build_runtime(
             termination_policy=TerminationPolicy(termination),
             event_logger=runtime_events,
             memory_store=store,
+            reasoning_manager=reasoning_manager,
         )
         memory.status = SessionStatus.RUNNING.value
         store.save_state(memory, status=SessionStatus.RUNNING.value)
@@ -721,6 +753,7 @@ def _print_runtime(console: Console, workspace: Path, runtime: Runtime) -> None:
             f"Maximum output: {runtime.config.api.max_output_tokens} tokens\n"
             f"Token estimator: {runtime.controller.context_manager.token_manager.name}\n"
             f"Approval mode: {runtime.registry.approval_engine.mode.value}\n"
+            f"Decision trace: {runtime.controller.reasoning_manager.config.display.value}\n"
             f"Safe prompt budget: "
             f"{runtime.controller.context_manager.token_manager.config.prompt_budget} tokens\n"
             f"Session: {runtime.store.session_dir}",

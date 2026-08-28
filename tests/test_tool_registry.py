@@ -6,10 +6,11 @@ from repo_rivet.tools.git import GitDiffTool
 from repo_rivet.tools.registry import create_default_registry
 
 
-def test_default_registry_exposes_seven_tools(tmp_path: Path) -> None:
+def test_default_registry_exposes_workspace_and_decision_tools(tmp_path: Path) -> None:
     registry = create_default_registry(tmp_path)
 
     assert registry.names == (
+        "record_decision",
         "list_files",
         "search_text",
         "read_file",

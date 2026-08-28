@@ -37,11 +37,38 @@ def test_real_tools_complete_three_step_edit_and_verification_loop(tmp_path: Pat
             "command": f"{shlex.quote(sys.executable)} -m py_compile discount.py",
         },
     )
+    replace_decision = ToolCall(
+        id="decision-2",
+        name="record_decision",
+        arguments={
+            "phase": "decision",
+            "current_goal": "Reject negative prices",
+            "summary": "The file read identified the precise return statement to guard.",
+            "evidence_refs": ["read observation"],
+            "next_tool": "replace_text",
+            "next_tool_argument_summary": "edit discount.py once",
+            "expected_result": "A negative-price guard is inserted exactly once",
+            "confidence": 0.9,
+        },
+    )
+    verify_decision = ToolCall(
+        id="decision-3",
+        name="record_decision",
+        arguments={
+            "phase": "decision",
+            "current_goal": "Verify the edited module",
+            "summary": "The source changed and now requires syntax verification.",
+            "next_tool": "run_command",
+            "next_tool_argument_summary": "compile discount.py",
+            "expected_result": "Python compilation exits successfully",
+            "confidence": 0.9,
+        },
+    )
     model = FakeModelClient(
         [
             ModelResponse(tool_calls=[read]),
-            ModelResponse(tool_calls=[replace]),
-            ModelResponse(tool_calls=[verify]),
+            ModelResponse(tool_calls=[replace_decision, replace]),
+            ModelResponse(tool_calls=[verify_decision, verify]),
             ModelResponse(content="Rejected negative prices and verified the module."),
         ]
     )
@@ -60,4 +87,6 @@ def test_real_tools_complete_three_step_edit_and_verification_loop(tmp_path: Pat
     assert "raise ValueError" in source_path.read_text(encoding="utf-8")
     log_content = log_path.read_text(encoding="utf-8")
     assert '"event": "session_start"' in log_content
+    assert '"event": "reasoning"' in log_content
+    assert '"event": "observation"' in log_content
     assert '"event": "session_end"' in log_content

@@ -81,6 +81,11 @@ minimum_confidence = 0.95
 
 [approval.safety]
 deny_secret_access = false
+
+[reasoning]
+display = "trace"
+recent_event_limit = 12
+max_summary_chars = 600
 """,
     )
 
@@ -93,6 +98,9 @@ deny_secret_access = false
     assert config.approval.llm.max_auto_approve_risk == "low"
     assert config.approval.llm.minimum_confidence == 0.95
     assert not config.approval.safety.deny_secret_access
+    assert config.reasoning.display.value == "trace"
+    assert config.reasoning.recent_event_limit == 12
+    assert config.reasoning.max_summary_chars == 600
 
 
 def test_load_config_reports_missing_file(tmp_path: Path) -> None:

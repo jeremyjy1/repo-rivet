@@ -22,6 +22,22 @@ def call(call_id: str, name: str, arguments: dict) -> ToolCall:  # type: ignore[
     return ToolCall(id=call_id, name=name, arguments=arguments)
 
 
+def decision(call_id: str, next_tool: str, summary: str = "Use the declared tool.") -> ToolCall:
+    return call(
+        call_id,
+        "record_decision",
+        {
+            "phase": "decision",
+            "current_goal": "Complete the requested change safely",
+            "summary": summary,
+            "next_tool": next_tool,
+            "next_tool_argument_summary": "bounded task action",
+            "expected_result": "The action completes with a locally observed result",
+            "confidence": 0.8,
+        },
+    )
+
+
 def controller(
     model: FakeModelClient,
     tools: FakeToolRegistry,
@@ -55,9 +71,9 @@ def test_agent_refuses_early_finish_until_change_is_verified() -> None:
     verify = call("2", "run_command", {"command": "pytest -q"})
     model = FakeModelClient(
         [
-            ModelResponse(tool_calls=[write]),
+            ModelResponse(tool_calls=[decision("d1", "write_file"), write]),
             ModelResponse(content="Finished too early."),
-            ModelResponse(tool_calls=[verify]),
+            ModelResponse(tool_calls=[decision("d2", "run_command"), verify]),
             ModelResponse(content="Implemented and tested."),
         ]
     )

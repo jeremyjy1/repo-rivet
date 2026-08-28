@@ -141,6 +141,7 @@ class SearchTextTool(WorkspaceTool):
             raise ValueError(f"Invalid regular expression: {error}") from None
 
         matches: list[str] = []
+        match_locations: list[str] = []
         files_scanned = 0
         for display_path, file_path in self._iter_files(root):
             try:
@@ -151,12 +152,15 @@ class SearchTextTool(WorkspaceTool):
             for line_number, line in enumerate(content.splitlines(), start=1):
                 if pattern.search(line):
                     matches.append(f"{display_path}:{line_number}:{line[:500]}")
+                    if len(match_locations) < 5:
+                        match_locations.append(f"{display_path}:{line_number}")
                     if len(matches) >= MAX_SEARCH_MATCHES:
                         return ToolResult(
                             ok=True,
                             output="\n".join(matches),
                             metadata={
                                 "matches": len(matches),
+                                "match_locations": match_locations,
                                 "files_scanned": files_scanned,
                                 "truncated": True,
                             },
@@ -167,6 +171,7 @@ class SearchTextTool(WorkspaceTool):
             output="\n".join(matches) if matches else "(no matches)",
             metadata={
                 "matches": len(matches),
+                "match_locations": match_locations,
                 "files_scanned": files_scanned,
                 "truncated": False,
             },
@@ -257,12 +262,14 @@ class WriteFileTool(WorkspaceTool):
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text(arguments.content, encoding="utf-8")
         sha256 = hashlib.sha256(encoded_content).hexdigest()
+        line_count = len(arguments.content.splitlines())
         return ToolResult(
             ok=True,
             output=f"Wrote {len(encoded_content)} bytes to {arguments.path}",
             metadata={
                 "path": arguments.path,
                 "bytes": len(encoded_content),
+                "line_count": line_count,
                 "created": not existed,
                 "sha256": sha256,
             },
@@ -288,6 +295,15 @@ class ReplaceTextTool(WorkspaceTool):
                 "file unchanged"
             )
 
+        line_numbers: list[int] = []
+        search_start = 0
+        while True:
+            match_start = content.find(arguments.old_text, search_start)
+            if match_start < 0:
+                break
+            line_numbers.append(content.count("\n", 0, match_start) + 1)
+            search_start = match_start + len(arguments.old_text)
+
         updated = content.replace(arguments.old_text, arguments.new_text)
         encoded_content = updated.encode("utf-8")
         if len(encoded_content) > MAX_TEXT_FILE_BYTES:
@@ -297,7 +313,12 @@ class ReplaceTextTool(WorkspaceTool):
         return ToolResult(
             ok=True,
             output=f"Replaced {actual_count} occurrence(s) in {arguments.path}",
-            metadata={"path": arguments.path, "replacements": actual_count, "sha256": sha256},
+            metadata={
+                "path": arguments.path,
+                "replacements": actual_count,
+                "line_numbers": line_numbers,
+                "sha256": sha256,
+            },
             raw_output=updated,
         )
 

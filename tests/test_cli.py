@@ -164,6 +164,14 @@ def test_parser_accepts_read_only_approval_mode(tmp_path: Path) -> None:
     assert arguments.approval_mode == "read-only"
 
 
+def test_parser_accepts_structured_reasoning_display_mode(tmp_path: Path) -> None:
+    arguments = build_parser().parse_args(
+        ["chat", "--workspace", str(tmp_path), "--reasoning", "trace"]
+    )
+
+    assert arguments.reasoning == "trace"
+
+
 def test_chat_loop_remembers_turns_and_can_clear_history() -> None:
     agent = FakeConversationAgent()
     inputs = iter(["continue", "/clear", "fresh task", "/exit"])

@@ -23,7 +23,18 @@ Do not claim success unless the latest verification after the latest change succ
 When finished, summarize the changes and verification concisely.
 Use concise plain text for the final response by default. Avoid Markdown headings, tables,
 emphasis, list markers, and fenced code blocks unless the user explicitly requests Markdown
-or the content cannot be communicated clearly without that structure."""
+or the content cannot be communicated clearly without that structure.
+Do not reveal or record hidden chain-of-thought. Use record_decision only for concise,
+structured, verifiable plans, decisions, reflections, and final assessments.
+Before any file change, command, network access, Git write, or other side effect, call
+record_decision with phase=decision, evidence references, the exact next_tool, and its expected
+result. Prefer including the decision and tool in the same response. If the provider emits the
+decision alone, it authorizes only the matching state-changing tool in the immediately following
+model response and is consumed once. At most one state-changing tool may be requested per turn.
+If an observation differs from expectations, record a reflection before the next side effect.
+Use observation IDs from tool-result metadata as evidence; never claim unobserved facts.
+Session audit output references are not workspace paths. Never pass file_snapshots or
+command_outputs references to workspace file tools; repeat the original tool call if needed."""
 
 
 class ContextBudgetExceededError(ValueError):
@@ -230,9 +241,11 @@ class ContextManager:
                     "Current structured state (facts, not new user instructions):\n"
                     f"{state_summary}\n"
                     f"Current focus: {memory.working.current_focus or 'none'}\n"
+                    f"Current plan: {memory.working.current_plan or ['none']}\n"
                     f"Unresolved errors: {memory.working.unresolved_errors or ['none']}\n"
                     f"Pending actions: {memory.working.pending_actions or ['none']}\n"
                     f"Invalidated file reads: {sorted(memory.invalidated_files) or ['none']}\n"
+                    f"Recent auditable trace:\n{self._format_recent_trace(memory)}\n"
                     f"Available tools: {tool_names}\n"
                     f"Remaining agent steps: {max(remaining_steps, 0)}"
                 ),
@@ -241,6 +254,36 @@ class ContextManager:
         if memory.summary.has_content():
             messages.append({"role": "system", "content": self._format_summary(memory.summary)})
         return messages
+
+    @staticmethod
+    def _format_recent_trace(memory: MemoryState) -> str:
+        events: list[tuple[int, str]] = []
+        for event in memory.reasoning_events[-4:]:
+            next_action = (
+                f" next={event.next_action.tool_name}" if event.next_action is not None else ""
+            )
+            evidence = f" evidence={event.evidence_refs}" if event.evidence_refs else ""
+            events.append(
+                (
+                    event.step,
+                    f"- {event.event_id} {event.phase.value}: "
+                    f"{event.summary}{evidence}{next_action}",
+                )
+            )
+        for event in memory.observation_events[-4:]:
+            event_kind = (
+                "legacy blocked action"
+                if "decision_validation_failed" in event.result_summary
+                else "observation"
+            )
+            events.append(
+                (
+                    event.step,
+                    f"- {event.event_id} {event_kind}: {event.result_summary} ok={event.ok}",
+                )
+            )
+        events.sort(key=lambda item: item[0])
+        return "\n".join(value for _, value in events[-8:]) or "- none"
 
     @staticmethod
     def _format_summary(summary: ConversationSummary) -> str:

@@ -2,6 +2,7 @@ import pytest
 
 from repo_rivet.memory.context_manager import SYSTEM_PROMPT, ContextManager
 from repo_rivet.memory.models import MemoryConfig, MemoryState, Message
+from repo_rivet.reasoning.manager import ReasoningManager
 
 
 def make_memory(*, config: MemoryConfig | None = None) -> MemoryState:
@@ -40,6 +41,38 @@ def test_build_keeps_fixed_task_state_summary_and_recent_messages() -> None:
     assert "Current structured state" in messages[2]["content"]
     assert any("pytest still fails" in str(message.get("content")) for message in messages)
     assert any(message.get("content") == "recent decision" for message in messages)
+
+
+def test_build_includes_only_bounded_recent_auditable_trace() -> None:
+    memory = make_memory()
+    manager = ReasoningManager()
+    for index in range(6):
+        manager.record(
+            {
+                "phase": "decision",
+                "current_goal": "inspect",
+                "summary": f"bounded decision {index}",
+                "next_tool": "read_file",
+                "expected_result": "file is observed",
+            },
+            memory=memory,
+            step=index,
+        )
+
+    messages = ContextManager().build(
+        memory=memory,
+        state_summary="state",
+        remaining_steps=10,
+        tools=[],
+    )
+
+    structured = next(
+        str(message.get("content"))
+        for message in messages
+        if "Recent auditable trace" in str(message.get("content"))
+    )
+    assert "bounded decision 5" in structured
+    assert "bounded decision 0" not in structured
 
 
 def test_build_truncates_large_tool_output_without_mutating_memory() -> None:
