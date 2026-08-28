@@ -195,6 +195,7 @@ def test_console_reporter_makes_dynamic_markup_and_controls_inert() -> None:
     assert "[REDACTED]" in output
     assert "\\x1b[2J" in output
     assert "\x1b" not in output
+    assert "abc1234567890" not in output
 
 
 def test_real_hard_denial_is_rendered_once_with_its_target(tmp_path: Path) -> None:

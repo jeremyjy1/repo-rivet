@@ -203,6 +203,57 @@ def test_edit_approval_contains_preflight_diff_and_version_fingerprint(tmp_path:
     assert any(event == "edit_approved" for event, _ in events.events)
 
 
+def test_terminal_edit_approval_shows_readable_operations_and_diff_without_hashes(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "main.py"
+    path.write_text("value = 1\n", encoding="utf-8")
+    buffer = StringIO()
+    console = Console(file=buffer, force_terminal=False, color_system=None, width=200)
+    terminal = TerminalHumanApprover(console, reader=lambda _: "1")
+    engine, _ = create_engine(tmp_path, mode=ApprovalMode.SAFE_AUTO, human=terminal)
+    registry = create_default_registry(tmp_path, approval_engine=engine)
+    read = registry.execute(
+        ToolCall(id="read-for-terminal-edit", name="read_file", arguments={"path": "main.py"})
+    )
+    assert read.ok and read.metadata
+
+    edited = registry.execute(
+        ToolCall(
+            id="terminal-edit",
+            name="edit_file",
+            arguments={
+                "path": "main.py",
+                "snapshot_id": read.metadata["snapshot_id"],
+                "operations": [
+                    {
+                        "op": "replace",
+                        "start_line": 1,
+                        "end_line": 1,
+                        "new_lines": ["value = 2", "print(value)"],
+                    }
+                ],
+            },
+        )
+    )
+
+    output = buffer.getvalue()
+    assert edited.ok
+    assert "Edit Approval Required" in output
+    assert "Requested edit" in output
+    assert "File" in output and "main.py" in output
+    assert "Replace lines 1-1 with 2 lines" in output
+    assert "Proposed changes" in output
+    assert "-value = 1" in output
+    assert "+value = 2" in output
+    assert "+print(value)" in output
+    assert read.metadata["snapshot_id"] not in output
+    assert read.metadata["raw_bytes_hash"] not in output
+    assert "snapshot_id" not in output
+    assert "prepared_live_hash" not in output
+    assert "new_lines_sha256" not in output
+
+
 def test_large_line_deletion_is_classified_as_high_risk(tmp_path: Path) -> None:
     engine, _ = create_engine(tmp_path, mode=ApprovalMode.ALLOW_ALL)
 
@@ -619,6 +670,36 @@ def test_terminal_approval_uses_numbered_options_and_reprompts_invalid_choice(
     assert "2  Approve this exact request for the session" in output
     assert "5  Abort agent" in output
     assert "Enter a number from 1 to 5" in output
+    assert "Requested action" in output
+    assert "File" in output and "file.txt" in output
+    assert "Content" in output and "5 characters" in output
+    assert request.fingerprint[:12] not in output
+    assert "sha256" not in output.lower()
+
+
+def test_terminal_command_approval_uses_readable_fields_without_internal_json(
+    tmp_path: Path,
+) -> None:
+    engine, _ = create_engine(tmp_path, mode=ApprovalMode.ALLOW_ALL)
+    request = engine.authorize(
+        tool_name="run_command",
+        arguments={"command": "pytest -q", "cwd": "tests", "timeout_seconds": 90},
+        capabilities={Capability.PROCESS_EXECUTE},
+        session_id=engine.session_id,
+    ).request
+    buffer = StringIO()
+    console = Console(file=buffer, force_terminal=False, color_system=None, width=180)
+
+    TerminalHumanApprover(console, reader=lambda _: "1").ask(request)
+
+    output = buffer.getvalue()
+    assert "Requested action" in output
+    assert "Program" in output and "pytest" in output
+    assert "Arguments" in output and "-q" in output
+    assert "Working directory" in output and "tests" in output
+    assert "Timeout" in output and "90 seconds" in output
+    assert "Normalized request" not in output
+    assert request.fingerprint[:12] not in output
 
 
 def test_terminal_option_five_marks_agent_abort(tmp_path: Path) -> None:

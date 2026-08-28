@@ -265,7 +265,4 @@ class ConsoleEventReporter:
         affected_paths = data.get("affected_paths")
         if isinstance(affected_paths, list) and affected_paths:
             return f"target {self._safe(affected_paths[0], limit=100)}"
-        fingerprint = data.get("fingerprint")
-        if isinstance(fingerprint, str) and fingerprint:
-            return f"request {self._safe(fingerprint[:12])}"
         return None

@@ -20,6 +20,29 @@ from repo_rivet.approval.models import (
     LLMReviewResult,
     NonInteractivePolicy,
 )
+from repo_rivet.storage.terminal_text import escape_terminal_controls
+
+_HIDDEN_DISPLAY_KEYS = frozenset(
+    {
+        "fingerprint",
+        "prepared_live_hash",
+        "snapshot_id",
+        "snapshot_tag",
+    }
+)
+_DISPLAY_LABELS = {
+    "case_sensitive": "Case sensitive",
+    "check_id": "Verification check",
+    "content": "Content",
+    "cwd": "Working directory",
+    "end_line": "End line",
+    "max_depth": "Maximum depth",
+    "path": "File",
+    "query": "Search query",
+    "regex": "Regular expression",
+    "start_line": "Start line",
+    "timeout_seconds": "Timeout",
+}
 
 
 class HumanApprover(Protocol):
@@ -100,7 +123,6 @@ class TerminalHumanApprover:
         summary.add_column()
         summary.add_row("Tool", request.tool_name)
         summary.add_row("Risk", request.assessment.level.name)
-        summary.add_row("Request", request.fingerprint[:12])
 
         reasons = Text()
         for index, reason in enumerate(request.assessment.reasons):
@@ -110,21 +132,12 @@ class TerminalHumanApprover:
         if not reasons:
             reasons.append("• No deterministic reason was provided.")
 
-        arguments = Text(
-            json.dumps(
-                request.normalized_arguments,
-                ensure_ascii=False,
-                sort_keys=True,
-                indent=2,
-            )
-        )
-        sections: list[object] = [
-            summary,
-            Text("\nRisk reasons", style="bold"),
-            reasons,
-            Text("\nNormalized request", style="bold"),
-            arguments,
-        ]
+        sections: list[object] = [summary]
+        if request.tool_name == "edit_file":
+            sections.extend(TerminalHumanApprover._edit_sections(request))
+        else:
+            sections.extend(TerminalHumanApprover._request_sections(request))
+        sections.extend((Text("\nRisk reasons", style="bold"), reasons))
         if llm_review is not None:
             review = Text()
             review.append(
@@ -143,7 +156,52 @@ class TerminalHumanApprover:
         options.add_row("4", "Deny this exact request for the session, with optional direction")
         options.add_row("5", "Abort agent")
         sections.extend((Text("\nOptions", style="bold"), options))
-        return Panel(Group(*sections), title="Approval Required", border_style="yellow")
+        title = (
+            "Edit Approval Required" if request.tool_name == "edit_file" else "Approval Required"
+        )
+        return Panel(Group(*sections), title=title, border_style="yellow")
+
+    @staticmethod
+    def _edit_sections(request: ApprovalRequest) -> list[object]:
+        arguments = request.normalized_arguments
+        details = Table.grid(padding=(0, 2))
+        details.add_column(style="bold")
+        details.add_column()
+        details.add_row("File", _display_value(arguments.get("path", "unknown")))
+        operations = arguments.get("operations")
+        operation_values = operations if isinstance(operations, list) else []
+        details.add_row("Operations", str(len(operation_values)))
+
+        operation_text = Text()
+        for index, operation in enumerate(operation_values, start=1):
+            if index > 1:
+                operation_text.append("\n")
+            operation_text.append(f"{index}. ", style="bold cyan")
+            operation_text.append(_operation_description(operation))
+        if not operation_values:
+            operation_text.append("No edit operations were provided.", style="yellow")
+
+        diff_value = arguments.get("diff_preview")
+        return [
+            Text("\nRequested edit", style="bold"),
+            details,
+            Text("\nOperations", style="bold"),
+            operation_text,
+            Text("\nProposed changes", style="bold"),
+            _format_diff(diff_value if isinstance(diff_value, str) else ""),
+        ]
+
+    @staticmethod
+    def _request_sections(request: ApprovalRequest) -> list[object]:
+        rows = _request_rows(request)
+        if not rows:
+            return []
+        details = Table.grid(padding=(0, 2))
+        details.add_column(style="bold")
+        details.add_column()
+        for label, value in rows:
+            details.add_row(label, value)
+        return [Text("\nRequested action", style="bold"), details]
 
     def _read_choice(self, prompt: str) -> str | None:
         if self.reader is not None:
@@ -195,6 +253,134 @@ class TerminalHumanApprover:
             scope=scope,
             abort_agent=abort_agent,
         )
+
+
+def _request_rows(request: ApprovalRequest) -> list[tuple[str, str]]:
+    arguments = _without_hashes(request.normalized_arguments)
+    if not isinstance(arguments, dict):
+        return []
+    rows: list[tuple[str, str]] = []
+    path = arguments.get("path")
+    if isinstance(path, str):
+        path_label = (
+            "Directory"
+            if request.tool_name in {"git_diff", "list_files", "search_text"}
+            else "File"
+        )
+        rows.append((path_label, _display_value(path)))
+
+    command = arguments.get("command")
+    if isinstance(command, dict):
+        rows.append(("Program", _display_value(command.get("program", "unknown"))))
+        command_arguments = command.get("args")
+        if isinstance(command_arguments, list):
+            rows.append(
+                (
+                    "Arguments",
+                    " ".join(_display_value(value) for value in command_arguments) or "(none)",
+                )
+            )
+
+    skipped = {
+        "command",
+        "diff_preview",
+        "operations",
+        "path",
+    }
+    for key, value in arguments.items():
+        if key in skipped or key.startswith("_") or value is None:
+            continue
+        label = _DISPLAY_LABELS.get(key, key.replace("_", " ").capitalize())
+        rendered = _display_value(value)
+        if key == "timeout_seconds" and rendered not in {"", "unknown"}:
+            rendered = f"{rendered} seconds"
+        rows.append((label, rendered))
+    return rows
+
+
+def _without_hashes(value: object) -> object:
+    if isinstance(value, dict):
+        cleaned: dict[str, object] = {}
+        for key, item in value.items():
+            normalized = str(key).lower()
+            if (
+                normalized in _HIDDEN_DISPLAY_KEYS
+                or normalized == "hash"
+                or normalized == "sha256"
+                or normalized.endswith("_sha256")
+                or normalized.endswith("_hash")
+                or normalized.endswith("_fingerprint")
+                or normalized.endswith("snapshot_id")
+                or normalized.endswith("snapshot_tag")
+            ):
+                continue
+            cleaned[str(key)] = _without_hashes(item)
+        return cleaned
+    if isinstance(value, list):
+        return [_without_hashes(item) for item in value]
+    return value
+
+
+def _display_value(value: object) -> str:
+    if isinstance(value, dict):
+        if value.get("redacted") is True:
+            return "[REDACTED]"
+        if set(value) == {"characters"} and isinstance(value.get("characters"), int):
+            count = value["characters"]
+            return f"{count} character" if count == 1 else f"{count} characters"
+        value = _without_hashes(value)
+        return escape_terminal_controls(
+            json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        )
+    if isinstance(value, list):
+        return ", ".join(_display_value(item) for item in value) or "(none)"
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    return escape_terminal_controls(str(value))
+
+
+def _operation_description(value: object) -> str:
+    if not isinstance(value, dict):
+        return "Unrecognized edit operation"
+    operation = str(value.get("op", "unknown"))
+    count = value.get("new_line_count")
+    line_count = count if isinstance(count, int) else 0
+    new_lines = "line" if line_count == 1 else "lines"
+    if operation == "replace":
+        start = value.get("start_line", "?")
+        end = value.get("end_line", "?")
+        return f"Replace lines {start}-{end} with {line_count} {new_lines}"
+    if operation == "delete":
+        return f"Delete lines {value.get('start_line', '?')}-{value.get('end_line', '?')}"
+    if operation == "insert_before":
+        return f"Insert {line_count} {new_lines} before line {value.get('line', '?')}"
+    if operation == "insert_after":
+        return f"Insert {line_count} {new_lines} after line {value.get('line', '?')}"
+    if operation == "insert_start":
+        return f"Insert {line_count} {new_lines} at the start of the file"
+    if operation == "insert_end":
+        return f"Insert {line_count} {new_lines} at the end of the file"
+    return f"Unrecognized edit operation: {escape_terminal_controls(operation)}"
+
+
+def _format_diff(diff: str) -> Text:
+    if not diff:
+        return Text("(no textual changes)", style="dim")
+    rendered = Text()
+    for line in diff.splitlines(keepends=True):
+        safe_line = escape_terminal_controls(line)
+        if line.startswith("@@"):
+            style = "bold cyan"
+        elif line.startswith("+++") or line.startswith("---"):
+            style = "bold"
+        elif line.startswith("+"):
+            style = "green"
+        elif line.startswith("-"):
+            style = "red"
+        else:
+            style = None
+        rendered.append(safe_line, style=style)
+    return rendered
 
 
 class NonInteractiveHumanApprover:
