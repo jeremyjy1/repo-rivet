@@ -17,6 +17,11 @@ def make_memory(*, config: MemoryConfig | None = None) -> MemoryState:
     return memory
 
 
+def test_system_prompt_defaults_final_response_to_plain_text() -> None:
+    assert "plain text for the final response by default" in SYSTEM_PROMPT
+    assert "unless the user explicitly requests Markdown" in SYSTEM_PROMPT
+
+
 def test_build_keeps_fixed_task_state_summary_and_recent_messages() -> None:
     memory = make_memory()
     memory.summary.files_modified.append("src/app.py")

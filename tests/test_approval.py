@@ -546,5 +546,6 @@ def test_approval_events_cover_request_decision_and_execution(tmp_path: Path) ->
     assert [event[0] for event in events.events] == [
         "approval_requested",
         "approval_decided",
+        "approved_tool_started",
         "approved_tool_executed",
     ]

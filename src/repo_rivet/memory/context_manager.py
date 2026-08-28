@@ -20,7 +20,10 @@ Treat command failures as observations, diagnose them, and continue when possibl
 If a tool request is denied, do not repeat the same request; choose a safer alternative or stop.
 After changing files, run an appropriate test, build, lint, or syntax check before finishing.
 Do not claim success unless the latest verification after the latest change succeeded.
-When finished, summarize the changes and verification concisely."""
+When finished, summarize the changes and verification concisely.
+Use concise plain text for the final response by default. Avoid Markdown headings, tables,
+emphasis, list markers, and fenced code blocks unless the user explicitly requests Markdown
+or the content cannot be communicated clearly without that structure."""
 
 
 class ContextBudgetExceededError(ValueError):

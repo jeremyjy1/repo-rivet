@@ -103,6 +103,7 @@ class ToolRegistry:
                     retryable=False,
                     metadata={"approval_source": stale_decision.source},
                 )
+            self.approval_engine.record_execution_started(outcome)
             result = tool.execute_validated(validated)
             self.approval_engine.record_execution(
                 outcome,

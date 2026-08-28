@@ -10,6 +10,7 @@ from typing import Protocol
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt
+from rich.text import Text
 
 from repo_rivet import __version__
 from repo_rivet.agent.controller import AgentController, AgentResult
@@ -37,6 +38,7 @@ from repo_rivet.memory.token_estimator import create_token_estimator
 from repo_rivet.safety.path_policy import PathPolicyError
 from repo_rivet.storage.console_reporter import ConsoleEventReporter
 from repo_rivet.storage.event_sink import CompositeEventSink, EventSink
+from repo_rivet.storage.terminal_text import escape_terminal_controls
 from repo_rivet.tools.registry import ToolRegistry, create_default_registry
 
 
@@ -540,17 +542,20 @@ def _handle_chat_command(
 
 def _print_result(console: Console, result: AgentResult) -> None:
     color = {"success": "green", "stopped": "yellow", "error": "red"}[result.status]
-    lines = [
-        f"Status: [{color}]{result.status}[/{color}]",
-        f"Model steps: {result.step_count}",
-        f"Tool calls: {result.tool_call_count}",
-        f"Modified files: {', '.join(result.modified_files) or 'none'}",
-        f"Verification passed: {result.verification_success}",
-    ]
+    content = Text("Status: ")
+    content.append(result.status, style=color)
+    content.append(f"\nModel steps: {result.step_count}")
+    content.append(f"\nTool calls: {result.tool_call_count}")
+    modified_files = (
+        ", ".join(escape_terminal_controls(path) for path in result.modified_files) or "none"
+    )
+    content.append(f"\nModified files: {modified_files}")
+    content.append(f"\nVerification passed: {result.verification_success}")
     if result.reason:
-        lines.append(f"Reason: {result.reason}")
-    lines.extend(("", result.summary))
-    console.print(Panel("\n".join(lines), title="Result"))
+        content.append(f"\nReason: {escape_terminal_controls(result.reason)}")
+    content.append("\n\n")
+    content.append(escape_terminal_controls(result.summary))
+    console.print(Panel(content, title="Result"))
 
 
 def main() -> None:

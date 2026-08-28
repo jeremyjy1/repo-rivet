@@ -172,6 +172,15 @@ class ApprovalEngine:
             metadata=metadata,
         )
 
+    def record_execution_started(self, outcome: ApprovalOutcome) -> None:
+        """Record the point after revalidation when local execution actually begins."""
+        self._log(
+            "approved_tool_started",
+            request_id=outcome.request.request_id,
+            tool=outcome.request.tool_name,
+            fingerprint=outcome.request.fingerprint,
+        )
+
     def _decide_by_mode(self, request: ApprovalRequest) -> ApprovalDecision:
         if self.mode == ApprovalMode.ALLOW_ALL:
             return self._decision(
@@ -265,9 +274,6 @@ class ApprovalEngine:
         )
 
     def _log_request(self, request: ApprovalRequest) -> None:
-        command = request.normalized_arguments.get("command")
-        program = command.get("program") if isinstance(command, dict) else None
-        command_args = command.get("args") if isinstance(command, dict) else None
         self._log(
             "approval_requested",
             request_id=request.request_id,
@@ -276,9 +282,7 @@ class ApprovalEngine:
             risk=request.assessment.level.name.lower(),
             capabilities=sorted(item.value for item in request.assessment.capabilities),
             reasons=request.assessment.reasons,
-            affected_paths=request.assessment.affected_paths,
-            program=program if isinstance(program, str) else None,
-            argument_count=len(command_args) if isinstance(command_args, list) else None,
+            **self._request_details(request),
         )
 
     def _log_decision(
@@ -298,7 +302,19 @@ class ApprovalEngine:
             confidence=decision.llm_confidence,
             scope=decision.scope.value,
             abort_agent=decision.abort_agent,
+            **self._request_details(request),
         )
+
+    @staticmethod
+    def _request_details(request: ApprovalRequest) -> dict[str, Any]:
+        command = request.normalized_arguments.get("command")
+        program = command.get("program") if isinstance(command, dict) else None
+        command_args = command.get("args") if isinstance(command, dict) else None
+        return {
+            "affected_paths": request.assessment.affected_paths,
+            "program": program if isinstance(program, str) else None,
+            "argument_count": len(command_args) if isinstance(command_args, list) else None,
+        }
 
     def _log(self, event_type: str, **data: Any) -> None:
         if self.event_logger is not None:

@@ -5,7 +5,7 @@ from rich.console import Console
 
 from repo_rivet.agent.controller import AgentResult
 from repo_rivet.approval.models import ApprovalMode
-from repo_rivet.cli import _chat_loop, build_parser, cli
+from repo_rivet.cli import _chat_loop, _print_result, build_parser, cli
 from repo_rivet.memory.context_manager import SYSTEM_PROMPT
 from repo_rivet.memory.models import MemoryConfig, MemoryState, Message
 from repo_rivet.memory.store import MemoryStore
@@ -51,6 +51,27 @@ class FakeApprovalEngine:
 
     def set_mode(self, mode: ApprovalMode) -> None:
         self.mode = mode
+
+
+def test_result_summary_is_rendered_as_literal_plain_terminal_text() -> None:
+    buffer = StringIO()
+    console = Console(file=buffer, force_terminal=False, color_system=None)
+    result = AgentResult(
+        status="success",
+        summary="\x1b[2J[bold]literal model text[/bold]",
+        reason=None,
+        modified_files=(),
+        step_count=1,
+        tool_call_count=0,
+        verification_success=True,
+    )
+
+    _print_result(console, result)
+
+    output = buffer.getvalue()
+    assert "[bold]literal model text[/bold]" in output
+    assert "\\x1b[2J" in output
+    assert "\x1b" not in output
 
 
 def test_run_parser_accepts_workspace_config_and_task(tmp_path: Path) -> None:
