@@ -9,6 +9,7 @@ from typing import Any
 from uuid import uuid4
 
 from repo_rivet.memory.models import MemoryState, add_unique
+from repo_rivet.storage.atomic_write import atomic_write_json
 from repo_rivet.storage.event_logger import EventLogger
 from repo_rivet.tools.base import ToolCall, ToolResult
 
@@ -58,17 +59,26 @@ class MemoryStore:
         return output_path.relative_to(self.session_dir).as_posix()
 
     def save_state(self, memory: MemoryState, **runtime_state: Any) -> None:
+        status = str(runtime_state.get("status", memory.status))
+        normalized_status = {
+            "ready": "created",
+            "stopped": "paused",
+            "error": "failed",
+        }.get(status, status)
+        if "status" in runtime_state:
+            runtime_state["status"] = normalized_status
+            memory.status = normalized_status
         payload = {
             "memory": memory.model_dump(mode="json"),
             "runtime": runtime_state,
             "saved_at": datetime.now(UTC).isoformat(),
         }
-        temporary_path = self.state_path.with_suffix(".json.tmp")
-        temporary_path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2, default=str),
-            encoding="utf-8",
+        atomic_write_json(self.state_path, payload)
+        atomic_write_json(
+            self.session_dir / "summary.json",
+            memory.summary.model_dump(mode="json"),
         )
-        temporary_path.replace(self.state_path)
+        self._update_metadata(memory, runtime_state)
 
     def load_state(self) -> MemoryState:
         try:
@@ -115,3 +125,117 @@ class MemoryStore:
             memory.working.last_verification_result = "invalidated by external file changes"
             memory.summary.verification_status = "invalidated by external file changes"
         return changed
+
+    def reconcile_interrupted_tool_calls(self, memory: MemoryState) -> list[str]:
+        """Mark tool calls with no recorded result as uncertain; never retry them implicitly."""
+        started: dict[str, str] = {}
+        event_started: set[str] = set()
+        event_finished: set[str] = set()
+        message_finished: set[str] = set()
+        assistant_call_ids: set[str] = set()
+        for message in memory.messages:
+            if message.role == "assistant" and message.tool_calls:
+                for call in message.tool_calls:
+                    call_id = call.get("id")
+                    if not isinstance(call_id, str):
+                        continue
+                    function = call.get("function", {})
+                    name = function.get("name") if isinstance(function, dict) else None
+                    started.setdefault(call_id, str(name or "unknown tool"))
+                    assistant_call_ids.add(call_id)
+            elif message.role == "tool" and message.tool_call_id:
+                message_finished.add(message.tool_call_id)
+
+        if self.events_path.exists():
+            try:
+                lines = self.events_path.read_text(encoding="utf-8").splitlines()
+                for line_number, line in enumerate(lines, start=1):
+                    if not line.strip():
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        if line_number == len(lines):
+                            break
+                        raise ValueError(
+                            f"Corrupted session event log at {self.events_path}:{line_number}"
+                        ) from None
+                    data = event.get("data", {})
+                    call_id = data.get("tool_call_id")
+                    if not isinstance(call_id, str):
+                        continue
+                    if event.get("event") == "tool_call":
+                        started[call_id] = str(data.get("name", "unknown tool"))
+                        event_started.add(call_id)
+                    elif event.get("event") == "tool_result":
+                        event_finished.add(call_id)
+            except OSError as error:
+                raise ValueError(f"Could not inspect session events: {error}") from None
+
+        missing_results = [
+            call_id for call_id in assistant_call_ids if call_id not in message_finished
+        ]
+        uncertain = [call_id for call_id in event_started if call_id not in event_finished]
+        if not missing_results and not uncertain:
+            return []
+        affected = list(dict.fromkeys([*missing_results, *uncertain]))
+        descriptions = [f"{started[call_id]} ({call_id})" for call_id in affected]
+        from repo_rivet.memory.models import Message
+
+        for call_id in missing_results:
+            if call_id in event_finished:
+                error = "Tool completed, but its result was not checkpointed before interruption."
+            elif call_id in event_started:
+                error = (
+                    "Tool call was interrupted before a result was checkpointed; side effects "
+                    "are unknown and it was not retried."
+                )
+            else:
+                error = "Tool call was not started before interruption and was not retried."
+            memory.messages.append(
+                Message(
+                    role="tool",
+                    tool_call_id=call_id,
+                    content=json.dumps(
+                        {
+                            "ok": False,
+                            "error": error,
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+            )
+        warning = (
+            "The previous process stopped with incomplete tool-call checkpoints: "
+            + ", ".join(descriptions)
+            + ". Some side effects may be unknown. Inspect current workspace state and request "
+            "approval again before repeating any write or command; nothing was retried "
+            "automatically."
+        )
+        already_recorded = any(
+            message.role == "system" and message.content == warning for message in memory.messages
+        )
+        if not already_recorded:
+            memory.messages.append(Message(role="system", content=warning))
+        add_unique(memory.working.unresolved_errors, warning, limit=20)
+        add_unique(memory.summary.unresolved_issues, warning)
+        return descriptions
+
+    def _update_metadata(self, memory: MemoryState, runtime_state: dict[str, Any]) -> None:
+        metadata_path = self.session_dir / "meta.json"
+        if not metadata_path.exists():
+            return
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError(
+                f"Could not update session metadata: {metadata_path}: {error}"
+            ) from None
+        metadata["status"] = str(runtime_state.get("status", memory.status))
+        metadata["updated_at"] = datetime.now(UTC).isoformat()
+        step = runtime_state.get("agent_step")
+        if isinstance(step, int):
+            metadata["step"] = step
+        if memory.fixed is not None:
+            metadata["task_preview"] = " ".join(memory.fixed.original_task.split())[:160]
+        atomic_write_json(metadata_path, metadata)

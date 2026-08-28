@@ -117,12 +117,28 @@ def test_chat_parser_accepts_optional_initial_task(tmp_path: Path) -> None:
     assert arguments.initial_task == ["continue", "the", "task"]
 
 
-def test_chat_parser_accepts_resume_session(tmp_path: Path) -> None:
+def test_chat_parser_accepts_explicit_session_id(tmp_path: Path) -> None:
     arguments = build_parser().parse_args(
-        ["chat", "--workspace", str(tmp_path), "--resume", str(tmp_path / "session")]
+        ["chat", "--workspace", str(tmp_path), "--session", "20260828-153022-a7c4e1"]
     )
 
-    assert arguments.resume == tmp_path / "session"
+    assert arguments.session == "20260828-153022-a7c4e1"
+
+
+def test_parser_exposes_session_management_commands() -> None:
+    parser = build_parser()
+
+    assert parser.parse_args(["session", "list", "--status", "paused"]).session_command == "list"
+    assert parser.parse_args(["session", "show", "a7c4e1"]).session_id == "a7c4e1"
+    assert parser.parse_args(["session", "current"]).session_command == "current"
+    assert parser.parse_args(["session", "use", "a7c4e1"]).session_command == "use"
+    assert parser.parse_args(["session", "resume"]).session_id is None
+    assert parser.parse_args(["session", "new", "task"]).task == "task"
+    assert parser.parse_args(["session", "rename", "a7c4e1", "name"]).name == "name"
+    assert parser.parse_args(["session", "fork", "a7c4e1", "--use"]).use
+    assert parser.parse_args(["session", "archive", "a7c4e1"]).session_command == "archive"
+    assert parser.parse_args(["session", "delete", "a7c4e1", "--yes"]).yes
+    assert parser.parse_args(["session", "repair", "a7c4e1"]).session_command == "repair"
 
 
 def test_parser_accepts_approval_mode_override(tmp_path: Path) -> None:

@@ -11,9 +11,9 @@ RepoRivet 是一个本地优先的单智能体编程工具。它使用模型原�
 3. 在 `[approval]` 中选择审批模式（默认 `safe-auto`），然后运行：
    uv run reporivet run --approval-mode safe-auto --workspace ./examples/buggy_project "修复负数价格未被拒绝的问题，并运行测试"
 
-交互对话：uv run reporivet chat --workspace ./examples/buggy_project。支持 /help、/history、/clear、/compact、/compact aggressive、/approval、/approval <mode> 和 /exit。手动压缩只处理近期原文并立即保存，固定任务和结构化状态不变。会话采用固定任务、近期工作记忆、结构化摘要和本地持久化四层记忆；原始任务不会被压缩覆盖，文件内容通过 SHA-256 判断是否需要重新注入，长命令只把头尾送入模型，完整脱敏输出保存在 .reporivet/sessions。
+交互对话：uv run reporivet chat --workspace ./examples/buggy_project。支持 /help、/history、/clear、/compact、/compact aggressive、/approval、/approval <mode> 和 /exit。手动压缩只处理近期原文并立即保存，固定任务和结构化状态不变。会话采用固定任务、近期工作记忆、结构化摘要和本地持久化四层记忆；原始任务不会被压缩覆盖，文件内容通过 SHA-256 判断是否需要重新注入，长命令只把头尾送入模型，完整脱敏输出保存在全局的 ~/.reporivet/sessions（可用 REPORIVET_HOME 修改根目录）。
 
-恢复会话：uv run reporivet chat --workspace ./examples/buggy_project --resume .reporivet/sessions/<session-id>。恢复时会核对工作区和已读文件哈希，外部变化的文件会被标记为失效并要求重新读取。/clear 只清除近期原文，保留固定任务和结构化状态。
+多会话管理：使用 `reporivet session list` 查看会话，`session current` 查看当前工作区选择，`session use ID` 只切换选择但不运行模型，`session resume [ID]` 恢复交互执行。还支持 `session show/new/rename/fork/archive/delete/repair`；短 ID 必须唯一，完成或失败的会话需要先 fork。每个工作区的 active 指针、meta.json、state.json、summary.json、events.jsonl 和运行锁均由本地管理；恢复时会核对已读文件哈希，将外部变化和中断工具标为未知状态，并且不会自动重试写入或命令。
 
 核心能力：浏览、搜索和读取代码；安全创建、精确替换文件；限时执行本地命令；查看 Git Diff；修改后强制验证；带安全余量、服务端 usage 校准和超限恢复的上下文管理；会话恢复；五模式工具审批；工具请求、审批风险、审批决定和执行结果的实时终端显示；最大步数、运行时间、重复调用与连续失败保护；JSONL 事件日志及凭据过滤。
 
