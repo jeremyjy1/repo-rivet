@@ -1,6 +1,8 @@
 """Layer deterministic safety, modes, grants, LLM advice, and human decisions."""
 
+import hashlib
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol
 
 from repo_rivet.approval.grant_store import ApprovalGrantStore
@@ -15,6 +17,7 @@ from repo_rivet.approval.models import (
     ApprovalScope,
     Capability,
     LLMReviewResult,
+    OperationClass,
     RiskLevel,
 )
 from repo_rivet.approval.normalizer import RequestNormalizer
@@ -23,6 +26,9 @@ from repo_rivet.approval.review_context import (
     IMPORTANT_EFFECTS,
 )
 from repo_rivet.approval.risk_analyzer import RiskAnalyzer
+from repo_rivet.approval.semantic_analyzer import artifact_key
+from repo_rivet.approval.templates import DeterministicApprovalTemplates
+from repo_rivet.memory.models import ArtifactRecord
 
 
 class EventSink(Protocol):
@@ -50,6 +56,7 @@ class ApprovalEngine:
         llm_reviewer: LLMApprovalReviewer | None = None,
         max_llm_risk: RiskLevel = RiskLevel.MEDIUM,
         event_logger: EventSink | None = None,
+        approval_templates: DeterministicApprovalTemplates | None = None,
     ) -> None:
         self.mode = mode
         self.normalizer = normalizer
@@ -60,6 +67,8 @@ class ApprovalEngine:
         self.llm_reviewer = llm_reviewer
         self.max_llm_risk = max_llm_risk
         self.event_logger = event_logger
+        self.approval_templates = approval_templates or DeterministicApprovalTemplates()
+        self.risk_analyzer.bind(self.grant_store.memory)
         self.sync_memory_rule()
 
     @property
@@ -158,6 +167,7 @@ class ApprovalEngine:
 
     def revalidate(self, outcome: ApprovalOutcome) -> ApprovalDecision | None:
         refreshed = self.normalizer.refresh(outcome.request)
+        refreshed.task_summary = outcome.request.task_summary
         self.risk_analyzer.assess(refreshed)
         if refreshed.fingerprint != outcome.decision.request_fingerprint:
             decision = self._decision(
@@ -165,6 +175,18 @@ class ApprovalEngine:
                 action=ApprovalAction.DENY,
                 source="execution_revalidation",
                 reason="request path or normalized arguments changed after approval",
+            )
+            self._log_decision(refreshed, decision)
+            return decision
+        if refreshed.facts != outcome.request.facts:
+            decision = self._decision(
+                refreshed,
+                action=ApprovalAction.DENY,
+                source="execution_revalidation",
+                reason=(
+                    "executable identity, effect scope, or artifact provenance changed "
+                    "after approval"
+                ),
             )
             self._log_decision(refreshed, decision)
             return decision
@@ -179,6 +201,8 @@ class ApprovalEngine:
         return None
 
     def record_execution(self, outcome: ApprovalOutcome, *, ok: bool, metadata: Any) -> None:
+        if ok:
+            self._record_artifacts(outcome)
         self._log(
             "approved_tool_executed",
             request_id=outcome.request.request_id,
@@ -213,6 +237,15 @@ class ApprovalEngine:
                 action=ApprovalAction.ALLOW,
                 source="safe_rule",
                 reason="matched a narrow deterministic harmless-tool rule",
+            )
+        template = self.approval_templates.match(request)
+        if template is not None:
+            return self._decision(
+                request,
+                action=ApprovalAction.ALLOW,
+                source=f"semantic_template:{template.name}",
+                reason=template.reason,
+                constraints=template.constraints,
             )
         if self.mode == ApprovalMode.SAFE_AUTO:
             return self.human_approver.ask(request)
@@ -264,15 +297,58 @@ class ApprovalEngine:
         if request.assessment.level > self.max_llm_risk or review_risk > self.max_llm_risk:
             return False
 
-        deterministic_important = request.deterministic_effects & IMPORTANT_EFFECTS
+        deterministic_effects = request.facts.explicit_effects
+        deterministic_important = deterministic_effects & IMPORTANT_EFFECTS
         recognized = set(review.recognized_effects)
-        if request.deterministic_effects & AUTO_APPROVAL_BLOCKING_EFFECTS:
+        if deterministic_effects & AUTO_APPROVAL_BLOCKING_EFFECTS:
             return False
         if not deterministic_important <= recognized:
             return False
-        if (recognized & IMPORTANT_EFFECTS) - request.deterministic_effects:
+        if (recognized & IMPORTANT_EFFECTS) - deterministic_effects:
             return False
-        return set(review.required_constraints) <= request.available_constraints
+        return set(review.required_constraints) <= request.facts.constraints
+
+    def _record_artifacts(self, outcome: ApprovalOutcome) -> None:
+        request = outcome.request
+        if request.facts.operation_class not in {
+            OperationClass.BUILD,
+            OperationClass.GENERATE,
+        }:
+            return
+        memory = self.grant_store.memory
+        workspace = Path(request.workspace)
+        for path_value in request.facts.write_paths:
+            path = Path(path_value)
+            if not path.is_relative_to(workspace) or not path.is_file():
+                continue
+            try:
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            except OSError:
+                continue
+            memory.artifact_registry[artifact_key(path, workspace)] = ArtifactRecord(
+                path=artifact_key(path, workspace),
+                artifact_type=(
+                    "executable"
+                    if request.facts.operation_class == OperationClass.BUILD
+                    else "generated"
+                ),
+                created_by_session=request.session_id,
+                created_by_request=request.request_id,
+                producer_operation=request.facts.operation_class,
+                source_paths=[
+                    artifact_key(Path(source), workspace)
+                    for source in request.facts.read_paths
+                    if Path(source).is_relative_to(workspace)
+                ],
+                content_sha256=digest,
+                workspace_revision=memory.workspace_revision,
+            )
+            self._log(
+                "artifact_registered",
+                path=artifact_key(path, workspace),
+                producer_operation=request.facts.operation_class.value,
+                workspace_revision=memory.workspace_revision,
+            )
 
     @staticmethod
     def _decision(
@@ -376,6 +452,17 @@ class ApprovalEngine:
             "affected_paths": request.assessment.affected_paths,
             "program": program if isinstance(program, str) else None,
             "argument_count": len(command_args) if isinstance(command_args, list) else None,
+            "operation_class": request.facts.operation_class.value,
+            "analysis_level": request.facts.analysis_level.value,
+            "executable_origin": request.facts.executable_origin.value,
+            "effect_scope": request.facts.effect_scope.value,
+            "read_paths": request.facts.read_paths,
+            "write_paths": request.facts.write_paths,
+            "output_provenance": {
+                path: provenance.value
+                for path, provenance in request.facts.output_provenance.items()
+            },
+            "semantic_reasons": request.facts.reasons,
         }
 
     def _log(self, event_type: str, **data: Any) -> None:

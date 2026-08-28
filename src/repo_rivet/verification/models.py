@@ -8,6 +8,8 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+FINAL_ASSESSMENT_SUMMARY_MAX_CHARS = 2_000
+
 
 class VerificationKind(StrEnum):
     BUILD = "build"
@@ -185,7 +187,7 @@ class FinalAssessment(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    summary: str = Field(min_length=1, max_length=2_000)
+    summary: str = Field(min_length=1, max_length=FINAL_ASSESSMENT_SUMMARY_MAX_CHARS)
     changes: list[str] = Field(default_factory=list, max_length=100)
     claimed_completed: bool = True
     remaining_risks: list[str] = Field(default_factory=list, max_length=100)

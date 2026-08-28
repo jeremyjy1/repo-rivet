@@ -319,6 +319,25 @@ def test_verification_has_one_authoritative_console_result_in_quiet_mode() -> No
     ]
 
 
+def test_semantic_auto_approval_names_the_matched_rule() -> None:
+    buffer = StringIO()
+    reporter = ConsoleEventReporter(
+        Console(file=buffer, force_terminal=False, color_system=None, width=240)
+    )
+
+    reporter.log(
+        "approval_decided",
+        action="allow",
+        source="semantic_template:bounded_build",
+        tool="run_command",
+        risk="medium",
+    )
+
+    assert buffer.getvalue().strip() == (
+        "✓ run_command · approved by semantic rule (bounded build) · risk medium"
+    )
+
+
 def test_console_reporter_labels_unexecuted_action_as_blocked() -> None:
     buffer = StringIO()
     reporter = ConsoleEventReporter(

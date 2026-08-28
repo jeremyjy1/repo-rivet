@@ -56,6 +56,99 @@ class Capability(StrEnum):
     PRIVILEGE_ESCALATION = "privilege_escalation"
 
 
+class OperationClass(StrEnum):
+    """Semantic operation inferred from the complete request."""
+
+    READ = "read"
+    EDIT = "edit"
+    BUILD = "build"
+    STATIC_CHECK = "static_check"
+    TEST = "test"
+    RUN_ARTIFACT = "run_artifact"
+    FORMAT = "format"
+    GENERATE = "generate"
+    INSTALL = "install"
+    DELETE = "delete"
+    GIT_WRITE = "git_write"
+    NETWORK = "network"
+    SHELL = "shell"
+    UNKNOWN = "unknown"
+
+
+class AnalysisLevel(StrEnum):
+    EXACT = "exact"
+    EXPANDED = "expanded"
+    OPAQUE = "opaque"
+
+
+class ExecutableOrigin(StrEnum):
+    TRUSTED_TOOLCHAIN = "trusted_toolchain"
+    SYSTEM = "system"
+    WORKSPACE = "workspace"
+    SESSION_GENERATED = "session_generated"
+    UNKNOWN = "unknown"
+
+
+class EffectScope(StrEnum):
+    NONE = "none"
+    MANAGED = "managed"
+    WORKSPACE = "workspace"
+    OUTSIDE_WORKSPACE = "outside_workspace"
+    UNKNOWN = "unknown"
+
+
+class ArtifactProvenance(StrEnum):
+    NEW = "new"
+    SESSION_GENERATED = "session_generated"
+    USER_FILE = "user_file"
+    STALE = "stale"
+    UNKNOWN = "unknown"
+
+
+class PathClass(StrEnum):
+    SOURCE = "source"
+    TEST = "test"
+    CONFIG = "config"
+    USER_DATA = "user_data"
+    BUILD = "build"
+    CACHE = "cache"
+    TEMP = "temp"
+    GENERATED = "generated"
+    SENSITIVE = "sensitive"
+    UNKNOWN = "unknown"
+
+
+class ApprovalFacts(BaseModel):
+    """Locally derived semantic facts; risk and approval policy consume this model."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    operation_class: OperationClass = OperationClass.UNKNOWN
+    analysis_level: AnalysisLevel = AnalysisLevel.OPAQUE
+    executable: str | None = None
+    resolved_executable: str | None = None
+    executable_origin: ExecutableOrigin = ExecutableOrigin.UNKNOWN
+    expanded_command: list[str] = Field(default_factory=list)
+    read_paths: list[str] = Field(default_factory=list)
+    write_paths: list[str] = Field(default_factory=list)
+    delete_paths: list[str] = Field(default_factory=list)
+    path_classes: dict[str, PathClass] = Field(default_factory=dict)
+    effect_scope: EffectScope = EffectScope.UNKNOWN
+    output_provenance: dict[str, ArtifactProvenance] = Field(default_factory=dict)
+    explicit_effects: set[str] = Field(default_factory=set)
+    potential_capabilities: set[str] = Field(default_factory=set)
+    constraints: set[str] = Field(default_factory=set)
+    accesses_network: bool = False
+    requires_privilege: bool = False
+    touches_sensitive_paths: bool = False
+    outside_workspace: bool = False
+    overwrites_existing: bool = False
+    reversible: bool = False
+    verification_kind: str | None = None
+    task_relevance: Literal["required", "helpful", "unrelated", "uncertain"] = "uncertain"
+    reasons: list[str] = Field(default_factory=list)
+
+
 class RiskAssessment(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -82,8 +175,7 @@ class ApprovalRequest(BaseModel):
     fingerprint: str
     assessment: RiskAssessment
     task_summary: str = ""
-    deterministic_effects: set[str] = Field(default_factory=set)
-    available_constraints: set[str] = Field(default_factory=set)
+    facts: ApprovalFacts = Field(default_factory=ApprovalFacts)
 
 
 class ApprovalDecision(BaseModel):

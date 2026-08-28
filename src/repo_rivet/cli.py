@@ -27,6 +27,7 @@ from repo_rivet.approval.llm_reviewer import OpenAIApprovalReviewer
 from repo_rivet.approval.models import ApprovalMode, RiskLevel
 from repo_rivet.approval.normalizer import RequestNormalizer
 from repo_rivet.approval.risk_analyzer import RiskAnalyzer
+from repo_rivet.approval.semantic_analyzer import ApprovalFactAnalyzer
 from repo_rivet.config import AppConfig, ConfigurationError, load_config
 from repo_rivet.context.manager import ContextManager
 from repo_rivet.llm.openai_compatible import OpenAICompatibleClient
@@ -698,7 +699,11 @@ def _build_approval_engine(
     engine = ApprovalEngine(
         mode=mode,
         normalizer=RequestNormalizer(arguments.workspace),
-        risk_analyzer=RiskAnalyzer(),
+        risk_analyzer=RiskAnalyzer(
+            ApprovalFactAnalyzer(
+                trusted_executable_directories=config.approval.toolchains.trusted_directories
+            )
+        ),
         hard_policy=HardSafetyPolicy(
             HardSafetySettings(
                 deny_outside_workspace_write=safety.deny_outside_workspace_write,

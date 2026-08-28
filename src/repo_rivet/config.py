@@ -119,6 +119,14 @@ class ApprovalSafetyConfig(BaseModel):
     deny_device_access: bool = True
 
 
+class ApprovalToolchainConfig(BaseModel):
+    """Executable directories whose resolved tools may match deterministic templates."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    trusted_directories: list[str] = Field(default_factory=list)
+
+
 class ApprovalConfig(BaseModel):
     """Tool approval mode, persistence, and fallback policy."""
 
@@ -131,6 +139,7 @@ class ApprovalConfig(BaseModel):
     remember_session_denials: bool = True
     llm: ApprovalLLMConfig = Field(default_factory=ApprovalLLMConfig)
     safety: ApprovalSafetyConfig = Field(default_factory=ApprovalSafetyConfig)
+    toolchains: ApprovalToolchainConfig = Field(default_factory=ApprovalToolchainConfig)
 
 
 class AppConfig(BaseModel):

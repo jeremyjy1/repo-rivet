@@ -52,3 +52,7 @@ deny_outside_workspace_write = true
 deny_privilege_escalation = true
 deny_secret_access = true
 deny_device_access = true
+
+[approval.toolchains]
+# Additional executable directories trusted for deterministic build/check/test templates.
+trusted_directories = []

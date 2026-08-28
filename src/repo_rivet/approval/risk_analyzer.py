@@ -3,12 +3,9 @@
 from pathlib import Path
 
 from repo_rivet.approval.models import ApprovalRequest, Capability, RiskAssessment, RiskLevel
-from repo_rivet.approval.review_context import (
-    attach_review_facts,
-    command_effect_paths,
-    command_effects,
-)
 from repo_rivet.approval.safe_rules import is_obviously_safe
+from repo_rivet.approval.semantic_analyzer import ApprovalFactAnalyzer
+from repo_rivet.memory.models import MemoryState
 
 _SENSITIVE_NAMES = frozenset(
     {
@@ -34,7 +31,14 @@ _LARGE_EDIT_DELETION_LINES = 100
 class RiskAnalyzer:
     """Combine declared tool capabilities with request-specific facts."""
 
+    def __init__(self, fact_analyzer: ApprovalFactAnalyzer | None = None) -> None:
+        self.fact_analyzer = fact_analyzer or ApprovalFactAnalyzer()
+
+    def bind(self, memory: MemoryState) -> None:
+        self.fact_analyzer.bind(memory)
+
     def assess(self, request: ApprovalRequest) -> RiskAssessment:
+        facts = self.fact_analyzer.analyze(request)
         capabilities = set(request.declared_capabilities)
         reasons: list[str] = []
         affected_paths = list(request.normalized_arguments.get("_resolved_paths", {}).values())
@@ -44,12 +48,20 @@ class RiskAnalyzer:
             reasons.append("requested path resolves outside the configured workspace")
 
         if request.tool_name in {"run_command", "run_verification"}:
-            semantic_effects = command_effects(request)
+            semantic_effects = facts.explicit_effects
             if "filesystem_read" in semantic_effects:
                 capabilities.add(Capability.FILESYSTEM_READ)
             if "filesystem_write" in semantic_effects:
                 capabilities.add(Capability.FILESYSTEM_WRITE)
-            command_read_paths, command_write_paths = command_effect_paths(request)
+            if "filesystem_delete" in semantic_effects:
+                capabilities.add(Capability.FILESYSTEM_DELETE)
+            if "network_access" in semantic_effects:
+                capabilities.add(Capability.NETWORK_ACCESS)
+            if "git_write" in semantic_effects:
+                capabilities.add(Capability.GIT_WRITE)
+            if "privilege_escalation" in semantic_effects:
+                capabilities.add(Capability.PRIVILEGE_ESCALATION)
+            command_read_paths, command_write_paths = facts.read_paths, facts.write_paths
             affected_paths.extend(
                 path
                 for path in [*command_read_paths, *command_write_paths]
@@ -98,7 +110,6 @@ class RiskAnalyzer:
         )
         request.assessment = assessment
         assessment.obviously_safe = is_obviously_safe(request)
-        attach_review_facts(request)
         return assessment
 
     @staticmethod

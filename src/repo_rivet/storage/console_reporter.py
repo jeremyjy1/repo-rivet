@@ -152,7 +152,11 @@ class ConsoleEventReporter:
         if allowed and source_value in _QUIET_ALLOW_SOURCES:
             return
         icon = "✓" if allowed else "✗"
-        source = _SOURCE_LABELS.get(source_value, source_value.replace("_", " "))
+        if source_value.startswith("semantic_template:"):
+            template = source_value.partition(":")[2].replace("_", " ")
+            source = f"semantic rule ({template})"
+        else:
+            source = _SOURCE_LABELS.get(source_value, source_value.replace("_", " "))
         status = "approved" if allowed else "denied"
         risk = self._safe(data.get("risk", "unknown")).lower()
         detail = self._join(

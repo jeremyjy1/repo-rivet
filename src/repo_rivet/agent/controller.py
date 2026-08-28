@@ -34,6 +34,7 @@ from repo_rivet.safety.path_policy import WorkspacePathPolicy
 from repo_rivet.tools.base import ToolCall, ToolResult
 from repo_rivet.tools.registry import ToolRegistry
 from repo_rivet.verification.models import (
+    FINAL_ASSESSMENT_SUMMARY_MAX_CHARS,
     FinalAssessment,
     VerificationOutcome,
     VerificationResult,
@@ -899,16 +900,17 @@ class AgentController:
         state: SessionState,
         memory: MemoryState,
     ) -> AgentResult | None:
+        assessment_summary = _bounded_assessment_summary(summary)
         existing_assessment = state.candidate_final_assessment
-        if existing_assessment is None or existing_assessment.summary != summary:
+        if existing_assessment is None or existing_assessment.summary != assessment_summary:
             assessment = (
                 FinalAssessment(
-                    summary=summary,
+                    summary=assessment_summary,
                     changes=sorted(state.modified_files),
                     claimed_completed=True,
                 )
                 if existing_assessment is None
-                else existing_assessment.model_copy(update={"summary": summary})
+                else existing_assessment.model_copy(update={"summary": assessment_summary})
             )
             state.candidate_final_assessment = assessment
             memory.candidate_final_assessment = assessment
@@ -1312,3 +1314,12 @@ class AgentController:
 
 class AgentContextOverflowError(RuntimeError):
     """Bounded context recovery was exhausted without a safe provider request."""
+
+
+def _bounded_assessment_summary(summary: str) -> str:
+    """Keep the audit projection bounded without truncating the user-visible answer."""
+    if len(summary) <= FINAL_ASSESSMENT_SUMMARY_MAX_CHARS:
+        return summary
+    marker = "\n\n[Assessment summary truncated; full response remains in conversation history.]"
+    prefix_length = FINAL_ASSESSMENT_SUMMARY_MAX_CHARS - len(marker)
+    return f"{summary[:prefix_length].rstrip()}{marker}"

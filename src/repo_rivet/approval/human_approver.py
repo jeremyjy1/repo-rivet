@@ -4,6 +4,7 @@ import json
 import select
 import sys
 from collections.abc import Callable
+from pathlib import Path
 from typing import Protocol
 
 from rich.console import Console, Group
@@ -274,6 +275,31 @@ def _request_rows(request: ApprovalRequest) -> list[tuple[str, str]]:
     if not isinstance(arguments, dict):
         return []
     rows: list[tuple[str, str]] = []
+    facts = request.facts
+    if request.tool_name in {"run_command", "run_verification"}:
+        rows.extend(
+            [
+                ("Operation", facts.operation_class.value.replace("_", " ")),
+                ("Analysis", facts.analysis_level.value),
+                ("Executable origin", facts.executable_origin.value.replace("_", " ")),
+                ("Effect scope", facts.effect_scope.value.replace("_", " ")),
+            ]
+        )
+        if facts.resolved_executable:
+            rows.append(("Resolved executable", _display_value(facts.resolved_executable)))
+        if facts.read_paths:
+            rows.append(("Reads", _path_list(facts.read_paths, request.workspace)))
+        if facts.write_paths:
+            rows.append(("Writes", _path_list(facts.write_paths, request.workspace)))
+            provenance = ", ".join(
+                f"{_relative_path(path, request.workspace)}: {value.value.replace('_', ' ')}"
+                for path, value in facts.output_provenance.items()
+            )
+            rows.append(("Output ownership", provenance))
+        if facts.explicit_effects:
+            rows.append(("Known effects", ", ".join(sorted(facts.explicit_effects))))
+        if facts.potential_capabilities:
+            rows.append(("Possible effects", ", ".join(sorted(facts.potential_capabilities))))
     path = arguments.get("path")
     if isinstance(path, str):
         path_label = (
@@ -310,6 +336,18 @@ def _request_rows(request: ApprovalRequest) -> list[tuple[str, str]]:
             rendered = f"{rendered} seconds"
         rows.append((label, rendered))
     return rows
+
+
+def _path_list(paths: list[str], workspace: str) -> str:
+    return ", ".join(_relative_path(path, workspace) for path in paths)
+
+
+def _relative_path(path: str, workspace: str) -> str:
+    candidate = Path(path)
+    try:
+        return candidate.relative_to(Path(workspace)).as_posix() or "."
+    except ValueError:
+        return str(candidate)
 
 
 def _without_hashes(value: object) -> object:

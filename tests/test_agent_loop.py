@@ -114,6 +114,23 @@ def test_agent_executes_tool_then_returns_final_text() -> None:
     assert result.tool_call_count == 1
 
 
+def test_long_final_response_is_bounded_only_in_assessment_memory() -> None:
+    summary = "Detailed result. " + ("x" * 2_500)
+    model = FakeModelClient([ModelResponse(content=summary)])
+    memory = MemoryState(session_id="long-final-response")
+
+    result = controller(model, FakeToolRegistry([])).run("inspect", memory=memory)
+
+    assert result.status == "success"
+    assert result.summary == summary
+    assert memory.candidate_final_assessment is not None
+    assert len(memory.candidate_final_assessment.summary) == 2_000
+    assert memory.candidate_final_assessment.summary.endswith(
+        "[Assessment summary truncated; full response remains in conversation history.]"
+    )
+    assert memory.messages[-1].content == summary
+
+
 def test_empty_model_response_is_replaced_with_local_feedback() -> None:
     model = FakeModelClient([ModelResponse(), ModelResponse(content="Continued successfully.")])
     tools = FakeToolRegistry([])

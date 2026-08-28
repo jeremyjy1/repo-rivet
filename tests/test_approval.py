@@ -4,6 +4,7 @@ from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from rich.console import Console
 
 from repo_rivet.approval.engine import ApprovalEngine
@@ -15,22 +16,33 @@ from repo_rivet.approval.human_approver import (
 )
 from repo_rivet.approval.llm_reviewer import OpenAIApprovalReviewer
 from repo_rivet.approval.models import (
+    AnalysisLevel,
     ApprovalAction,
     ApprovalDecision,
     ApprovalMode,
     ApprovalRequest,
     ApprovalScope,
+    ArtifactProvenance,
     Capability,
+    ExecutableOrigin,
     LLMReviewResult,
+    OperationClass,
     RiskLevel,
 )
 from repo_rivet.approval.normalizer import RequestNormalizer
 from repo_rivet.approval.review_context import build_review_payload
 from repo_rivet.approval.risk_analyzer import RiskAnalyzer
+from repo_rivet.approval.semantic_analyzer import ApprovalFactAnalyzer
 from repo_rivet.config import ApiConfig
 from repo_rivet.memory.models import MemoryState
 from repo_rivet.tools.base import ToolCall
 from repo_rivet.tools.registry import create_default_registry
+from repo_rivet.verification.models import (
+    CommandSpec,
+    VerificationCheck,
+    VerificationKind,
+    VerificationPlan,
+)
 
 
 class FakeHumanApprover:
@@ -654,7 +666,7 @@ def test_llm_allow_with_missing_effect_coverage_falls_back_to_human(tmp_path: Pa
     )
 
     assert outcome.decision.source == "human"
-    assert outcome.request.deterministic_effects == {"filesystem_write"}
+    assert outcome.request.facts.explicit_effects == {"filesystem_write"}
     assert human.llm_reviews == [reviewer.result]
 
 
@@ -689,7 +701,7 @@ def test_llm_allow_with_unknowns_or_unavailable_constraints_falls_back_to_human(
     )
 
     assert outcome.decision.source == "human"
-    assert "network_isolation" not in outcome.request.available_constraints
+    assert "network_isolation" not in outcome.request.facts.constraints
     assert human.llm_reviews == [reviewer.result]
 
 
@@ -719,7 +731,7 @@ def test_git_write_cannot_be_auto_approved_by_llm(tmp_path: Path) -> None:
         session_id=engine.session_id,
     )
 
-    assert "git_write" in outcome.request.deterministic_effects
+    assert "git_write" in outcome.request.facts.explicit_effects
     assert outcome.decision.source == "human"
 
 
@@ -743,10 +755,11 @@ def test_review_payload_expands_package_script_as_untrusted_semantic_context(
     payload = build_review_payload(outcome.request)
     stage = payload["execution_plan"]["stages"][0]
     assert stage["semantic_context"] == {
-        "script_name": "test",
-        "resolved_script": "vitest run",
+        "analysis_level": "expanded",
+        "expanded_command": ["vitest", "run"],
+        "reason": ["expanded package test script to vitest"],
     }
-    assert "execute_project_code" in outcome.request.deterministic_effects
+    assert "execute_project_code" in outcome.request.facts.explicit_effects
 
 
 def test_package_installation_facts_force_human_review(tmp_path: Path) -> None:
@@ -784,12 +797,15 @@ def test_package_installation_facts_force_human_review(tmp_path: Path) -> None:
         "network_access",
         "package_installation",
         "execute_install_scripts",
-    } <= outcome.request.deterministic_effects
+    } <= outcome.request.facts.explicit_effects
     assert outcome.decision.source == "human"
 
 
 def test_openai_reviewer_receives_structured_plan_and_no_output_limit(tmp_path: Path) -> None:
     captured: dict[str, object] = {}
+    output = tmp_path / ".reporivet/build/quick_sort"
+    output.parent.mkdir(parents=True)
+    output.write_text("user-owned", encoding="utf-8")
 
     def create(**arguments: object) -> object:
         captured.update(arguments)
@@ -1230,4 +1246,385 @@ def test_approval_events_cover_request_decision_and_execution(tmp_path: Path) ->
         "approval_decided",
         "approved_tool_started",
         "approved_tool_executed",
+    ]
+
+
+def test_exact_bounded_build_is_auto_approved_at_medium_risk(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "repo_rivet.approval.semantic_analyzer.shutil.which", lambda _: sys.executable
+    )
+    (tmp_path / "snake.cpp").write_text("int main() {}\n", encoding="utf-8")
+    human = FakeHumanApprover()
+    engine, _ = create_engine(tmp_path, mode=ApprovalMode.SAFE_AUTO, human=human)
+
+    outcome = engine.authorize(
+        tool_name="run_command",
+        arguments={"command": "g++ -o snake snake.cpp", "cwd": "."},
+        capabilities={Capability.PROCESS_EXECUTE},
+        session_id=engine.session_id,
+    )
+
+    assert outcome.request.assessment.level == RiskLevel.MEDIUM
+    assert outcome.request.facts.operation_class == OperationClass.BUILD
+    assert outcome.request.facts.analysis_level == AnalysisLevel.EXACT
+    assert outcome.decision.source == "semantic_template:bounded_build"
+    assert human.requests == []
+
+
+def test_workspace_compiler_with_trusted_name_is_not_auto_approved(tmp_path: Path) -> None:
+    compiler = tmp_path / "g++"
+    compiler.write_text("#!/bin/sh\n", encoding="utf-8")
+    compiler.chmod(0o755)
+    (tmp_path / "snake.cpp").write_text("int main() {}\n", encoding="utf-8")
+    human = FakeHumanApprover()
+    engine, _ = create_engine(tmp_path, mode=ApprovalMode.SAFE_AUTO, human=human)
+
+    outcome = engine.authorize(
+        tool_name="run_command",
+        arguments={"command": "./g++ -o snake snake.cpp", "cwd": "."},
+        capabilities={Capability.PROCESS_EXECUTE},
+        session_id=engine.session_id,
+    )
+
+    assert outcome.request.facts.executable_origin == ExecutableOrigin.WORKSPACE
+    assert outcome.decision.source == "human"
+
+
+def test_build_that_overwrites_unknown_file_requires_human(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "repo_rivet.approval.semantic_analyzer.shutil.which", lambda _: sys.executable
+    )
+    (tmp_path / "snake.cpp").write_text("int main() {}\n", encoding="utf-8")
+    (tmp_path / "snake").write_text("user data", encoding="utf-8")
+    human = FakeHumanApprover()
+    engine, _ = create_engine(tmp_path, mode=ApprovalMode.SAFE_AUTO, human=human)
+
+    outcome = engine.authorize(
+        tool_name="run_command",
+        arguments={"command": "g++ -o snake snake.cpp", "cwd": "."},
+        capabilities={Capability.PROCESS_EXECUTE},
+        session_id=engine.session_id,
+    )
+
+    assert outcome.request.facts.overwrites_existing
+    assert set(item.value for item in outcome.request.facts.output_provenance.values()) == {
+        "user_file"
+    }
+    assert outcome.decision.source == "human"
+
+
+def test_build_response_file_and_plugin_flags_remain_opaque(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "repo_rivet.approval.semantic_analyzer.shutil.which", lambda _: sys.executable
+    )
+    human = FakeHumanApprover()
+    engine, _ = create_engine(tmp_path, mode=ApprovalMode.SAFE_AUTO, human=human)
+
+    response_file = engine.authorize(
+        tool_name="run_command",
+        arguments={"command": "g++ @build.rsp", "cwd": "."},
+        capabilities={Capability.PROCESS_EXECUTE},
+        session_id=engine.session_id,
+    )
+    plugin = engine.authorize(
+        tool_name="run_command",
+        arguments={"command": "g++ -fplugin=custom.so -o snake snake.cpp", "cwd": "."},
+        capabilities={Capability.PROCESS_EXECUTE},
+        session_id=engine.session_id,
+    )
+
+    assert response_file.request.facts.analysis_level == AnalysisLevel.OPAQUE
+    assert plugin.request.facts.analysis_level == AnalysisLevel.OPAQUE
+    assert response_file.decision.source == plugin.decision.source == "human"
+
+
+def test_registered_pytest_check_matches_bounded_test_template(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "repo_rivet.approval.semantic_analyzer.shutil.which", lambda _: sys.executable
+    )
+    human = FakeHumanApprover()
+    engine, memory = create_engine(tmp_path, mode=ApprovalMode.SAFE_AUTO, human=human)
+    memory.verification_plan = VerificationPlan(
+        plan_id="verify-tests",
+        checks=[
+            VerificationCheck(
+                check_id="tests",
+                title="Tests",
+                kind=VerificationKind.TEST,
+                command=CommandSpec(program="pytest", args=["-q"]),
+                provenance="model",
+            )
+        ],
+    )
+
+    outcome = engine.authorize(
+        tool_name="run_verification",
+        arguments={
+            "check_id": "tests",
+            "command": "pytest -q",
+            "cwd": ".",
+            "timeout_seconds": 60,
+        },
+        capabilities={Capability.PROCESS_EXECUTE},
+        session_id=engine.session_id,
+    )
+
+    assert outcome.request.facts.verification_kind == "test"
+    assert outcome.decision.source == "semantic_template:bounded_test"
+    assert human.requests == []
+
+
+def test_registered_npm_test_is_expanded_before_template_matching(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "repo_rivet.approval.semantic_analyzer.shutil.which", lambda _: sys.executable
+    )
+    (tmp_path / "package.json").write_text(
+        json.dumps({"scripts": {"test": "vitest run"}}),
+        encoding="utf-8",
+    )
+    human = FakeHumanApprover()
+    engine, memory = create_engine(tmp_path, mode=ApprovalMode.SAFE_AUTO, human=human)
+    memory.verification_plan = VerificationPlan(
+        plan_id="verify-js",
+        checks=[
+            VerificationCheck(
+                check_id="js-tests",
+                title="JavaScript tests",
+                kind=VerificationKind.TEST,
+                command=CommandSpec(program="npm", args=["test"]),
+                provenance="model",
+            )
+        ],
+    )
+
+    outcome = engine.authorize(
+        tool_name="run_verification",
+        arguments={
+            "check_id": "js-tests",
+            "command": "npm test",
+            "cwd": ".",
+            "timeout_seconds": 60,
+        },
+        capabilities={Capability.PROCESS_EXECUTE},
+        session_id=engine.session_id,
+    )
+
+    assert outcome.request.facts.analysis_level == AnalysisLevel.EXPANDED
+    assert outcome.request.facts.expanded_command == ["vitest", "run"]
+    assert outcome.decision.source == "semantic_template:bounded_test"
+
+
+def test_chained_package_test_script_remains_opaque(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "repo_rivet.approval.semantic_analyzer.shutil.which", lambda _: sys.executable
+    )
+    (tmp_path / "package.json").write_text(
+        json.dumps({"scripts": {"test": "vitest run && curl https://example.test"}}),
+        encoding="utf-8",
+    )
+    human = FakeHumanApprover()
+    engine, memory = create_engine(tmp_path, mode=ApprovalMode.SAFE_AUTO, human=human)
+    memory.verification_plan = VerificationPlan(
+        plan_id="verify-js",
+        checks=[
+            VerificationCheck(
+                check_id="js-tests",
+                title="JavaScript tests",
+                kind=VerificationKind.TEST,
+                command=CommandSpec(program="npm", args=["test"]),
+                provenance="model",
+            )
+        ],
+    )
+
+    outcome = engine.authorize(
+        tool_name="run_verification",
+        arguments={
+            "check_id": "js-tests",
+            "command": "npm test",
+            "cwd": ".",
+            "timeout_seconds": 60,
+        },
+        capabilities={Capability.PROCESS_EXECUTE},
+        session_id=engine.session_id,
+    )
+
+    assert outcome.request.facts.analysis_level == AnalysisLevel.OPAQUE
+    assert outcome.decision.source == "human"
+
+
+def test_generation_is_auto_approved_only_for_managed_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "repo_rivet.approval.semantic_analyzer.shutil.which", lambda _: sys.executable
+    )
+    (tmp_path / "schema.proto").write_text('syntax = "proto3";\n', encoding="utf-8")
+    human = FakeHumanApprover()
+    engine, _ = create_engine(tmp_path, mode=ApprovalMode.SAFE_AUTO, human=human)
+
+    managed = engine.authorize(
+        tool_name="run_command",
+        arguments={
+            "command": "protoc --python_out=.reporivet/generated schema.proto",
+            "cwd": ".",
+        },
+        capabilities={Capability.PROCESS_EXECUTE},
+        session_id=engine.session_id,
+    )
+    source_directory = engine.authorize(
+        tool_name="run_command",
+        arguments={"command": "protoc --python_out=. schema.proto", "cwd": "."},
+        capabilities={Capability.PROCESS_EXECUTE},
+        session_id=engine.session_id,
+    )
+
+    assert managed.decision.source == "semantic_template:managed_generation"
+    assert source_directory.decision.source == "human"
+
+
+def test_session_artifact_is_auto_approved_until_workspace_revision_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "repo_rivet.approval.semantic_analyzer.shutil.which", lambda _: sys.executable
+    )
+    source = tmp_path / "snake.cpp"
+    source.write_text("int main() {}\n", encoding="utf-8")
+    human = FakeHumanApprover()
+    engine, memory = create_engine(tmp_path, mode=ApprovalMode.SAFE_AUTO, human=human)
+    build = engine.authorize(
+        tool_name="run_command",
+        arguments={"command": "g++ -o snake snake.cpp", "cwd": "."},
+        capabilities={Capability.PROCESS_EXECUTE},
+        session_id=engine.session_id,
+    )
+    artifact = tmp_path / "snake"
+    artifact.write_bytes(b"current artifact")
+    artifact.chmod(0o755)
+    engine.record_execution(build, ok=True, metadata={})
+
+    first_run = engine.authorize(
+        tool_name="run_command",
+        arguments={"command": "./snake", "cwd": "."},
+        capabilities={Capability.PROCESS_EXECUTE},
+        session_id=engine.session_id,
+    )
+    unsafe_arguments = engine.authorize(
+        tool_name="run_command",
+        arguments={"command": "./snake ../user-data", "cwd": "."},
+        capabilities={Capability.PROCESS_EXECUTE},
+        session_id=engine.session_id,
+    )
+    memory.workspace_revision += 1
+    stale_run = engine.authorize(
+        tool_name="run_command",
+        arguments={"command": "./snake", "cwd": "."},
+        capabilities={Capability.PROCESS_EXECUTE},
+        session_id=engine.session_id,
+    )
+    stale_rebuild = engine.authorize(
+        tool_name="run_verification",
+        arguments={"check_id": "build", "command": "g++ -o snake snake.cpp", "cwd": "."},
+        capabilities={Capability.PROCESS_EXECUTE},
+        session_id=engine.session_id,
+    )
+    artifact.write_bytes(b"manually replaced")
+    tampered_rebuild = engine.authorize(
+        tool_name="run_verification",
+        arguments={"check_id": "build", "command": "g++ -o snake snake.cpp", "cwd": "."},
+        capabilities={Capability.PROCESS_EXECUTE},
+        session_id=engine.session_id,
+    )
+
+    assert "snake" in memory.artifact_registry
+    assert first_run.decision.source == "semantic_template:session_artifact_run"
+    assert unsafe_arguments.decision.source == "human"
+    assert stale_run.request.facts.executable_origin == ExecutableOrigin.WORKSPACE
+    assert stale_run.decision.source == "human"
+    assert set(stale_rebuild.request.facts.output_provenance.values()) == {ArtifactProvenance.STALE}
+    assert stale_rebuild.decision.source == "semantic_template:bounded_build"
+    assert set(tampered_rebuild.request.facts.output_provenance.values()) == {
+        ArtifactProvenance.USER_FILE
+    }
+    assert tampered_rebuild.decision.source == "human"
+
+
+def test_registered_build_can_overwrite_stale_current_session_artifact(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    (workspace / "snake.cpp").write_text("int main() {}\n", encoding="utf-8")
+    toolchain = tmp_path / "toolchain"
+    toolchain.mkdir()
+    compiler = toolchain / "g++"
+    compiler.write_text('#!/bin/sh\nprintf "artifact" > "$2"\n', encoding="utf-8")
+    compiler.chmod(0o755)
+
+    memory = MemoryState(session_id="approval-test")
+    memory.verification_plan = VerificationPlan(
+        plan_id="verify-build",
+        checks=[
+            VerificationCheck(
+                check_id="build",
+                title="Build snake",
+                kind=VerificationKind.BUILD,
+                command=CommandSpec(
+                    program=str(compiler),
+                    args=["-o", "snake", "snake.cpp"],
+                ),
+                provenance="model",
+            )
+        ],
+    )
+    human = FakeHumanApprover()
+    events = EventCollector()
+    engine = ApprovalEngine(
+        mode=ApprovalMode.SAFE_AUTO,
+        normalizer=RequestNormalizer(workspace),
+        risk_analyzer=RiskAnalyzer(
+            ApprovalFactAnalyzer(trusted_executable_directories=[str(toolchain)])
+        ),
+        hard_policy=HardSafetyPolicy(),
+        grant_store=ApprovalGrantStore(memory),
+        human_approver=human,
+        event_logger=events,
+    )
+    registry = create_default_registry(workspace, approval_engine=engine)
+    assert registry.verification_runtime is not None
+    registry.verification_runtime.bind(memory)
+    call = ToolCall(id="verify-build", name="run_verification", arguments={"check_id": "build"})
+
+    first = registry.execute(call)
+    memory.workspace_revision += 1
+    second = registry.execute(call)
+
+    assert first.ok and second.ok
+    assert "snake" in memory.artifact_registry
+    assert human.requests == []
+    sources = [data["source"] for event, data in events.events if event == "approval_decided"]
+    assert sources == [
+        "semantic_template:bounded_build",
+        "semantic_template:bounded_build",
     ]

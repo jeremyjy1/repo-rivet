@@ -6,7 +6,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from repo_rivet.approval.models import ApprovalMode
+from repo_rivet.approval.models import ApprovalMode, OperationClass
 from repo_rivet.memory.token_estimator import ApproximateTokenEstimator
 from repo_rivet.reasoning.models import ObservationEvent, ReasoningEvent
 from repo_rivet.tools.base import ToolCall, ToolResult
@@ -212,6 +212,21 @@ class CommandOutputMemory(BaseModel):
     truncated: bool = False
 
 
+class ArtifactRecord(BaseModel):
+    """Durable provenance for an output created by an approved session operation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str
+    artifact_type: Literal["executable", "build_output", "generated"]
+    created_by_session: str
+    created_by_request: str
+    producer_operation: OperationClass
+    source_paths: list[str] = Field(default_factory=list)
+    content_sha256: str
+    workspace_revision: int = Field(ge=0)
+
+
 class MemoryState(BaseModel):
     """Serializable state for one RepoRivet session."""
 
@@ -237,6 +252,7 @@ class MemoryState(BaseModel):
     provider_requires_reasoning_content: bool = False
     command_outputs: list[CommandOutputMemory] = Field(default_factory=list)
     process_observations: list[ProcessObservation] = Field(default_factory=list)
+    artifact_registry: dict[str, ArtifactRecord] = Field(default_factory=dict)
     tool_event_step: int = 0
     compaction_count: int = 0
     context_overflow_count: int = 0
