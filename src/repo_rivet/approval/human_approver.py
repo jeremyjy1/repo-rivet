@@ -71,8 +71,23 @@ class TerminalHumanApprover:
             choice = choice.strip().lower()
             decision = self._decision_for_choice(request, choice)
             if decision is not None:
+                if decision.action == ApprovalAction.DENY and not decision.abort_agent:
+                    guidance = self._read_guidance()
+                    if guidance:
+                        decision = decision.model_copy(update={"guidance": guidance})
                 return decision
             self.console.print("Enter a number from 1 to 5.", style="yellow")
+
+    def _read_guidance(self) -> str | None:
+        prompt = "Direction for the agent (optional; press Enter to skip)"
+        try:
+            value = self._read_choice(prompt)
+        except (EOFError, KeyboardInterrupt):
+            return None
+        if value is None:
+            return None
+        normalized = " ".join("".join(character for character in value if character >= " ").split())
+        return normalized[:1_000] or None
 
     @staticmethod
     def _build_panel(
@@ -124,8 +139,8 @@ class TerminalHumanApprover:
         options.add_column()
         options.add_row("1", "Approve once")
         options.add_row("2", "Approve this exact request for the session")
-        options.add_row("3", "Deny once")
-        options.add_row("4", "Deny this exact request for the session")
+        options.add_row("3", "Deny once, with optional direction")
+        options.add_row("4", "Deny this exact request for the session, with optional direction")
         options.add_row("5", "Abort agent")
         sections.extend((Text("\nOptions", style="bold"), options))
         return Panel(Group(*sections), title="Approval Required", border_style="yellow")

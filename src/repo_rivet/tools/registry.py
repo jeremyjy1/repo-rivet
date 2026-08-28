@@ -93,16 +93,20 @@ class ToolRegistry:
                 error_code = (
                     "hard_policy_denied" if decision.source == "hard_policy" else "approval_denied"
                 )
+                error = decision.reason
+                if decision.guidance:
+                    error = f"{error}. User direction: {decision.guidance}"
                 return ToolResult(
                     ok=False,
                     output="",
-                    error=decision.reason,
+                    error=error,
                     error_code=error_code,
                     retryable=False,
                     metadata={
                         "approval_source": decision.source,
                         "approval_fingerprint": decision.request_fingerprint,
                         "approval_abort": decision.abort_agent,
+                        "approval_guidance": decision.guidance,
                     },
                 )
 

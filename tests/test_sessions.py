@@ -95,6 +95,7 @@ def test_fork_preserves_memory_but_drops_session_approvals(tmp_path: Path) -> No
     source.memory.summary.completed_actions.append("located auth module")
     source.memory.approval_session_grants["grant"] = {"action": "approve"}
     source.memory.denied_request_fingerprints.add("denied")
+    source.memory.approval_denial_guidance["denied"] = "use a narrower edit"
     source.memory.messages.extend(
         [
             Message(
@@ -119,6 +120,7 @@ def test_fork_preserves_memory_but_drops_session_approvals(tmp_path: Path) -> No
     assert forked.memory.summary.completed_actions == ["located auth module"]
     assert forked.memory.approval_session_grants == {}
     assert forked.memory.denied_request_fingerprints == set()
+    assert forked.memory.approval_denial_guidance == {}
     assert manager.get_active(workspace) == forked.metadata
     assert forked.store.reconcile_interrupted_tool_calls(forked.memory) == []
 

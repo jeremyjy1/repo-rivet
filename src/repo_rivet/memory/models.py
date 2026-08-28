@@ -206,6 +206,7 @@ class MemoryState(BaseModel):
     total_output_tokens: int = 0
     approval_session_grants: dict[str, dict[str, Any]] = Field(default_factory=dict)
     denied_request_fingerprints: set[str] = Field(default_factory=set)
+    approval_denial_guidance: dict[str, str] = Field(default_factory=dict)
     approval_mode_override: ApprovalMode | None = None
     reasoning_events: list[ReasoningEvent] = Field(default_factory=list)
     observation_events: list[ObservationEvent] = Field(default_factory=list)
@@ -225,6 +226,7 @@ class MemoryState(BaseModel):
         """Preserve the first task verbatim and version every later user request."""
         normalized = task.strip()
         self.denied_request_fingerprints.clear()
+        self.approval_denial_guidance.clear()
         if self.fixed is None:
             self.fixed = FixedMemory(
                 system_prompt=system_prompt,

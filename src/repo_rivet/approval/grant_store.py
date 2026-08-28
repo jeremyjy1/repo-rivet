@@ -30,7 +30,13 @@ class ApprovalGrantStore:
             return None
         return grant
 
-    def remember(self, request: ApprovalRequest, action: ApprovalAction) -> None:
+    def remember(
+        self,
+        request: ApprovalRequest,
+        action: ApprovalAction,
+        *,
+        guidance: str | None = None,
+    ) -> None:
         if action == ApprovalAction.ALLOW and not self.remember_approvals:
             return
         if action == ApprovalAction.DENY and not self.remember_denials:
@@ -41,6 +47,7 @@ class ApprovalGrantStore:
             request_fingerprint=request.fingerprint,
             session_id=request.session_id,
             action=action.value,
+            guidance=guidance,
         )
         self.memory.approval_session_grants[request.fingerprint] = grant.model_dump(mode="json")
         if action == ApprovalAction.DENY:

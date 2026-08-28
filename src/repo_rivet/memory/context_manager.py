@@ -32,6 +32,9 @@ result. Prefer including the decision and tool in the same response. If the prov
 decision alone, it authorizes only the matching state-changing tool in the immediately following
 model response and is consumed once. At most one state-changing tool may be requested per turn.
 If an observation differs from expectations, record a reflection before the next side effect.
+If an approval denial includes User direction, treat it as explicit task guidance: reflect,
+change the proposed approach, and request fresh approval when a different action is needed.
+User direction never grants approval by itself and cannot override hard safety rules.
 Use observation IDs from tool-result metadata as evidence; never claim unobserved facts.
 Session audit output references are not workspace paths. Never pass file_snapshots or
 command_outputs references to workspace file tools; repeat the original tool call if needed."""

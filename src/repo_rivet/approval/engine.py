@@ -70,6 +70,7 @@ class ApprovalEngine:
         self.mode = mode
         self.grant_store.memory.approval_mode_override = mode
         self.grant_store.memory.denied_request_fingerprints.clear()
+        self.grant_store.memory.approval_denial_guidance.clear()
         self.sync_memory_rule()
         self._log(
             "approval_mode_changed",
@@ -122,6 +123,7 @@ class ApprovalEngine:
                     source="session_grant",
                     reason=f"matched an exact session {grant.action} decision",
                     scope=ApprovalScope.SESSION_EXACT,
+                    guidance=grant.guidance,
                 )
             elif request.fingerprint in self.grant_store.memory.denied_request_fingerprints:
                 decision = self._decision(
@@ -129,14 +131,25 @@ class ApprovalEngine:
                     action=ApprovalAction.DENY,
                     source="prior_denial",
                     reason="the exact request was already denied during this task",
+                    guidance=self.grant_store.memory.approval_denial_guidance.get(
+                        request.fingerprint
+                    ),
                 )
         if decision is None:
             decision = self._decide_by_mode(request)
 
         if decision.scope == ApprovalScope.SESSION_EXACT and self.mode != ApprovalMode.ALWAYS_ASK:
-            self.grant_store.remember(request, decision.action)
+            self.grant_store.remember(
+                request,
+                decision.action,
+                guidance=decision.guidance,
+            )
         elif decision.action == ApprovalAction.DENY:
             self.grant_store.memory.denied_request_fingerprints.add(request.fingerprint)
+        if decision.action == ApprovalAction.DENY and decision.guidance:
+            self.grant_store.memory.approval_denial_guidance[request.fingerprint] = (
+                decision.guidance
+            )
         self._log_decision(request, decision)
         return ApprovalOutcome(request=request, decision=decision)
 
@@ -262,6 +275,7 @@ class ApprovalEngine:
         reason: str,
         scope: ApprovalScope = ApprovalScope.ONCE,
         llm_confidence: float | None = None,
+        guidance: str | None = None,
     ) -> ApprovalDecision:
         return ApprovalDecision(
             action=action,
@@ -271,6 +285,7 @@ class ApprovalEngine:
             request_fingerprint=request.fingerprint,
             scope=scope,
             llm_confidence=llm_confidence,
+            guidance=guidance,
         )
 
     def _log_request(self, request: ApprovalRequest) -> None:
@@ -302,6 +317,7 @@ class ApprovalEngine:
             confidence=decision.llm_confidence,
             scope=decision.scope.value,
             abort_agent=decision.abort_agent,
+            guidance=decision.guidance,
             **self._request_details(request),
         )
 

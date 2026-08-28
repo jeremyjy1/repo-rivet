@@ -253,6 +253,7 @@ class FileSessionStore:
         state = copy.deepcopy(source.memory)
         state.approval_session_grants.clear()
         state.denied_request_fingerprints.clear()
+        state.approval_denial_guidance.clear()
         state.approval_mode_override = None
         state.status = SessionStatus.CREATED.value
         for output in state.command_outputs:

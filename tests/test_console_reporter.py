@@ -93,6 +93,7 @@ def test_console_reporter_shows_denial_once_without_exposing_inline_secret() -> 
         affected_paths=["/outside/secret.txt"],
         scope="once",
         reason="writes outside workspace are prohibited",
+        guidance="Read src/app.py first and change only the failing branch",
     )
     reporter.log(
         "tool_result",
@@ -108,6 +109,7 @@ def test_console_reporter_shows_denial_once_without_exposing_inline_secret() -> 
     assert "✗ write_file · denied by hard safety policy" in output
     assert "target /outside/secret.txt" in output
     assert "writes outside workspace are prohibited" in output
+    assert "direction: Read src/app.py first and change only the failing branch" in output
     assert "top-secret-value" not in output
 
 

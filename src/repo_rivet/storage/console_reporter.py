@@ -142,6 +142,7 @@ class ConsoleEventReporter:
             f"risk {risk}",
             self._request_target(data) if not allowed else None,
             self._decision_reason(data.get("reason")) if not allowed else None,
+            self._approval_guidance(data.get("guidance")) if not allowed else None,
         )
         self._print(
             icon,
@@ -224,6 +225,11 @@ class ConsoleEventReporter:
         if not isinstance(value, str) or not value:
             return None
         return self._safe(value, limit=120)
+
+    def _approval_guidance(self, value: Any) -> str | None:
+        if not isinstance(value, str) or not value:
+            return None
+        return f"direction: {self._safe(value, limit=200)}"
 
     def _request_target(self, data: dict[str, Any]) -> str | None:
         program = data.get("program")

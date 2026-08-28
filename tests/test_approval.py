@@ -36,9 +36,11 @@ class FakeHumanApprover:
         *,
         action: ApprovalAction = ApprovalAction.ALLOW,
         scope: ApprovalScope = ApprovalScope.ONCE,
+        guidance: str | None = None,
     ) -> None:
         self.action = action
         self.scope = scope
+        self.guidance = guidance
         self.requests: list[ApprovalRequest] = []
         self.llm_reviews: list[LLMReviewResult | None] = []
 
@@ -57,6 +59,7 @@ class FakeHumanApprover:
             risk_level=request.assessment.level,
             request_fingerprint=request.fingerprint,
             scope=self.scope,
+            guidance=self.guidance,
         )
 
 
@@ -524,6 +527,52 @@ def test_terminal_option_five_marks_agent_abort(tmp_path: Path) -> None:
 
     assert decision.action == ApprovalAction.DENY
     assert decision.abort_agent
+
+
+def test_terminal_denial_can_include_direction_for_agent(tmp_path: Path) -> None:
+    engine, _ = create_engine(tmp_path, mode=ApprovalMode.ALLOW_ALL)
+    request = engine.authorize(
+        tool_name="write_file",
+        arguments={"path": "file.txt", "content": "value"},
+        capabilities={Capability.FILESYSTEM_WRITE},
+        session_id=engine.session_id,
+    ).request
+    buffer = StringIO()
+    console = Console(file=buffer, force_terminal=False, color_system=None, width=180)
+    answers = iter(["3", "先读取现有文件，只修改目标函数"])
+
+    decision = TerminalHumanApprover(console, reader=lambda _: next(answers)).ask(request)
+
+    assert decision.action == ApprovalAction.DENY
+    assert decision.scope == ApprovalScope.ONCE
+    assert decision.guidance == "先读取现有文件，只修改目标函数"
+    assert "Deny once, with optional direction" in buffer.getvalue()
+
+
+def test_guided_denial_is_returned_to_model_and_reused_for_exact_retry(tmp_path: Path) -> None:
+    guidance = "Use replace_text on app.py instead of overwriting the file"
+    human = FakeHumanApprover(action=ApprovalAction.DENY, guidance=guidance)
+    engine, memory = create_engine(tmp_path, mode=ApprovalMode.SAFE_AUTO, human=human)
+    events = EventCollector()
+    engine.event_logger = events
+    registry = create_default_registry(tmp_path, approval_engine=engine)
+    call = ToolCall(
+        id="write-1",
+        name="write_file",
+        arguments={"path": "app.py", "content": "replacement"},
+    )
+
+    first = registry.execute(call)
+    repeated = registry.execute(call)
+
+    assert not first.ok and not repeated.ok
+    assert f"User direction: {guidance}" in (first.error or "")
+    assert f"User direction: {guidance}" in (repeated.error or "")
+    assert first.metadata and first.metadata["approval_guidance"] == guidance
+    assert len(human.requests) == 1
+    assert list(memory.approval_denial_guidance.values()) == [guidance]
+    decision_events = [data for event, data in events.events if event == "approval_decided"]
+    assert decision_events[0]["guidance"] == guidance
 
 
 def test_approval_events_cover_request_decision_and_execution(tmp_path: Path) -> None:

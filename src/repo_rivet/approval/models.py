@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from enum import IntEnum, StrEnum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class ApprovalMode(StrEnum):
@@ -95,6 +95,13 @@ class ApprovalDecision(BaseModel):
     expires_at: datetime | None = None
     llm_confidence: float | None = Field(default=None, ge=0, le=1)
     abort_agent: bool = False
+    guidance: str | None = Field(default=None, min_length=1, max_length=1_000)
+
+    @model_validator(mode="after")
+    def validate_guidance(self) -> "ApprovalDecision":
+        if self.guidance is not None and (self.action != ApprovalAction.DENY or self.abort_agent):
+            raise ValueError("guidance is only valid for a non-aborting denial")
+        return self
 
 
 class ApprovalGrant(BaseModel):
@@ -105,6 +112,13 @@ class ApprovalGrant(BaseModel):
     action: Literal["allow", "deny"]
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     expires_at: datetime | None = None
+    guidance: str | None = Field(default=None, min_length=1, max_length=1_000)
+
+    @model_validator(mode="after")
+    def validate_guidance(self) -> "ApprovalGrant":
+        if self.guidance is not None and self.action != "deny":
+            raise ValueError("guidance is only valid for a denial grant")
+        return self
 
 
 class LLMReviewResult(BaseModel):
