@@ -16,7 +16,7 @@ def test_default_registry_exposes_workspace_and_decision_tools(tmp_path: Path) -
         "search_text",
         "read_file",
         "write_file",
-        "replace_text",
+        "edit_file",
         "run_command",
         "run_verification",
         "git_diff",

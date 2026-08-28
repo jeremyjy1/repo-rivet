@@ -208,6 +208,7 @@ class MemoryState(BaseModel):
     summary: ConversationSummary = Field(default_factory=ConversationSummary)
     working: WorkingMemory = Field(default_factory=WorkingMemory)
     file_memories: dict[str, FileMemory] = Field(default_factory=dict)
+    current_snapshots: dict[str, str] = Field(default_factory=dict)
     invalidated_files: set[str] = Field(default_factory=set)
     modified_files: set[str] = Field(default_factory=set)
     workspace_revision: int = Field(default=0, ge=0)
@@ -345,7 +346,7 @@ class MemoryState(BaseModel):
             self.process_observations.append(process_observation)
             self.process_observations[:] = self.process_observations[-20:]
         context_output = result.output
-        path = call.arguments.get("path")
+        path = metadata.get("path") or call.arguments.get("path")
 
         if call.name == "read_file" and result.ok and isinstance(path, str):
             sha256 = metadata.get("sha256")
@@ -368,8 +369,12 @@ class MemoryState(BaseModel):
                             f"Latest version after prior invalidation:\n{context_output}"
                         )
                 add_unique(self.summary.files_read, path)
+                snapshot_id = metadata.get("snapshot_id")
+                if isinstance(snapshot_id, str):
+                    self.current_snapshots.pop(path, None)
+                    self.current_snapshots[path] = snapshot_id
 
-        elif call.name in {"write_file", "replace_text"} and result.ok and isinstance(path, str):
+        elif call.name in {"write_file", "edit_file"} and result.ok and isinstance(path, str):
             self.file_memories.pop(path, None)
             self.invalidated_files.add(path)
             self.modified_files.add(path)
@@ -384,9 +389,14 @@ class MemoryState(BaseModel):
             add_unique(self.summary.files_modified, path)
             add_unique(self.summary.completed_actions, f"Modified {path} with {call.name}")
             add_unique(self.working.recent_modified_files, path, limit=20)
+            snapshot_id = metadata.get("new_snapshot_id") or metadata.get("snapshot_id")
+            if isinstance(snapshot_id, str):
+                self.current_snapshots.pop(path, None)
+                self.current_snapshots[path] = snapshot_id
             context_output = (
-                f"{context_output}\nPrevious read memory for {path} is now invalid. "
-                "Read the file again before relying on its content."
+                f"{context_output}\nThe previous snapshot for {path} is invalid. "
+                "Use the returned new snapshot only for displayed changed ranges; reread other "
+                "ranges before editing them."
             )
 
         elif call.name in {"run_command", "run_verification"}:

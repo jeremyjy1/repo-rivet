@@ -167,8 +167,18 @@ class ReasoningManager:
             return f"Found {count} matching lines."
         if call.name == "read_file":
             path = metadata.get("path") or call.arguments.get("path", "file")
+            if metadata.get("total_lines") == 0:
+                return f"Read empty file {path}."
+            if (
+                "fully_visible_end_line" in metadata
+                and metadata.get("fully_visible_end_line") is None
+            ):
+                return (
+                    f"Partially read {path}:{metadata.get('start_line', '?')}; "
+                    "the truncated line is not editable."
+                )
             start = metadata.get("start_line", "?")
-            end = metadata.get("end_line", "?")
+            end = metadata.get("fully_visible_end_line", metadata.get("end_line", "?"))
             return f"Read {path}:{start}-{end}."
         if call.name == "write_file":
             path = metadata.get("path") or call.arguments.get("path", "file")
@@ -177,16 +187,17 @@ class ReasoningManager:
                 f"{path}:1-{line_count}" if isinstance(line_count, int) and line_count else path
             )
             return f"Wrote {metadata.get('bytes', 'unknown')} bytes to {location}."
-        if call.name == "replace_text":
+        if call.name == "edit_file":
             path = metadata.get("path") or call.arguments.get("path", "file")
-            line_numbers = metadata.get("line_numbers")
-            if isinstance(line_numbers, list) and line_numbers:
-                locations = ", ".join(f"{path}:{line}" for line in line_numbers)
-                return (
-                    f"Completed {metadata.get('replacements', 'unknown')} replacement(s) at "
-                    f"{locations}."
+            changed_ranges = metadata.get("changed_ranges")
+            if isinstance(changed_ranges, list) and changed_ranges:
+                rendered = ", ".join(
+                    f"{path}:{item[0]}-{item[1]}"
+                    for item in changed_ranges
+                    if isinstance(item, list) and len(item) == 2
                 )
-            return f"Completed {metadata.get('replacements', 'unknown')} replacement(s) in {path}."
+                return f"Committed snapshot-anchored edits at {rendered}."
+            return f"Committed snapshot-anchored edits in {path}."
         if call.name in {"run_command", "run_verification"}:
             return f"Command finished with exit code {metadata.get('exit_code', 'unknown')}."
         if call.name == "git_diff":

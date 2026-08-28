@@ -21,12 +21,12 @@ _PATH_KEYS: dict[str, tuple[str, ...]] = {
     "search_text": ("path",),
     "read_file": ("path",),
     "write_file": ("path",),
-    "replace_text": ("path",),
+    "edit_file": ("path",),
     "run_command": ("cwd",),
     "run_verification": ("cwd",),
     "git_diff": ("path",),
 }
-_CONTENT_KEYS = frozenset({"content", "old_text", "new_text", "stdin"})
+_CONTENT_KEYS = frozenset({"content", "stdin"})
 _SECRET_ARGUMENT_PATTERN = re.compile(
     r"(?i)(authorization|api[_-]?key|password|secret|token)(?:\s*[:=]|$)"
 )

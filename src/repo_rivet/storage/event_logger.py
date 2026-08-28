@@ -10,8 +10,6 @@ _SENSITIVE_KEY_PARTS = (
     "api_key",
     "authorization",
     "content",
-    "new_text",
-    "old_text",
     "password",
     "secret",
     "token",

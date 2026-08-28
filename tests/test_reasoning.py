@@ -84,7 +84,7 @@ def test_mutating_tool_without_decision_is_rejected_before_executor() -> None:
 
 
 def test_declared_tool_mismatch_is_rejected_without_guessing_intent() -> None:
-    write = ToolCall(id="write-1", name="replace_text", arguments={"path": "app.py"})
+    write = ToolCall(id="write-1", name="edit_file", arguments={"path": "app.py"})
     declared_read = decision("decision-1", "read_file")
     tools = FakeToolRegistry([])
     agent, memory = controller(
@@ -100,7 +100,7 @@ def test_declared_tool_mismatch_is_rejected_without_guessing_intent() -> None:
     assert tools.calls == []
     assert memory.reasoning_events[-1].next_action
     assert memory.reasoning_events[-1].next_action.tool_name == "read_file"
-    assert "actual tools were replace_text" in (memory.messages[-2].content or "")
+    assert "actual tools were edit_file" in (memory.messages[-2].content or "")
 
 
 def test_read_decision_cannot_cover_mutation_in_same_turn() -> None:
@@ -162,7 +162,7 @@ def test_matching_decision_executes_action_and_creates_executor_observation() ->
 
 def test_more_than_one_state_changing_action_in_a_turn_is_rejected() -> None:
     first = ToolCall(id="write-1", name="write_file", arguments={"path": "a.py"})
-    second = ToolCall(id="write-2", name="replace_text", arguments={"path": "b.py"})
+    second = ToolCall(id="write-2", name="edit_file", arguments={"path": "b.py"})
     tools = FakeToolRegistry([])
     agent, memory = controller(
         [
@@ -477,17 +477,16 @@ def test_observation_error_is_specific_and_audit_path_stays_executor_only() -> N
             "Found 2 matching lines at src/app.py:7, tests/test_app.py:12.",
         ),
         (
-            ToolCall(id="replace", name="replace_text", arguments={"path": "src/app.py"}),
+            ToolCall(id="replace", name="edit_file", arguments={"path": "src/app.py"}),
             ToolResult(
                 ok=True,
                 output="changed",
                 metadata={
                     "path": "src/app.py",
-                    "replacements": 2,
-                    "line_numbers": [7, 12],
+                    "changed_ranges": [[7, 8], [12, 12]],
                 },
             ),
-            "Completed 2 replacement(s) at src/app.py:7, src/app.py:12.",
+            "Committed snapshot-anchored edits at src/app.py:7-8, src/app.py:12-12.",
         ),
     ],
 )

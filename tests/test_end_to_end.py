@@ -2,6 +2,7 @@ import sys
 from pathlib import Path
 
 from repo_rivet.agent.controller import AgentController
+from repo_rivet.editing.document import TextDocument
 from repo_rivet.llm.base import ModelResponse
 from repo_rivet.storage.event_logger import EventLogger
 from repo_rivet.tools.base import ToolCall
@@ -16,17 +17,27 @@ def test_real_tools_complete_three_step_edit_and_verification_loop(tmp_path: Pat
         encoding="utf-8",
     )
     read = ToolCall(id="1", name="read_file", arguments={"path": "discount.py"})
-    replace = ToolCall(
+    snapshot_id = (
+        TextDocument.load(source_path).to_snapshot(relative_path="discount.py").snapshot_id
+    )
+    edit = ToolCall(
         id="2",
-        name="replace_text",
+        name="edit_file",
         arguments={
             "path": "discount.py",
-            "old_text": "    return price * (1 - rate)",
-            "new_text": (
-                '    if price < 0:\n        raise ValueError("price must not be negative")\n'
-                "    return price * (1 - rate)"
-            ),
-            "expected_count": 1,
+            "snapshot_id": snapshot_id,
+            "operations": [
+                {
+                    "op": "replace",
+                    "start_line": 2,
+                    "end_line": 2,
+                    "new_lines": [
+                        "    if price < 0:",
+                        '        raise ValueError("price must not be negative")',
+                        "    return price * (1 - rate)",
+                    ],
+                }
+            ],
         },
     )
     verification_plan = ToolCall(
@@ -51,7 +62,7 @@ def test_real_tools_complete_three_step_edit_and_verification_loop(tmp_path: Pat
             ],
         },
     )
-    replace_decision = ToolCall(
+    edit_decision = ToolCall(
         id="decision-2",
         name="record_decision",
         arguments={
@@ -59,8 +70,8 @@ def test_real_tools_complete_three_step_edit_and_verification_loop(tmp_path: Pat
             "current_goal": "Reject negative prices",
             "summary": "The file read identified the precise return statement to guard.",
             "evidence_refs": ["read observation"],
-            "next_tool": "replace_text",
-            "next_tool_argument_summary": "edit discount.py once",
+            "next_tool": "edit_file",
+            "next_tool_argument_summary": "edit discount.py snapshot line 2",
             "expected_result": "A negative-price guard is inserted exactly once",
             "confidence": 0.9,
         },
@@ -68,7 +79,7 @@ def test_real_tools_complete_three_step_edit_and_verification_loop(tmp_path: Pat
     model = FakeModelClient(
         [
             ModelResponse(tool_calls=[read]),
-            ModelResponse(tool_calls=[verification_plan, replace_decision, replace]),
+            ModelResponse(tool_calls=[verification_plan, edit_decision, edit]),
             ModelResponse(content="Rejected negative prices and verified the module."),
         ]
     )

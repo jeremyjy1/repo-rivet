@@ -123,13 +123,18 @@ class BaseTool[ArgumentsT: ToolArguments](ABC):
                 ok=False,
                 output="",
                 error=str(error),
-                error_code="tool_error",
-                retryable=True,
+                error_code=str(getattr(error, "code", "tool_error")),
+                retryable=bool(getattr(error, "retryable", True)),
+                metadata=getattr(error, "metadata", None),
             )
 
-    def approval_arguments(self, arguments: ArgumentsT) -> dict[str, Any]:
+    def approval_arguments(self, arguments: ArgumentsT) -> dict[str, Any] | ToolResult:
         """Return the concrete request that the approval layer must evaluate."""
         return arguments.model_dump(mode="json")
+
+    def approval_granted(self, arguments: ArgumentsT, *, source: str) -> None:
+        """Observe a completed approval before local execution begins."""
+        return None
 
     @abstractmethod
     def run(self, arguments: ArgumentsT) -> ToolResult:

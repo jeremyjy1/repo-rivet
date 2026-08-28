@@ -1021,7 +1021,7 @@ class AgentController:
         checker = getattr(self.tool_registry, "is_state_changing", None)
         if callable(checker):
             return bool(checker(tool_name))
-        return tool_name in {"replace_text", "run_command", "write_file"}
+        return tool_name in {"edit_file", "run_command", "write_file"}
 
     def _requires_decision(self, call: ToolCall) -> bool:
         config = self.reasoning_manager.config

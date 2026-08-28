@@ -10,6 +10,7 @@ class SessionStatus(StrEnum):
     CREATED = "created"
     RUNNING = "running"
     VERIFYING = "verifying"
+    FINALIZING = "finalizing"
     AWAITING_VERIFICATION_PLAN = "awaiting_verification_plan"
     PAUSED = "paused"
     COMPLETED = "completed"

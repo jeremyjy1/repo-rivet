@@ -15,7 +15,10 @@ from repo_rivet.memory.token_estimator import ApproximateTokenEstimator
 
 SYSTEM_PROMPT = """You are RepoRivet, a local coding agent.
 Work only through the provided tools and stay inside the configured workspace.
-Inspect relevant files before editing. Prefer precise replacements over full rewrites.
+Inspect relevant files before editing. read_file returns numbered content and a snapshot_id.
+Use edit_file for existing files with that snapshot and only target lines that were shown. All
+operations in one edit_file request use the original snapshot line numbers. Use write_file only
+to create a new path; it never overwrites. If a snapshot is stale, reread instead of guessing.
 Treat command failures as observations, diagnose them, and continue when possible.
 If a tool request is denied, do not repeat the same request; choose a safer alternative or stop.
 Before the first file change, register a Verification Plan with register_verification. Define
@@ -256,6 +259,8 @@ class ContextManager:
                     f"Unresolved errors: {memory.working.unresolved_errors or ['none']}\n"
                     f"Pending actions: {memory.working.pending_actions or ['none']}\n"
                     f"Invalidated file reads: {sorted(memory.invalidated_files) or ['none']}\n"
+                    "Current snapshot IDs (reread if the required visible lines are no longer "
+                    f"in recent context):\n{self._format_current_snapshots(memory)}\n"
                     f"Recent auditable trace:\n{self._format_recent_trace(memory)}\n"
                     f"Available tools: {tool_names}\n"
                     f"Remaining agent steps: {max(remaining_steps, 0)}"
@@ -265,6 +270,11 @@ class ContextManager:
         if memory.summary.has_content():
             messages.append({"role": "system", "content": self._format_summary(memory.summary)})
         return messages
+
+    @staticmethod
+    def _format_current_snapshots(memory: MemoryState) -> str:
+        recent = list(memory.current_snapshots.items())[-20:]
+        return "\n".join(f"- {path}: {snapshot_id}" for path, snapshot_id in recent) or "- none"
 
     @staticmethod
     def _format_recent_trace(memory: MemoryState) -> str:

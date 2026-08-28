@@ -23,6 +23,7 @@ _PRIVILEGED_PROGRAMS = frozenset({"doas", "su", "sudo"})
 _PACKAGE_MANAGERS = frozenset({"cargo", "npm", "pip", "pip3", "pnpm", "uv", "yarn"})
 _READ_ONLY_PROGRAMS = frozenset({"pwd", "whoami"})
 _SHELL_OPERATORS = frozenset({"&", "&&", ";", "<", "<<", ">", ">>", "|", "||"})
+_LARGE_EDIT_DELETION_LINES = 100
 
 
 class RiskAnalyzer:
@@ -48,6 +49,11 @@ class RiskAnalyzer:
         level = self._base_level(capabilities)
         if request.tool_name in {"run_command", "run_verification"}:
             level = max(level, self._assess_command(request, capabilities, reasons))
+        elif request.tool_name == "edit_file":
+            deleted_lines = _deleted_line_count(request.normalized_arguments)
+            if deleted_lines >= _LARGE_EDIT_DELETION_LINES:
+                level = max(level, RiskLevel.HIGH)
+                reasons.append(f"edit removes at least {deleted_lines} lines")
 
         if (
             Capability.PRIVILEGE_ESCALATION in capabilities
@@ -162,3 +168,25 @@ def _is_sensitive_path(path: str) -> bool:
 
 def _is_device_path(path: str) -> bool:
     return Path(path).is_relative_to(Path("/dev"))
+
+
+def _deleted_line_count(arguments: dict[str, object]) -> int:
+    operations = arguments.get("operations")
+    if not isinstance(operations, list):
+        return 0
+    deleted = 0
+    for operation in operations:
+        if not isinstance(operation, dict):
+            continue
+        start = operation.get("start_line")
+        end = operation.get("end_line")
+        if not isinstance(start, int) or not isinstance(end, int) or end < start:
+            continue
+        old_count = end - start + 1
+        if operation.get("op") == "delete":
+            deleted += old_count
+        elif operation.get("op") == "replace":
+            new_count = operation.get("new_line_count", 0)
+            if isinstance(new_count, int):
+                deleted += max(0, old_count - new_count)
+    return deleted

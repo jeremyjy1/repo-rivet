@@ -19,6 +19,8 @@ from repo_rivet.session.errors import (
 from repo_rivet.session.models import SessionStatus
 from repo_rivet.session.store import FileSessionStore
 from repo_rivet.storage.atomic_write import atomic_write_json
+from repo_rivet.tools.base import ToolCall
+from repo_rivet.tools.registry import create_default_registry
 
 
 def make_store(tmp_path: Path) -> FileSessionStore:
@@ -110,6 +112,16 @@ def test_fork_preserves_memory_but_drops_session_approvals(tmp_path: Path) -> No
             Message(role="tool", tool_call_id="read-1", content='{"ok": true}'),
         ]
     )
+    (workspace / "app.py").write_text("old\n", encoding="utf-8")
+    source_registry = create_default_registry(
+        workspace,
+        snapshot_dir=source.store.session_dir / "snapshots",
+    )
+    read = source_registry.execute(
+        ToolCall(id="snapshot-read", name="read_file", arguments={"path": "app.py"})
+    )
+    assert read.ok and read.metadata
+    source.memory.current_snapshots["app.py"] = read.metadata["snapshot_id"]
     source.store.save_state(source.memory, status=SessionStatus.PAUSED.value)
 
     forked = manager.fork(source.metadata.session_id, name="alternative", set_active=True)
@@ -122,6 +134,30 @@ def test_fork_preserves_memory_but_drops_session_approvals(tmp_path: Path) -> No
     assert forked.memory.approval_denial_guidance == {}
     assert manager.get_active(workspace) == forked.metadata
     assert forked.store.reconcile_interrupted_tool_calls(forked.memory) == []
+    forked_registry = create_default_registry(
+        workspace,
+        snapshot_dir=forked.store.session_dir / "snapshots",
+    )
+    edited = forked_registry.execute(
+        ToolCall(
+            id="fork-edit",
+            name="edit_file",
+            arguments={
+                "path": "app.py",
+                "snapshot_id": read.metadata["snapshot_id"],
+                "operations": [
+                    {
+                        "op": "replace",
+                        "start_line": 1,
+                        "end_line": 1,
+                        "new_lines": ["forked"],
+                    }
+                ],
+            },
+        )
+    )
+    assert edited.ok
+    assert (workspace / "app.py").read_text(encoding="utf-8") == "forked\n"
 
 
 def test_completed_and_failed_sessions_must_be_forked(tmp_path: Path) -> None:

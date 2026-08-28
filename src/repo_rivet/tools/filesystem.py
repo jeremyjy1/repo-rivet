@@ -1,6 +1,5 @@
 """Workspace-confined file listing, search, read, and edit tools."""
 
-import hashlib
 import re
 from pathlib import Path
 from typing import ClassVar
@@ -8,10 +7,12 @@ from typing import ClassVar
 from pydantic import Field, model_validator
 
 from repo_rivet.approval.models import Capability
+from repo_rivet.editing.atomic_writer import atomic_create_bytes
+from repo_rivet.editing.document import MAX_TEXT_FILE_BYTES, TextDocument
+from repo_rivet.editing.runtime import EditingRuntime
 from repo_rivet.safety.path_policy import PathPolicyError, WorkspacePathPolicy
 from repo_rivet.tools.base import BaseTool, ToolArguments, ToolResult
 
-MAX_TEXT_FILE_BYTES = 1_000_000
 MAX_READ_LINES = 300
 MAX_READ_CHARS = 20_000
 MAX_SEARCH_MATCHES = 200
@@ -52,14 +53,6 @@ class ReadFileArguments(ToolArguments):
 class WriteFileArguments(ToolArguments):
     path: str
     content: str
-    overwrite: bool = False
-
-
-class ReplaceTextArguments(ToolArguments):
-    path: str
-    old_text: str = Field(min_length=1)
-    new_text: str
-    expected_count: int = Field(default=1, ge=1)
 
 
 class WorkspaceTool(BaseTool[ToolArguments]):
@@ -128,6 +121,14 @@ class SearchTextTool(WorkspaceTool):
     arguments_type = SearchTextArguments
     capabilities = frozenset({Capability.FILESYSTEM_READ})
 
+    def __init__(
+        self,
+        path_policy: WorkspacePathPolicy,
+        editing_runtime: EditingRuntime | None = None,
+    ) -> None:
+        super().__init__(path_policy)
+        self.editing_runtime = editing_runtime or EditingRuntime(path_policy)
+
     def run(self, arguments: SearchTextArguments) -> ToolResult:
         root = self.path_policy.resolve(arguments.path)
         if not root.exists():
@@ -142,15 +143,35 @@ class SearchTextTool(WorkspaceTool):
 
         matches: list[str] = []
         match_locations: list[str] = []
+        snapshot_ids: dict[str, str] = {}
         files_scanned = 0
         for display_path, file_path in self._iter_files(root):
             try:
-                content = _read_text(file_path)
+                document = TextDocument.load(file_path)
             except (OSError, UnicodeError, ValueError):
                 continue
             files_scanned += 1
-            for line_number, line in enumerate(content.splitlines(), start=1):
+            snapshot = None
+            for line_number, line in enumerate(document.lines, start=1):
                 if pattern.search(line):
+                    if snapshot is None:
+                        snapshot = self.editing_runtime.capture_document(
+                            display_path,
+                            document,
+                            start_line=line_number,
+                            end_line=line_number,
+                            source="search_text",
+                            visible=len(line) <= 500,
+                        )
+                        snapshot_ids[display_path] = snapshot.snapshot_id
+                    elif len(line) <= 500:
+                        self.editing_runtime.visibility.record(
+                            path=display_path,
+                            snapshot_id=snapshot.snapshot_id,
+                            start_line=line_number,
+                            end_line=line_number,
+                            source="search_text",
+                        )
                     matches.append(f"{display_path}:{line_number}:{line[:500]}")
                     if len(match_locations) < 5:
                         match_locations.append(f"{display_path}:{line_number}")
@@ -163,6 +184,7 @@ class SearchTextTool(WorkspaceTool):
                                 "match_locations": match_locations,
                                 "files_scanned": files_scanned,
                                 "truncated": True,
+                                "snapshot_ids": snapshot_ids,
                             },
                         )
 
@@ -174,6 +196,7 @@ class SearchTextTool(WorkspaceTool):
                 "match_locations": match_locations,
                 "files_scanned": files_scanned,
                 "truncated": False,
+                "snapshot_ids": snapshot_ids,
             },
         )
 
@@ -202,48 +225,97 @@ class ReadFileTool(WorkspaceTool):
     arguments_type = ReadFileArguments
     capabilities = frozenset({Capability.FILESYSTEM_READ})
 
+    def __init__(
+        self,
+        path_policy: WorkspacePathPolicy,
+        editing_runtime: EditingRuntime | None = None,
+    ) -> None:
+        super().__init__(path_policy)
+        self.editing_runtime = editing_runtime or EditingRuntime(path_policy)
+
     def run(self, arguments: ReadFileArguments) -> ToolResult:
         if _is_sensitive_path(arguments.path):
             raise ValueError(f"Sensitive configuration files cannot be read: {arguments.path}")
         file_path = self.path_policy.resolve(arguments.path)
-        content = _read_text(file_path)
-        lines = content.splitlines()
+        document = TextDocument.load(file_path)
+        lines = document.lines
         if arguments.start_line > max(len(lines), 1):
             raise ValueError(f"start_line exceeds file length ({len(lines)} lines)")
 
         requested_end = arguments.end_line or arguments.start_line + MAX_READ_LINES - 1
         actual_end = min(requested_end, len(lines))
         selected = lines[arguments.start_line - 1 : actual_end]
-        output = "\n".join(
-            f"{line_number:>6} | {line}"
-            for line_number, line in enumerate(selected, start=arguments.start_line)
+        rendered: list[str] = []
+        rendered_chars = 0
+        complete_lines = 0
+        for line_number, line in enumerate(selected, start=arguments.start_line):
+            item = f"{line_number}│ {line}"
+            if rendered_chars + len(item) + 1 > MAX_READ_CHARS:
+                if not rendered:
+                    suffix = " ... line truncated; read a narrower source representation ..."
+                    rendered.append(item[: MAX_READ_CHARS - len(suffix)] + suffix)
+                break
+            rendered.append(item)
+            rendered_chars += len(item) + 1
+            complete_lines += 1
+        chars_truncated = complete_lines < len(selected)
+        displayed_end = arguments.start_line + complete_lines - 1
+        snapshot = self.editing_runtime.capture_document(
+            arguments.path,
+            document,
+            start_line=arguments.start_line,
+            end_line=max(arguments.start_line, displayed_end),
+            source="read_file",
+            visible=complete_lines > 0 or not lines,
         )
-        chars_truncated = len(output) > MAX_READ_CHARS
+        if complete_lines:
+            shown = f"{arguments.start_line}-{displayed_end}"
+        elif not lines:
+            shown = "empty"
+        else:
+            shown = f"none partial={arguments.start_line}"
+        header = (
+            f"[{snapshot.relative_path}#{snapshot.display_tag} lines={shown} total={len(lines)}]"
+        )
+        output = "\n".join([header, *rendered])
         if chars_truncated:
-            output = f"{output[:MAX_READ_CHARS]}\n... output truncated by character limit ..."
-        sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            output += "\n... output truncated by character limit ..."
         return ToolResult(
             ok=True,
             output=output,
             metadata={
-                "path": arguments.path,
-                "sha256": sha256,
+                "path": snapshot.relative_path,
+                "sha256": document.raw_hash,
+                "raw_bytes_hash": document.raw_hash,
+                "normalized_content_hash": document.normalized_hash,
+                "snapshot_id": snapshot.snapshot_id,
+                "snapshot_tag": snapshot.display_tag,
                 "total_lines": len(lines),
                 "start_line": arguments.start_line,
-                "end_line": actual_end,
-                "truncated": actual_end < len(lines) or chars_truncated,
+                "end_line": max(arguments.start_line, displayed_end),
+                "fully_visible_end_line": displayed_end if complete_lines else None,
+                "encoding": snapshot.encoding,
+                "newline_style": snapshot.newline_style,
+                "has_trailing_newline": snapshot.has_trailing_newline,
+                "truncated": displayed_end < len(lines) or chars_truncated,
             },
-            raw_output=content,
+            raw_output=output,
         )
 
 
 class WriteFileTool(WorkspaceTool):
     name = "write_file"
-    description = (
-        "Create a UTF-8 text file, or overwrite one only when overwrite is explicitly true."
-    )
+    description = "Create a new UTF-8 text file. Existing files must be changed with edit_file."
     arguments_type = WriteFileArguments
     capabilities = frozenset({Capability.FILESYSTEM_WRITE})
+
+    def __init__(
+        self,
+        path_policy: WorkspacePathPolicy,
+        editing_runtime: EditingRuntime | None = None,
+    ) -> None:
+        super().__init__(path_policy)
+        self.editing_runtime = editing_runtime or EditingRuntime(path_policy)
 
     def run(self, arguments: WriteFileArguments) -> ToolResult:
         if _is_sensitive_path(arguments.path):
@@ -251,90 +323,42 @@ class WriteFileTool(WorkspaceTool):
         encoded_content = arguments.content.encode("utf-8")
         if len(encoded_content) > MAX_TEXT_FILE_BYTES:
             raise ValueError(f"Content exceeds {MAX_TEXT_FILE_BYTES} bytes")
+        desired_document = TextDocument.from_bytes(encoded_content)
 
         file_path = self.path_policy.resolve(arguments.path)
-        existed = file_path.exists()
-        if existed and file_path.is_dir():
+        if file_path.exists() and file_path.is_dir():
             raise ValueError(f"Path is a directory: {arguments.path}")
-        if existed and not arguments.overwrite:
-            raise ValueError("File already exists; set overwrite=true to replace it")
+        if file_path.exists():
+            raise ValueError("File already exists; use read_file and edit_file to change it")
 
         file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(arguments.content, encoding="utf-8")
-        sha256 = hashlib.sha256(encoded_content).hexdigest()
-        line_count = len(arguments.content.splitlines())
+        try:
+            atomic_create_bytes(file_path, encoded_content)
+        except FileExistsError:
+            raise ValueError("File was created concurrently; no content was overwritten") from None
+        document, snapshot = self.editing_runtime.capture(
+            arguments.path,
+            start_line=1,
+            end_line=max(1, desired_document.total_lines),
+            source="edit_file",
+        )
+        workspace_revision = self.editing_runtime.record_created_file()
+        line_count = document.total_lines
         return ToolResult(
             ok=True,
             output=f"Wrote {len(encoded_content)} bytes to {arguments.path}",
             metadata={
-                "path": arguments.path,
+                "path": snapshot.relative_path,
                 "bytes": len(encoded_content),
                 "line_count": line_count,
-                "created": not existed,
-                "sha256": sha256,
+                "created": True,
+                "sha256": document.raw_hash,
+                "snapshot_id": snapshot.snapshot_id,
+                "snapshot_tag": snapshot.display_tag,
+                "workspace_revision": workspace_revision,
             },
             raw_output=arguments.content,
         )
-
-
-class ReplaceTextTool(WorkspaceTool):
-    name = "replace_text"
-    description = "Replace exact text only when its occurrence count matches expected_count."
-    arguments_type = ReplaceTextArguments
-    capabilities = frozenset({Capability.FILESYSTEM_READ, Capability.FILESYSTEM_WRITE})
-
-    def run(self, arguments: ReplaceTextArguments) -> ToolResult:
-        if _is_sensitive_path(arguments.path):
-            raise ValueError(f"Sensitive configuration files cannot be modified: {arguments.path}")
-        file_path = self.path_policy.resolve(arguments.path)
-        content = _read_text(file_path)
-        actual_count = content.count(arguments.old_text)
-        if actual_count != arguments.expected_count:
-            raise ValueError(
-                f"Expected {arguments.expected_count} matches but found {actual_count}; "
-                "file unchanged"
-            )
-
-        line_numbers: list[int] = []
-        search_start = 0
-        while True:
-            match_start = content.find(arguments.old_text, search_start)
-            if match_start < 0:
-                break
-            line_numbers.append(content.count("\n", 0, match_start) + 1)
-            search_start = match_start + len(arguments.old_text)
-
-        updated = content.replace(arguments.old_text, arguments.new_text)
-        encoded_content = updated.encode("utf-8")
-        if len(encoded_content) > MAX_TEXT_FILE_BYTES:
-            raise ValueError(f"Updated content exceeds {MAX_TEXT_FILE_BYTES} bytes")
-        file_path.write_text(updated, encoding="utf-8")
-        sha256 = hashlib.sha256(encoded_content).hexdigest()
-        return ToolResult(
-            ok=True,
-            output=f"Replaced {actual_count} occurrence(s) in {arguments.path}",
-            metadata={
-                "path": arguments.path,
-                "replacements": actual_count,
-                "line_numbers": line_numbers,
-                "sha256": sha256,
-            },
-            raw_output=updated,
-        )
-
-
-def _read_text(file_path: Path) -> str:
-    if not file_path.exists():
-        raise ValueError(f"File does not exist: {file_path.name}")
-    if not file_path.is_file():
-        raise ValueError(f"Path is not a file: {file_path.name}")
-    if file_path.stat().st_size > MAX_TEXT_FILE_BYTES:
-        raise ValueError(f"File exceeds {MAX_TEXT_FILE_BYTES} bytes: {file_path.name}")
-
-    data = file_path.read_bytes()
-    if b"\x00" in data:
-        raise ValueError(f"Binary files are not supported: {file_path.name}")
-    return data.decode("utf-8")
 
 
 def _is_sensitive_path(path: str) -> bool:

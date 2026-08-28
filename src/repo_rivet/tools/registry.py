@@ -6,13 +6,14 @@ from typing import Any
 
 from repo_rivet.approval.engine import ApprovalEngine
 from repo_rivet.approval.models import ApprovalAction, Capability
+from repo_rivet.editing.runtime import EditingRuntime
+from repo_rivet.editing.tools import EditFileTool
 from repo_rivet.safety.command_policy import CommandPolicy
 from repo_rivet.safety.path_policy import WorkspacePathPolicy
 from repo_rivet.tools.base import BaseTool, ToolCall, ToolResult
 from repo_rivet.tools.filesystem import (
     ListFilesTool,
     ReadFileTool,
-    ReplaceTextTool,
     SearchTextTool,
     WriteFileTool,
 )
@@ -86,6 +87,8 @@ class ToolRegistry:
                 return tool.execute_validated(validated)
 
             normalized_arguments = tool.approval_arguments(validated)
+            if isinstance(normalized_arguments, ToolResult):
+                return normalized_arguments
             outcome = self.approval_engine.authorize(
                 tool_name=call.name,
                 arguments=normalized_arguments,
@@ -128,6 +131,7 @@ class ToolRegistry:
                     retryable=False,
                     metadata={"approval_source": stale_decision.source},
                 )
+            tool.approval_granted(validated, source=decision.source)
             self.approval_engine.record_execution_started(outcome)
             result = tool.execute_validated(validated)
             self.approval_engine.record_execution(
@@ -144,20 +148,29 @@ def create_default_registry(
     workspace: str | Path,
     *,
     approval_engine: ApprovalEngine | None = None,
+    snapshot_dir: Path | None = None,
+    event_logger: Any | None = None,
+    initial_workspace_revision: int = 0,
 ) -> ToolRegistry:
     """Create the local workspace tools and the side-effect-free decision meta tool."""
     path_policy = WorkspacePathPolicy(workspace)
     command_policy = CommandPolicy()
     verification_runtime = VerificationRuntime(path_policy, command_policy)
+    editing_runtime = EditingRuntime(
+        path_policy,
+        snapshot_dir=snapshot_dir,
+        event_logger=event_logger,
+        initial_workspace_revision=initial_workspace_revision,
+    )
     return ToolRegistry(
         [
             RecordDecisionTool(),
             RegisterVerificationTool(),
             ListFilesTool(path_policy),
-            SearchTextTool(path_policy),
-            ReadFileTool(path_policy),
-            WriteFileTool(path_policy),
-            ReplaceTextTool(path_policy),
+            SearchTextTool(path_policy, editing_runtime),
+            ReadFileTool(path_policy, editing_runtime),
+            WriteFileTool(path_policy, editing_runtime),
+            EditFileTool(editing_runtime),
             RunCommandTool(path_policy, command_policy),
             RunVerificationTool(verification_runtime),
             GitDiffTool(path_policy),

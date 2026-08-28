@@ -31,6 +31,7 @@ from repo_rivet.storage.atomic_write import atomic_write_json
 _ACTIVE_SESSION_STATUSES = {
     SessionStatus.RUNNING,
     SessionStatus.VERIFYING,
+    SessionStatus.FINALIZING,
     SessionStatus.AWAITING_VERIFICATION_PLAN,
 }
 
@@ -274,6 +275,14 @@ class FileSessionStore:
             memory=state,
             set_active=set_active,
         )
+        source_snapshots = source.store.session_dir / "snapshots"
+        if source_snapshots.is_dir():
+            shutil.copytree(
+                source_snapshots,
+                forked.store.session_dir / "snapshots",
+                dirs_exist_ok=True,
+            )
+            (forked.store.session_dir / "snapshots" / "noop-counts.json").unlink(missing_ok=True)
         forked.store.log("session_forked", parent_session_id=source.metadata.session_id)
         return forked
 

@@ -27,6 +27,7 @@ def test_build_keeps_fixed_task_state_summary_and_recent_messages() -> None:
     memory = make_memory()
     memory.summary.files_modified.append("src/app.py")
     memory.summary.unresolved_issues.append("pytest still fails")
+    memory.current_snapshots["src/app.py"] = "a" * 64
     memory.messages.append(Message(role="assistant", content="recent decision"))
 
     messages = ContextManager().build(
@@ -39,6 +40,7 @@ def test_build_keeps_fixed_task_state_summary_and_recent_messages() -> None:
     assert messages[0] == {"role": "system", "content": SYSTEM_PROMPT}
     assert "preserve this original task exactly" in messages[1]["content"]
     assert "Current structured state" in messages[2]["content"]
+    assert f"src/app.py: {'a' * 64}" in messages[2]["content"]
     assert any("pytest still fails" in str(message.get("content")) for message in messages)
     assert any(message.get("content") == "recent decision" for message in messages)
 

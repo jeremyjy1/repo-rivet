@@ -16,7 +16,7 @@ from repo_rivet.verification.models import (
     VerificationStatus,
 )
 
-_FILE_MODIFICATION_TOOLS = frozenset({"replace_text", "write_file"})
+_FILE_MODIFICATION_TOOLS = frozenset({"edit_file", "write_file"})
 
 
 class AgentStatus(StrEnum):

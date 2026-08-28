@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from repo_rivet.editing.snapshot_store import SnapshotStore
 from repo_rivet.memory.models import MemoryState, add_unique
 from repo_rivet.storage.atomic_write import atomic_write_json
 from repo_rivet.storage.event_logger import EventLogger
@@ -109,6 +110,7 @@ class MemoryStore:
             )
 
         changed: list[str] = []
+        file_memory_paths = set(memory.file_memories)
         for path, file_memory in list(memory.file_memories.items()):
             full_path = (actual_workspace / path).resolve()
             if not full_path.is_relative_to(actual_workspace):
@@ -121,6 +123,33 @@ class MemoryStore:
             if current_hash != file_memory.sha256:
                 changed.append(path)
                 memory.file_memories.pop(path, None)
+                memory.current_snapshots.pop(path, None)
+                memory.invalidated_files.add(path)
+                issue = f"External file change detected; reread required: {path}"
+                add_unique(memory.working.unresolved_errors, issue, limit=20)
+                add_unique(memory.summary.unresolved_issues, issue)
+        snapshot_store = SnapshotStore(self.session_dir / "snapshots")
+        for path, snapshot_id in list(memory.current_snapshots.items()):
+            if path in file_memory_paths:
+                continue
+            full_path = (actual_workspace / path).resolve()
+            if not full_path.is_relative_to(actual_workspace):
+                current_hash = "missing-or-invalid"
+                snapshot = None
+            else:
+                try:
+                    snapshot = snapshot_store.get(snapshot_id)
+                    current_hash = hashlib.sha256(full_path.read_bytes()).hexdigest()
+                except (OSError, ValueError):
+                    current_hash = "missing-or-invalid"
+                    snapshot = None
+            if (
+                snapshot is None
+                or snapshot.relative_path != path
+                or current_hash != snapshot.raw_bytes_hash
+            ):
+                changed.append(path)
+                memory.current_snapshots.pop(path, None)
                 memory.invalidated_files.add(path)
                 issue = f"External file change detected; reread required: {path}"
                 add_unique(memory.working.unresolved_errors, issue, limit=20)

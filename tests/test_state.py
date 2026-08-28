@@ -18,8 +18,19 @@ def test_record_tool_result_tracks_changes_failures_and_repetition() -> None:
     state = SessionState(task="task")
     call = ToolCall(
         id="call-1",
-        name="replace_text",
-        arguments={"path": "app.py", "old_text": "a", "new_text": "b"},
+        name="edit_file",
+        arguments={
+            "path": "app.py",
+            "snapshot_id": "a" * 64,
+            "operations": [
+                {
+                    "op": "replace",
+                    "start_line": 1,
+                    "end_line": 1,
+                    "new_lines": ["b"],
+                }
+            ],
+        },
     )
 
     state.record_tool_result(call, ToolResult(ok=False, output="", error="not found"))

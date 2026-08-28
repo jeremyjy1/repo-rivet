@@ -361,7 +361,7 @@ def test_console_reporter_trace_is_structured_bounded_and_secret_safe() -> None:
         assumptions=["public API remains stable"],
         open_questions=["none"],
         next_action={
-            "tool_name": "replace_text",
+            "tool_name": "edit_file",
             "argument_summary": "src/app.py",
             "expected_result": "one replacement",
         },
@@ -374,7 +374,7 @@ def test_console_reporter_trace_is_structured_bounded_and_secret_safe() -> None:
     assert "Evidence:" not in output
     assert "obs-1" not in output
     assert "reason-2" not in output
-    assert "Next: replace_text src/app.py" in output
+    assert "Next: edit_file src/app.py" in output
     assert "Confidence: 0.91" in output
     assert "opaque-secret" not in output
     assert "[REDACTED]" in output

@@ -6,10 +6,14 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from repo_rivet.editing.runtime import EditingRuntime
+from repo_rivet.editing.tools import EditFileTool
 from repo_rivet.memory.context_manager import SYSTEM_PROMPT
 from repo_rivet.memory.models import MemoryConfig, MemoryState, Message
 from repo_rivet.memory.store import MemoryStore
+from repo_rivet.safety.path_policy import WorkspacePathPolicy
 from repo_rivet.tools.base import ToolCall, ToolResult
+from repo_rivet.tools.filesystem import ReadFileTool
 from repo_rivet.verification.models import (
     CommandSpec,
     VerificationCheck,
@@ -94,8 +98,19 @@ def test_file_modification_invalidates_previous_file_memory() -> None:
     memory.record_tool_result(read_call(), read_result("old content"), step=1)
     write = ToolCall(
         id="write-1",
-        name="replace_text",
-        arguments={"path": "src/app.py", "old_text": "old", "new_text": "new"},
+        name="edit_file",
+        arguments={
+            "path": "src/app.py",
+            "snapshot_id": "a" * 64,
+            "operations": [
+                {
+                    "op": "replace",
+                    "start_line": 1,
+                    "end_line": 1,
+                    "new_lines": ["new"],
+                }
+            ],
+        },
     )
 
     memory.record_tool_result(
@@ -313,6 +328,56 @@ def test_resume_detects_external_file_change(tmp_path: Path) -> None:
     assert memory.verification_results["tests"].status == VerificationStatus.STALE
     assert memory.summary.verification_status == "invalidated by external file changes"
     assert any("External file change" in issue for issue in memory.working.unresolved_errors)
+
+
+def test_resume_detects_external_change_after_snapshot_edit(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    file_path = workspace / "app.py"
+    file_path.write_text("old\n", encoding="utf-8")
+    store = MemoryStore(tmp_path / "session")
+    memory = MemoryState(session_id=store.session_id)
+    memory.start_task(
+        task="task",
+        workspace=str(workspace.resolve()),
+        system_prompt=SYSTEM_PROMPT,
+        safety_rules=[],
+        completion_rules=[],
+        max_steps=30,
+    )
+    runtime = EditingRuntime(
+        WorkspacePathPolicy(workspace),
+        snapshot_dir=store.session_dir / "snapshots",
+    )
+    read_tool = ReadFileTool(runtime.path_policy, runtime)
+    edit_tool = EditFileTool(runtime)
+    read = read_tool.execute({"path": "app.py", "start_line": 1, "end_line": 1})
+    assert read.ok and read.metadata
+    memory.record_tool_result(
+        ToolCall(id="read", name="read_file", arguments={"path": "app.py"}),
+        read,
+        step=1,
+    )
+    edit_call = ToolCall(
+        id="edit",
+        name="edit_file",
+        arguments={
+            "path": "app.py",
+            "snapshot_id": read.metadata["snapshot_id"],
+            "operations": [{"op": "replace", "start_line": 1, "end_line": 1, "new_lines": ["new"]}],
+        },
+    )
+    edited = edit_tool.execute(edit_call.arguments)
+    assert edited.ok
+    memory.record_tool_result(edit_call, edited, step=2)
+    store.save_state(memory, status="paused")
+    file_path.write_text("external\n", encoding="utf-8")
+
+    changed = store.validate_workspace(memory, workspace)
+
+    assert changed == ["app.py"]
+    assert "app.py" not in memory.current_snapshots
+    assert "app.py" in memory.invalidated_files
 
 
 @pytest.mark.parametrize(

@@ -153,6 +153,78 @@ def test_safe_auto_allows_normal_read_and_denies_sensitive_read(tmp_path: Path) 
     assert human.requests == []
 
 
+def test_edit_approval_contains_preflight_diff_and_version_fingerprint(tmp_path: Path) -> None:
+    path = tmp_path / "main.py"
+    path.write_text("value = 1\n", encoding="utf-8")
+    human = FakeHumanApprover()
+    engine, _ = create_engine(tmp_path, mode=ApprovalMode.SAFE_AUTO, human=human)
+    events = EventCollector()
+    engine.event_logger = events
+    registry = create_default_registry(
+        tmp_path,
+        approval_engine=engine,
+        event_logger=events,
+    )
+    read = registry.execute(
+        ToolCall(id="read-edit", name="read_file", arguments={"path": "main.py"})
+    )
+    assert read.ok and read.metadata
+
+    edited = registry.execute(
+        ToolCall(
+            id="edit-1",
+            name="edit_file",
+            arguments={
+                "path": "main.py",
+                "snapshot_id": read.metadata["snapshot_id"],
+                "operations": [
+                    {
+                        "op": "replace",
+                        "start_line": 1,
+                        "end_line": 1,
+                        "new_lines": ["value = 2"],
+                    }
+                ],
+            },
+        )
+    )
+
+    assert edited.ok and edited.metadata
+    request = human.requests[-1]
+    normalized = request.normalized_arguments
+    assert request.tool_name == "edit_file"
+    assert normalized["snapshot_id"] == read.metadata["snapshot_id"]
+    assert normalized["prepared_live_hash"] == read.metadata["raw_bytes_hash"]
+    assert "-value = 1" in normalized["diff_preview"]
+    assert "+value = 2" in normalized["diff_preview"]
+    assert normalized["operations"][0]["new_line_count"] == 1
+    assert "new_lines" not in normalized["operations"][0]
+    assert edited.metadata["workspace_revision"] == 1
+    assert any(event == "edit_approved" for event, _ in events.events)
+
+
+def test_large_line_deletion_is_classified_as_high_risk(tmp_path: Path) -> None:
+    engine, _ = create_engine(tmp_path, mode=ApprovalMode.ALLOW_ALL)
+
+    outcome = engine.authorize(
+        tool_name="edit_file",
+        arguments={
+            "path": "main.py",
+            "snapshot_id": "a" * 64,
+            "prepared_live_hash": "b" * 64,
+            "operations": [{"op": "delete", "start_line": 1, "end_line": 100}],
+            "diff_preview": "bounded preview",
+        },
+        capabilities={Capability.FILESYSTEM_READ, Capability.FILESYSTEM_WRITE},
+        session_id=engine.session_id,
+    )
+
+    assert outcome.request.assessment.level == RiskLevel.HIGH
+    assert any(
+        "removes at least 100 lines" in reason for reason in outcome.request.assessment.reasons
+    )
+
+
 def test_always_ask_prompts_even_for_list_files(tmp_path: Path) -> None:
     human = FakeHumanApprover()
     engine, _ = create_engine(tmp_path, mode=ApprovalMode.ALWAYS_ASK, human=human)
@@ -586,7 +658,7 @@ def test_terminal_denial_can_include_direction_for_agent(tmp_path: Path) -> None
 
 
 def test_guided_denial_is_returned_to_model_and_reused_for_exact_retry(tmp_path: Path) -> None:
-    guidance = "Use replace_text on app.py instead of overwriting the file"
+    guidance = "Use edit_file on app.py instead of overwriting the file"
     human = FakeHumanApprover(action=ApprovalAction.DENY, guidance=guidance)
     engine, memory = create_engine(tmp_path, mode=ApprovalMode.SAFE_AUTO, human=human)
     events = EventCollector()

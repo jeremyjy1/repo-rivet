@@ -621,6 +621,9 @@ def _build_runtime(
         registry = create_default_registry(
             workspace,
             approval_engine=approval_engine,
+            snapshot_dir=store.session_dir / "snapshots",
+            event_logger=runtime_events,
+            initial_workspace_revision=memory.workspace_revision,
         )
         controller = AgentController(
             model_client=OpenAICompatibleClient(config.api),
