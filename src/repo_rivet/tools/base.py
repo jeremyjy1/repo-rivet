@@ -127,6 +127,10 @@ class BaseTool[ArgumentsT: ToolArguments](ABC):
                 retryable=True,
             )
 
+    def approval_arguments(self, arguments: ArgumentsT) -> dict[str, Any]:
+        """Return the concrete request that the approval layer must evaluate."""
+        return arguments.model_dump(mode="json")
+
     @abstractmethod
     def run(self, arguments: ArgumentsT) -> ToolResult:
         """Execute the tool with validated arguments."""

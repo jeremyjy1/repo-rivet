@@ -9,6 +9,7 @@ from repo_rivet.cli import _chat_loop, _print_result, build_parser, cli
 from repo_rivet.memory.context_manager import SYSTEM_PROMPT
 from repo_rivet.memory.models import MemoryConfig, MemoryState, Message
 from repo_rivet.memory.store import MemoryStore
+from repo_rivet.verification.models import VerificationOutcome
 
 
 class FakeConversationAgent:
@@ -41,7 +42,7 @@ class FakeConversationAgent:
             modified_files=(),
             step_count=1,
             tool_call_count=0,
-            verification_success=False,
+            verification_status=VerificationOutcome.NOT_APPLICABLE,
         )
 
 
@@ -63,7 +64,7 @@ def test_result_summary_is_rendered_as_literal_plain_terminal_text() -> None:
         modified_files=(),
         step_count=1,
         tool_call_count=0,
-        verification_success=True,
+        verification_status=VerificationOutcome.PASSED,
     )
 
     _print_result(console, result)
@@ -72,6 +73,8 @@ def test_result_summary_is_rendered_as_literal_plain_terminal_text() -> None:
     assert "[bold]literal model text[/bold]" in output
     assert "\\x1b[2J" in output
     assert "\x1b" not in output
+    assert "Verification: passed" in output
+    assert "Verification passed:" not in output
 
 
 def test_run_parser_accepts_workspace_config_and_task(tmp_path: Path) -> None:

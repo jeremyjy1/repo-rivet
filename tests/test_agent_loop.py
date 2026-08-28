@@ -1,12 +1,15 @@
+from datetime import UTC, datetime
 from typing import cast
 
 from repo_rivet.agent.controller import AgentController
 from repo_rivet.agent.termination import TerminationConfig, TerminationPolicy
 from repo_rivet.llm.base import ModelContextLengthError, ModelResponse
+from repo_rivet.llm.openai_compatible import ModelRequestError
 from repo_rivet.llm.parser import ResponseParseError
 from repo_rivet.memory.models import MemoryState, Message
 from repo_rivet.tools.base import ToolCall, ToolResult
 from repo_rivet.tools.registry import ToolRegistry
+from repo_rivet.verification.models import ModelErrorRecord
 from tests.fakes import FakeModelClient, FakeToolRegistry
 
 
@@ -34,6 +37,48 @@ def decision(call_id: str, next_tool: str, summary: str = "Use the declared tool
             "next_tool_argument_summary": "bounded task action",
             "expected_result": "The action completes with a locally observed result",
             "confidence": 0.8,
+        },
+    )
+
+
+def verification_plan(call_id: str = "verify-plan") -> ToolCall:
+    return call(
+        call_id,
+        "register_verification",
+        {
+            "requirements": ["tests-pass"],
+            "checks": [
+                {
+                    "check_id": "tests",
+                    "title": "Run tests",
+                    "kind": "test",
+                    "command": {"program": "pytest", "args": ["-q"]},
+                    "criteria": {"expected_exit_codes": [0]},
+                    "required": True,
+                    "claim_ids": ["tests-pass"],
+                    "provenance": "model",
+                }
+            ],
+        },
+    )
+
+
+def passed_verification_result(*, check_id: str = "tests", revision: int = 1) -> ToolResult:
+    now = datetime.now(UTC).isoformat()
+    return ToolResult(
+        ok=True,
+        output="passed",
+        metadata={
+            "exit_code": 0,
+            "verification_result": {
+                "check_id": check_id,
+                "status": "passed",
+                "workspace_revision": revision,
+                "exit_code": 0,
+                "reasons": ["all registered success criteria passed"],
+                "started_at": now,
+                "finished_at": now,
+            },
         },
     )
 
@@ -66,32 +111,373 @@ def test_agent_executes_tool_then_returns_final_text() -> None:
     assert result.tool_call_count == 1
 
 
-def test_agent_refuses_early_finish_until_change_is_verified() -> None:
+def test_agent_automatically_runs_registered_checks_before_finishing() -> None:
     write = call("1", "write_file", {"path": "app.py", "content": "new"})
-    verify = call("2", "run_command", {"command": "pytest -q"})
     model = FakeModelClient(
         [
-            ModelResponse(tool_calls=[decision("d1", "write_file"), write]),
-            ModelResponse(content="Finished too early."),
-            ModelResponse(tool_calls=[decision("d2", "run_command"), verify]),
-            ModelResponse(content="Implemented and tested."),
+            ModelResponse(tool_calls=[verification_plan(), decision("d1", "write_file"), write]),
+            ModelResponse(content="Implemented and ready for deterministic verification."),
         ]
     )
     tools = FakeToolRegistry(
         [
             ToolResult(ok=True, output="written"),
-            ToolResult(ok=True, output="passed", metadata={"exit_code": 0}),
+            passed_verification_result(),
         ]
     )
 
     result = controller(model, tools).run("fix the bug")
 
     assert result.status == "success"
-    assert result.summary == "Implemented and tested."
+    assert result.summary == "Implemented and ready for deterministic verification."
     assert result.modified_files == ("app.py",)
-    assert result.verification_success
-    third_request = model.requests[2]["messages"]
-    assert any("Files changed" in (message.get("content") or "") for message in third_request)
+    assert result.verification_status.value == "passed"
+    assert [item.name for item in tools.calls] == ["write_file", "run_verification"]
+    assert len(model.requests) == 2
+
+
+def test_started_verification_runs_remaining_required_checks_without_model_round_trips() -> None:
+    write = call("1", "write_file", {"path": "app.py", "content": "new"})
+    compile_check = call("verify-compile", "run_verification", {"check_id": "compile"})
+    plan = call(
+        "verify-plan",
+        "register_verification",
+        {
+            "requirements": ["compile", "smoke"],
+            "checks": [
+                {
+                    "check_id": "compile",
+                    "title": "Compile application",
+                    "kind": "build",
+                    "command": {"program": "builder"},
+                    "required": True,
+                    "provenance": "model",
+                },
+                {
+                    "check_id": "smoke",
+                    "title": "Run smoke test",
+                    "kind": "smoke",
+                    "command": {"program": "app", "args": ["--test"]},
+                    "required": True,
+                    "provenance": "model",
+                },
+            ],
+        },
+    )
+    model = FakeModelClient(
+        [
+            ModelResponse(tool_calls=[plan, decision("d1", "write_file"), write]),
+            ModelResponse(tool_calls=[decision("d2", "run_verification"), compile_check]),
+            ModelResponse(content="Implemented and all registered checks passed."),
+        ]
+    )
+    tools = FakeToolRegistry(
+        [
+            ToolResult(ok=True, output="written"),
+            passed_verification_result(check_id="compile"),
+            passed_verification_result(check_id="smoke"),
+        ]
+    )
+
+    result = controller(
+        model,
+        tools,
+        termination=TerminationPolicy(TerminationConfig(max_steps=3)),
+    ).run("implement and verify")
+
+    assert result.status == "success"
+    assert result.verification_status.value == "passed"
+    assert [item.arguments.get("check_id") for item in tools.calls[1:]] == [
+        "compile",
+        "smoke",
+    ]
+    assert len(model.requests) == 3
+    assert "verification_complete" in str(model.requests[2]["messages"][-1]["content"])
+    assert model.requests[2]["tools"] == []
+
+
+def test_verification_pass_on_final_model_step_finishes_instead_of_stopping() -> None:
+    write = call("1", "write_file", {"path": "app.py", "content": "new"})
+    run_check = call("verify-tests", "run_verification", {"check_id": "tests"})
+    model = FakeModelClient(
+        [
+            ModelResponse(tool_calls=[verification_plan(), decision("d1", "write_file"), write]),
+            ModelResponse(tool_calls=[decision("d2", "run_verification"), run_check]),
+        ]
+    )
+    tools = FakeToolRegistry(
+        [
+            ToolResult(ok=True, output="written"),
+            passed_verification_result(),
+        ]
+    )
+
+    result = controller(
+        model,
+        tools,
+        termination=TerminationPolicy(TerminationConfig(max_steps=2)),
+    ).run("implement and verify")
+
+    assert result.status == "success"
+    assert result.step_count == 2
+    assert result.verification_status.value == "passed"
+    assert result.reason is None
+    assert result.summary == (
+        "Completed the requested task. All required verification checks passed. "
+        "Modified files: app.py."
+    )
+
+
+def test_finalization_disables_tools_and_does_not_repeat_passed_check() -> None:
+    write = call("1", "write_file", {"path": "app.py", "content": "new"})
+    first_check = call("verify-tests", "run_verification", {"check_id": "tests"})
+    repeated_check = call("repeat-tests", "run_verification", {"check_id": "tests"})
+    model = FakeModelClient(
+        [
+            ModelResponse(tool_calls=[verification_plan(), decision("d1", "write_file"), write]),
+            ModelResponse(tool_calls=[decision("d2", "run_verification"), first_check]),
+            ModelResponse(tool_calls=[repeated_check]),
+        ]
+    )
+    tools = FakeToolRegistry(
+        [
+            ToolResult(ok=True, output="written"),
+            passed_verification_result(),
+        ]
+    )
+
+    result = controller(model, tools).run("implement and verify")
+
+    assert result.status == "success"
+    assert result.verification_status.value == "passed"
+    assert [item.name for item in tools.calls] == ["write_file", "run_verification"]
+    assert model.requests[2]["tools"] == []
+
+
+def test_finalization_discards_dsml_tool_markup_from_result_and_history() -> None:
+    write = call("1", "write_file", {"path": "app.py", "content": "new"})
+    run_check = call("verify-tests", "run_verification", {"check_id": "tests"})
+    leaked = (
+        "Build passed. Now run the selftest.\n\n"
+        '<｜｜DSML｜｜tool_calls>\n<｜｜DSML｜｜invoke name="record_decision">\n'
+        '<｜｜DSML｜｜parameter name="phase">decision\\</｜｜DSML｜｜parameter>\n'
+        "\\</｜｜DSML｜｜invoke>\n\\</｜｜DSML｜｜tool_calls>"
+    )
+    model = FakeModelClient(
+        [
+            ModelResponse(tool_calls=[verification_plan(), decision("d1", "write_file"), write]),
+            ModelResponse(tool_calls=[decision("d2", "run_verification"), run_check]),
+            ModelResponse(content=leaked),
+        ]
+    )
+    tools = FakeToolRegistry(
+        [
+            ToolResult(ok=True, output="written"),
+            passed_verification_result(),
+        ]
+    )
+    memory = MemoryState(session_id="dsml-finalization")
+
+    result = controller(model, tools).run("implement and verify", memory=memory)
+
+    assert result.status == "success"
+    assert result.summary == (
+        "Completed the requested task. All required verification checks passed. "
+        "Modified files: app.py."
+    )
+    assert "DSML" not in result.summary
+    assert all("DSML" not in (message.content or "") for message in memory.messages)
+
+
+def test_controller_persists_verifying_and_failed_scheduled_check_before_abort() -> None:
+    write = call("1", "write_file", {"path": "app.py", "content": "new"})
+    memory = MemoryState(session_id="verification-abort")
+
+    class StatusInspectingRegistry(FakeToolRegistry):
+        status_at_verification: str | None = None
+
+        def execute(self, tool_call: ToolCall) -> ToolResult:
+            if tool_call.name == "run_verification":
+                self.status_at_verification = memory.status
+            return super().execute(tool_call)
+
+    tools = StatusInspectingRegistry(
+        [
+            ToolResult(ok=True, output="written"),
+            ToolResult(
+                ok=False,
+                output="",
+                error="denied",
+                error_code="approval_denied",
+                metadata={"approval_abort": True},
+            ),
+        ]
+    )
+    model = FakeModelClient(
+        [
+            ModelResponse(tool_calls=[verification_plan(), decision("d1", "write_file"), write]),
+            ModelResponse(content="Ready for verification."),
+        ]
+    )
+
+    result = controller(model, tools).run("fix", memory=memory)
+
+    assert result.status == "stopped"
+    assert tools.status_at_verification == "verifying"
+    assert memory.verification_results["tests"].status.value == "error"
+    assert memory.status == "stopped"
+
+
+def test_missing_verification_plan_gets_one_recovery_then_finishes_incomplete() -> None:
+    write = call("1", "write_file", {"path": "app.py", "content": "new"})
+    model = FakeModelClient(
+        [
+            ModelResponse(tool_calls=[decision("d1", "write_file"), write]),
+            ModelResponse(content="Done without a plan."),
+            ModelResponse(content="Still done without a plan."),
+        ]
+    )
+    tools = FakeToolRegistry([ToolResult(ok=True, output="written")])
+    memory = MemoryState(session_id="missing-plan")
+
+    result = controller(model, tools).run("fix the bug", memory=memory)
+
+    assert result.status == "incomplete"
+    assert result.reason == "no executable verification plan was registered after one recovery"
+    assert len(model.requests) == 3
+    assert memory.verification_plan_recovery_attempts == 1
+    assert memory.candidate_final_assessment
+    recovery = model.requests[2]["messages"]
+    assert any("verification_plan_missing" in str(message.get("content")) for message in recovery)
+
+
+def test_provider_block_preserves_candidate_assessment_and_error_details() -> None:
+    write = call("1", "write_file", {"path": "app.py", "content": "new"})
+    provider_error = ModelRequestError(
+        ModelErrorRecord(
+            error_type="BadRequestError",
+            status_code=400,
+            error_code="invalid_messages",
+            request_id="request-1",
+            message="invalid messages",
+            retryable=False,
+            attempt=1,
+            max_attempts=4,
+            message_count=5,
+            message_roles=["system", "user"],
+            pending_tool_call_ids=[],
+            request_size_bytes=100,
+        )
+    )
+    model = FakeModelClient(
+        [
+            ModelResponse(tool_calls=[decision("d1", "write_file"), write]),
+            ModelResponse(content="Candidate final answer."),
+            provider_error,
+        ]
+    )
+    memory = MemoryState(session_id="blocked-provider")
+
+    result = controller(
+        model,
+        FakeToolRegistry([ToolResult(ok=True, output="written")]),
+    ).run("fix", memory=memory)
+
+    assert result.status == "blocked"
+    assert result.reason == (
+        "model request failed: BadRequestError "
+        "(status 400, code invalid_messages, request request-1)"
+    )
+    assert memory.candidate_final_assessment
+    assert memory.candidate_final_assessment.summary == "Candidate final answer."
+    assert memory.last_model_error and memory.last_model_error.status_code == 400
+    assert result.verification_status.value == "not_run"
+
+
+def test_length_limited_reasoning_is_replayed_then_removed_from_memory() -> None:
+    model = FakeModelClient(
+        [
+            ModelResponse(
+                reasoning_content="private provider continuation",
+                finish_reason="length",
+            ),
+            ModelResponse(content="Completed after continuation."),
+        ]
+    )
+    memory = MemoryState(session_id="length-continuation")
+
+    result = controller(model, FakeToolRegistry([])).run("inspect", memory=memory)
+
+    assert result.status == "success"
+    assert len(model.requests) == 2
+    second_messages = model.requests[1]["messages"]
+    assert second_messages[-2]["reasoning_content"] == "private provider continuation"
+    assert "truncated" in second_messages[-1]["content"]
+    assert model.requests[1]["options"].reasoning_effort == "low"
+    assert all(message.reasoning_content is None for message in memory.messages)
+    assert all(not message.ephemeral for message in memory.messages)
+
+
+def test_repeated_reasoning_length_exhaustion_disables_thinking_and_restarts_from_facts() -> None:
+    model = FakeModelClient(
+        [
+            ModelResponse(reasoning_content="first hidden attempt", finish_reason="length"),
+            ModelResponse(reasoning_content="second hidden attempt", finish_reason="length"),
+            ModelResponse(content="Recovered without more hidden reasoning."),
+        ]
+    )
+    memory = MemoryState(session_id="thinking-fallback")
+
+    result = controller(model, FakeToolRegistry([])).run("inspect", memory=memory)
+
+    assert result.status == "success"
+    assert model.requests[1]["options"].reasoning_effort == "low"
+    assert model.requests[2]["options"].thinking_enabled is False
+    final_messages = model.requests[2]["messages"]
+    assert all("reasoning_content" not in message for message in final_messages)
+    assert "Thinking is disabled" in final_messages[-1]["content"]
+
+
+def test_completed_task_scope_does_not_leak_files_or_verification_to_next_task() -> None:
+    memory = MemoryState(session_id="new-task-scope")
+    memory.modified_files.add("old.cpp")
+    memory.last_agent_outcome = "success"
+
+    result = controller(
+        FakeModelClient([ModelResponse(content="New task inspected.")]),
+        FakeToolRegistry([]),
+    ).run("inspect a different task", memory=memory)
+
+    assert result.status == "success"
+    assert result.modified_files == ()
+    assert result.verification_status.value == "not_applicable"
+
+
+def test_missing_durable_reasoning_for_tool_history_disables_thinking_on_resume() -> None:
+    memory = MemoryState(
+        session_id="reasoning-resume",
+        provider_requires_reasoning_content=True,
+        messages=[
+            Message(
+                role="assistant",
+                content="",
+                tool_calls=[
+                    {
+                        "id": "old-call",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{}"},
+                    }
+                ],
+            ),
+            Message(role="tool", tool_call_id="old-call", content="{}"),
+        ],
+    )
+    model = FakeModelClient([ModelResponse(content="Resumed safely.")])
+
+    result = controller(model, FakeToolRegistry([])).run("continue", memory=memory)
+
+    assert result.status == "success"
+    assert model.requests[0]["options"].thinking_enabled is False
 
 
 def test_agent_stops_repeated_identical_tool_calls() -> None:
@@ -129,7 +515,7 @@ def test_agent_returns_error_after_model_client_retries_fail() -> None:
     result = controller(model, tools).run("task")
 
     assert result.status == "error"
-    assert result.reason == "model API failed after retries: RuntimeError"
+    assert result.reason == "model request failed: RuntimeError"
 
 
 def test_agent_passes_prior_conversation_to_context() -> None:

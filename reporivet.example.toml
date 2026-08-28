@@ -3,13 +3,17 @@ api_key = "replace-with-your-api-key"
 base_url = "https://api.openai.com/v1"
 model = "replace-with-model-name"
 context_window_tokens = 128000
-max_output_tokens = 4096
+# provider_default, enabled, or disabled.
+thinking_mode = "provider_default"
+# Optional for compatible reasoning models: low, high, or max.
+# reasoning_effort = "low"
 # Optional optimization; unavailable or unknown encodings fall back to conservative estimation.
 # tokenizer_encoding = "o200k_base"
 timeout_seconds = 60
 max_retries = 3
 
 [token]
+reserved_output_tokens = 4096
 reserved_tool_result_tokens = 2048
 safety_margin_ratio = 0.15
 soft_limit_ratio = 0.70

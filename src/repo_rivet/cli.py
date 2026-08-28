@@ -723,7 +723,7 @@ def _build_approval_engine(
 def _memory_config(config: AppConfig) -> MemoryConfig:
     return MemoryConfig(
         max_context_tokens=config.api.context_window_tokens,
-        reserved_output_tokens=config.api.max_output_tokens,
+        reserved_output_tokens=config.token.reserved_output_tokens,
         reserved_tool_result_tokens=config.token.reserved_tool_result_tokens,
         safety_margin_ratio=config.token.safety_margin_ratio,
         compaction_threshold=config.token.soft_limit_ratio,
@@ -754,7 +754,7 @@ def _print_runtime(console: Console, workspace: Path, runtime: Runtime) -> None:
             f"Workspace: {workspace.resolve()}\n"
             f"Model: {runtime.config.api.model}\n"
             f"Context window: {runtime.config.api.context_window_tokens} tokens\n"
-            f"Maximum output: {runtime.config.api.max_output_tokens} tokens\n"
+            f"Reserved output headroom: {runtime.config.token.reserved_output_tokens} tokens\n"
             f"Token estimator: {runtime.controller.context_manager.token_manager.name}\n"
             f"Approval mode: {runtime.registry.approval_engine.mode.value}\n"
             f"Decision trace: {runtime.controller.reasoning_manager.config.display.value}\n"
@@ -946,7 +946,13 @@ def _print_history_entry(console: Console, label: str, content: str) -> None:
 
 
 def _print_result(console: Console, result: AgentResult) -> None:
-    color = {"success": "green", "stopped": "yellow", "error": "red"}[result.status]
+    color = {
+        "success": "green",
+        "incomplete": "yellow",
+        "blocked": "yellow",
+        "stopped": "yellow",
+        "error": "red",
+    }[result.status]
     content = Text("Status: ")
     content.append(result.status, style=color)
     content.append(f"\nModel steps: {result.step_count}")
@@ -955,7 +961,8 @@ def _print_result(console: Console, result: AgentResult) -> None:
         ", ".join(escape_terminal_controls(path) for path in result.modified_files) or "none"
     )
     content.append(f"\nModified files: {modified_files}")
-    content.append(f"\nVerification passed: {result.verification_success}")
+    verification = result.verification_status.value.replace("_", " ")
+    content.append(f"\nVerification: {verification}")
     if result.reason:
         content.append(f"\nReason: {escape_terminal_controls(result.reason)}")
     content.append("\n\n")

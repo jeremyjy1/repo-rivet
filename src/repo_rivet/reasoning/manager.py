@@ -6,7 +6,6 @@ from uuid import uuid4
 
 from pydantic import ValidationError
 
-from repo_rivet.agent.verifier import is_verification_command
 from repo_rivet.memory.models import MemoryState, add_unique
 from repo_rivet.reasoning.models import (
     ActionIntent,
@@ -102,7 +101,6 @@ class ReasoningManager:
             output_ref=output_ref,
             exit_code=exit_code if isinstance(exit_code, int) else None,
             affected_paths=affected_paths,
-            verification=self._is_verification(call),
         )
         memory.observation_events.append(event)
         memory.observation_events[:] = memory.observation_events[-self.config.recent_event_limit :]
@@ -150,17 +148,6 @@ class ReasoningManager:
         return paths
 
     @staticmethod
-    def _is_verification(call: ToolCall) -> bool:
-        if call.name == "git_diff":
-            return True
-        command = call.arguments.get("command")
-        return (
-            call.name == "run_command"
-            and isinstance(command, str)
-            and is_verification_command(command)
-        )
-
-    @staticmethod
     def _observation_summary(call: ToolCall, result: ToolResult) -> str:
         metadata = result.metadata or {}
         if not result.ok:
@@ -200,7 +187,7 @@ class ReasoningManager:
                     f"{locations}."
                 )
             return f"Completed {metadata.get('replacements', 'unknown')} replacement(s) in {path}."
-        if call.name == "run_command":
+        if call.name in {"run_command", "run_verification"}:
             return f"Command finished with exit code {metadata.get('exit_code', 'unknown')}."
         if call.name == "git_diff":
             return "Inspected the current Git diff."

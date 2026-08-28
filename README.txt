@@ -7,7 +7,7 @@ RepoRivet 是一个本地优先的单智能体编程工具。它使用模型原�
 运行环境：Python 3.12、uv。
 
 1. 执行 uv sync。
-2. 复制 reporivet.example.toml 为 reporivet.toml，填写 OpenAI 兼容 API 的 key、base_url、model、模型真实的 context_window_tokens 和 max_output_tokens。tokenizer_encoding 可选：能够识别时使用模型 tokenizer，否则自动采用保守近似估算；真实配置已被 Git 忽略。
+2. 复制 reporivet.example.toml 为 reporivet.toml，填写 OpenAI 兼容 API 的 key、base_url、model 和模型真实的 context_window_tokens。RepoRivet 不向模型发送输出长度限制；`token.reserved_output_tokens` 只用于上下文预算预留。tokenizer_encoding 可选：能够识别时使用模型 tokenizer，否则自动采用保守近似估算；真实配置已被 Git 忽略。
 3. 在 `[approval]` 中选择审批模式（默认 `safe-auto`），然后运行：
    uv run reporivet run --approval-mode safe-auto --workspace ./examples/buggy_project "修复负数价格未被拒绝的问题，并运行测试"
 
@@ -15,9 +15,13 @@ RepoRivet 是一个本地优先的单智能体编程工具。它使用模型原�
 
 多会话管理：使用 `reporivet session list` 查看会话，`session current` 查看当前工作区选择，`session use ID` 只切换选择但不运行模型，`session resume [ID]` 恢复交互执行并先显示已保存的对话历史。直接通过 `chat --session ID` 或工作区 active 会话加载已有会话时也会显示历史，新建会话不显示空历史。还支持 `session show/new/rename/fork/archive/delete/repair`；短 ID 必须唯一，完成或失败的会话需要先 fork。每个工作区的 active 指针、meta.json、state.json、summary.json、events.jsonl 和运行锁均由本地管理；恢复时会核对已读文件哈希，将外部变化和中断工具标为未知状态，并且不会自动重试写入或命令。
 
-核心能力：浏览、搜索和读取代码；安全创建、精确替换文件；限时执行本地命令；查看 Git Diff；修改后强制验证；带安全余量、服务端 usage 校准和超限恢复的上下文管理；会话恢复；五模式工具审批；工具请求、审批风险、审批决定和执行结果的实时终端显示；最大步数、运行时间、重复调用与连续失败保护；JSONL 事件日志及凭据过滤。
+核心能力：浏览、搜索和读取代码；安全创建、精确替换文件；限时执行本地命令；查看 Git Diff；基于显式计划和确定性成功条件的修改后验证；带安全余量、服务端 usage 校准和超限恢复的上下文管理；会话恢复；五模式工具审批；工具请求、审批风险、审批决定和执行结果的实时终端显示；最大步数、运行时间、重复调用与连续失败保护；JSONL 事件日志及凭据过滤。
 
-可审计决策链：RepoRivet 不请求或保存模型的原始内部思维链，而是通过 `record_decision` 元工具记录有长度限制且可验证的 Plan、Decision、Reflection 和 Final Assessment。文件修改、命令及其他副作用操作必须声明匹配的 Decision；优先在同一模型响应中携带 Decision 和 Action，也支持一次性授权紧随其后的匹配 Action，每轮最多执行一个副作用工具。协议阻断不会伪装成工具 Observation，也不会占用真实工具失败额度；实际 Observation 和验证结论由 Controller 根据本地 Tool Result 生成，并带有可引用的 `obs-*` 证据 ID。`--reasoning off|summary|trace` 控制终端展示粒度，默认 `summary`；任何 Decision 都不能绕过独立审批系统。
+验证系统不再根据 `pytest`、`g++` 等命令名称猜测结果。模型先通过 `register_verification` 注册带类型、结构化命令、成功条件和必需 Claim 的 Verification Plan；普通 `run_command` 只产生 `[OBSERVE]` 进程事实，`run_verification CHECK_ID` 才会执行已注册检查并由本地规则产生 `[VERIFY]` 结果。Controller 在最终回答时自动调度尚未运行或已因文件修改而过期的必需检查，全部通过才完成；行为检查没有输出或产物 Oracle 时为 `inconclusive`。每次成功写入都会递增 workspace revision，使旧验证变为 `stale`。
+
+对于要求回传思考模式状态的 OpenAI-compatible 网关，RepoRivet 会在当前调用链内原样重放 `reasoning_content`，并对 `finish_reason=length` 做最多三次有界续传；隐藏思考和内部续传提示不会写入会话存储。结果面板使用 `passed`、`failed`、`not run`、`not applicable` 表达验证状态，不再用布尔值把“未修改、未验证”显示成验证通过。已完成任务之后的新用户任务会建立独立的修改与验证证据范围。
+
+可审计决策链：RepoRivet 不请求或保存模型的原始内部思维链，而是通过 `record_decision` 元工具记录有长度限制且可验证的 Plan、Decision、Reflection 和 Final Assessment。文件修改、命令及其他副作用操作必须声明匹配的 Decision；优先在同一模型响应中携带 Decision 和 Action，也支持一次性授权紧随其后的匹配 Action，每轮最多执行一个副作用工具。协议阻断不会伪装成工具 Observation，也不会占用真实工具失败额度；实际 Observation 由 Controller 根据本地 Tool Result 生成，并带有可引用的 `obs-*` 证据 ID。模型 Final Assessment 只显示为 `[ASSESS]`，不能修改验证状态；`[VERIFY]` 只来自本地 Verification Result。`--reasoning off|summary|trace` 控制终端展示粒度，默认 `summary`；任何 Decision 都不能绕过独立审批系统。
 
 审批模式：`allow-all` 在硬性安全规则外自动批准；`llm-auto` 仅允许审批模型高置信批准中低风险请求；`safe-auto` 自动放行窄范围只读工具并人工确认其余操作；`always-ask` 每次询问且不复用会话授权；`read-only` 只允许类型化文件检查，直接拒绝写入、替换和通用命令。交互对话中使用 `/approval` 查看当前模式，使用 `/approval <mode>` 即时切换并保存到会话。人工界面使用数字 `1`～`5` 选择本次批准、当前会话精确批准、本次拒绝、当前会话精确拒绝或中止 Agent；选择拒绝时可继续输入可选的正确方向，该指导会返回模型并进入审计记录，但不会视为授权。单次 `run` 在无交互终端遇到询问时默认拒绝，可在配置中改为失败。
 

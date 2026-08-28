@@ -38,7 +38,7 @@ _APPROVAL_FAILURE_CODES = {
     "approval_stale",
     "hard_policy_denied",
 }
-_PROGRESS_TOOLS = {"git_diff", "run_command"}
+_PROGRESS_TOOLS = {"git_diff", "run_command", "run_verification"}
 
 
 class ConsoleEventReporter:
@@ -62,12 +62,16 @@ class ConsoleEventReporter:
             self._tool_started(data)
         elif event_type == "reasoning":
             self._reasoning(data)
+        elif event_type == "assessment":
+            self._assessment(data)
         elif event_type == "action":
             self._action(data)
         elif event_type == "action_blocked":
             self._action_blocked(data)
         elif event_type == "observation":
             self._observation(data)
+        elif event_type == "verification_result":
+            self._verification(data)
         elif event_type == "tool_result":
             self._tool_result(data)
 
@@ -75,8 +79,6 @@ class ConsoleEventReporter:
         if self.reasoning_mode == ReasoningDisplayMode.OFF:
             return
         phase = self._safe(data.get("phase", "decision")).upper()
-        if phase == "FINAL_ASSESSMENT":
-            phase = "VERIFY"
         summary = self._safe(data.get("summary", ""), limit=500)
         if self.reasoning_mode == ReasoningDisplayMode.SUMMARY:
             self._print_trace_label(phase, summary, style="bold magenta")
@@ -122,10 +124,26 @@ class ConsoleEventReporter:
     def _observation(self, data: dict[str, Any]) -> None:
         if self.reasoning_mode == ReasoningDisplayMode.OFF:
             return
-        label = "VERIFY" if data.get("verification") is True else "OBSERVE"
         summary = self._safe(data.get("result_summary", ""), limit=500)
         style = "bold green" if data.get("ok") is True else "bold red"
-        self._print_trace_label(label, summary, style=style)
+        self._print_trace_label("OBSERVE", summary, style=style)
+
+    def _assessment(self, data: dict[str, Any]) -> None:
+        if self.reasoning_mode == ReasoningDisplayMode.OFF:
+            return
+        summary = self._safe(data.get("summary", ""), limit=500)
+        self._print_trace_label("ASSESS", summary, style="bold magenta")
+
+    def _verification(self, data: dict[str, Any]) -> None:
+        check_id = self._safe(data.get("check_id", "unknown"), limit=100)
+        status = self._safe(data.get("status", "unknown"), limit=30)
+        reasons = data.get("reasons")
+        reason = None
+        if isinstance(reasons, list) and reasons:
+            reason = self._safe(reasons[0], limit=300)
+        detail = self._join(f"{check_id} {status}", reason)
+        style = "bold green" if status == "passed" else "bold red"
+        self._print_trace_label("VERIFY", detail, style=style)
 
     def _approval_decided(self, data: dict[str, Any]) -> None:
         action = self._safe(data.get("action", "unknown")).lower()
@@ -157,7 +175,11 @@ class ConsoleEventReporter:
             self._print("…", tool, "running", style="bold cyan")
 
     def _tool_result(self, data: dict[str, Any]) -> None:
-        if data.get("name") == "record_decision":
+        if data.get("name") in {
+            "record_decision",
+            "register_verification",
+            "run_verification",
+        }:
             return
         if self.reasoning_mode != ReasoningDisplayMode.OFF:
             return

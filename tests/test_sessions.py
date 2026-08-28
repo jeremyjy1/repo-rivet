@@ -34,7 +34,6 @@ api_key = "test-secret"
 base_url = "https://example.com/v1"
 model = "test-model"
 context_window_tokens = 32768
-max_output_tokens = 2048
 """,
         encoding="utf-8",
     )
@@ -176,13 +175,24 @@ def test_live_session_lock_prevents_second_owner(tmp_path: Path) -> None:
         manager.lock(loaded.metadata.session_id).__enter__()
 
 
-def test_repair_removes_stale_lock_and_pauses_interrupted_session(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "active_status",
+    [
+        SessionStatus.RUNNING,
+        SessionStatus.VERIFYING,
+        SessionStatus.AWAITING_VERIFICATION_PLAN,
+    ],
+)
+def test_repair_removes_stale_lock_and_pauses_interrupted_session(
+    tmp_path: Path,
+    active_status: SessionStatus,
+) -> None:
     manager = make_store(tmp_path)
     workspace = tmp_path / "project"
     workspace.mkdir()
     loaded = manager.create(workspace=workspace)
-    loaded.memory.status = SessionStatus.RUNNING.value
-    loaded.store.save_state(loaded.memory, status=SessionStatus.RUNNING.value)
+    loaded.memory.status = active_status.value
+    loaded.store.save_state(loaded.memory, status=active_status.value)
     lock_path = loaded.store.session_dir / "lock.json"
     lock_path.write_text(
         json.dumps(

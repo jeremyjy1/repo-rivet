@@ -17,6 +17,7 @@ def test_termination_limits_are_positive() -> None:
         ("consecutive_protocol_failures", 2, "decision protocol failures"),
         ("repeated_tool_calls", 2, "repeated identical tool call"),
         ("empty_model_responses", 2, "empty model responses"),
+        ("consecutive_length_responses", 2, "length-limited model responses"),
     ],
 )
 def test_termination_counter_limits(attribute: str, value: int, reason: str) -> None:
@@ -29,6 +30,7 @@ def test_termination_counter_limits(attribute: str, value: int, reason: str) -> 
             max_consecutive_protocol_failures=2,
             max_repeated_tool_calls=2,
             max_empty_model_responses=2,
+            max_consecutive_length_responses=2,
         )
     )
 

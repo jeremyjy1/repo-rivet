@@ -23,9 +23,10 @@ _PATH_KEYS: dict[str, tuple[str, ...]] = {
     "write_file": ("path",),
     "replace_text": ("path",),
     "run_command": ("cwd",),
+    "run_verification": ("cwd",),
     "git_diff": ("path",),
 }
-_CONTENT_KEYS = frozenset({"content", "old_text", "new_text"})
+_CONTENT_KEYS = frozenset({"content", "old_text", "new_text", "stdin"})
 _SECRET_ARGUMENT_PATTERN = re.compile(
     r"(?i)(authorization|api[_-]?key|password|secret|token)(?:\s*[:=]|$)"
 )
@@ -128,7 +129,7 @@ class RequestNormalizer:
         if outside_paths:
             normalized["_outside_workspace_paths"] = sorted(outside_paths)
 
-        if tool_name == "run_command":
+        if tool_name in {"run_command", "run_verification"}:
             command = arguments.get("command")
             if isinstance(command, str):
                 try:

@@ -22,6 +22,10 @@ def test_run_command_captures_output_and_exit_code(tmp_path: Path) -> None:
     assert "Exit code: 0" in result.output
     assert "hello" in result.output
     assert result.metadata and result.metadata["exit_code"] == 0
+    observation = result.metadata["process_observation"]
+    assert observation["argv"][0] == sys.executable
+    assert observation["exit_code"] == 0
+    assert observation["spawn_error"] is None
 
 
 def test_nonzero_exit_is_a_normal_observation(tmp_path: Path) -> None:

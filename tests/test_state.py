@@ -29,5 +29,5 @@ def test_record_tool_result_tracks_changes_failures_and_repetition() -> None:
     assert state.repeated_tool_calls == 2
     assert state.consecutive_failures == 0
     assert state.modified_files == {"app.py"}
-    assert state.last_change_step == 2
+    assert state.workspace_revision == 1
     assert "not found" in state.state_summary()

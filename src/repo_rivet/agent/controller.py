@@ -1,11 +1,13 @@
-"""Explicit single-agent model/tool loop."""
+"""Explicit single-agent model/tool/verification loop."""
 
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, Protocol
 from uuid import uuid4
 
-from repo_rivet.agent.state import SessionState
+from repo_rivet.agent.state import AgentStatus, SessionState
 from repo_rivet.agent.termination import TerminationPolicy
 from repo_rivet.agent.verifier import Verifier
 from repo_rivet.context.manager import (
@@ -13,15 +15,31 @@ from repo_rivet.context.manager import (
     ContextBudgetExceededError,
     ContextManager,
 )
-from repo_rivet.llm.base import ModelClient, ModelContextLengthError, ModelResponse
+from repo_rivet.llm.base import (
+    ModelClient,
+    ModelContextLengthError,
+    ModelRequestOptions,
+    ModelResponse,
+)
+from repo_rivet.llm.openai_compatible import ModelRequestError
 from repo_rivet.llm.parser import ResponseParseError
+from repo_rivet.llm.protocol import contains_embedded_tool_protocol
 from repo_rivet.memory.models import MemoryState, Message
 from repo_rivet.memory.store import MemoryStore
 from repo_rivet.reasoning.manager import ReasoningManager
 from repo_rivet.reasoning.models import ReasoningEvent, ReasoningPhase
 from repo_rivet.reasoning.validator import DecisionValidationError, validate_decision_for_actions
+from repo_rivet.safety.command_policy import CommandPolicy
+from repo_rivet.safety.path_policy import WorkspacePathPolicy
 from repo_rivet.tools.base import ToolCall, ToolResult
 from repo_rivet.tools.registry import ToolRegistry
+from repo_rivet.verification.models import (
+    FinalAssessment,
+    VerificationOutcome,
+    VerificationResult,
+    VerificationStatus,
+)
+from repo_rivet.verification.runtime import VerificationRuntime
 
 
 class EventSink(Protocol):
@@ -36,13 +54,13 @@ class EventSink(Protocol):
 class AgentResult:
     """Final outcome returned to the CLI for every terminal path."""
 
-    status: Literal["success", "stopped", "error"]
+    status: Literal["success", "incomplete", "blocked", "stopped", "error"]
     summary: str
     reason: str | None
     modified_files: tuple[str, ...]
     step_count: int
     tool_call_count: int
-    verification_success: bool
+    verification_status: VerificationOutcome
 
 
 class AgentController:
@@ -68,6 +86,13 @@ class AgentController:
         self.event_logger = event_logger
         self.memory_store = memory_store
         self.reasoning_manager = reasoning_manager or ReasoningManager()
+        runtime = getattr(tool_registry, "verification_runtime", None)
+        workspace = getattr(tool_registry, "workspace", None) or Path.cwd().resolve()
+        self.verification_runtime = (
+            runtime
+            if isinstance(runtime, VerificationRuntime)
+            else VerificationRuntime(WorkspacePathPolicy(workspace), CommandPolicy())
+        )
 
     def run(
         self,
@@ -81,6 +106,7 @@ class AgentController:
 
         workspace = getattr(self.tool_registry, "workspace", None) or Path.cwd().resolve()
         memory = memory or MemoryState(session_id=f"memory-{uuid4().hex[:8]}")
+        memory.begin_task_scope()
         memory.start_task(
             task=task,
             workspace=str(workspace),
@@ -107,29 +133,51 @@ class AgentController:
             tool_call_count=memory.tool_event_step,
             initial_tool_call_count=memory.tool_event_step,
             modified_files=set(memory.modified_files),
-            last_change_step=memory.last_file_change_step,
-            last_verification_step=memory.last_verification_step,
-            last_verification_success=memory.last_verification_success,
+            workspace_revision=memory.workspace_revision,
+            verification_plan=memory.verification_plan,
+            verification_results=dict(memory.verification_results),
+            verification_plan_recovery_attempts=memory.verification_plan_recovery_attempts,
+            candidate_final_assessment=memory.candidate_final_assessment,
             reflection_required=memory.reflection_required or bool(memory.invalidated_files),
+            provider_reasoning_detected=memory.provider_requires_reasoning_content,
+            force_thinking_disabled=self._history_requires_non_thinking(memory),
         )
+        self.verification_runtime.bind(memory)
         self._log("session_start", task=state.task)
         if repaired_legacy_reflection:
             self._log(
                 "legacy_decision_state_repaired",
                 reason="trailing decision-validation rejections did not execute tools",
             )
-        self._save_memory(memory, state, status="running")
+        self._save_memory(memory, state, status=state.status.value)
         try:
             while True:
                 reason = self.termination_policy.check(state)
                 if reason:
+                    if (
+                        reason
+                        == (
+                            "maximum agent steps reached "
+                            f"({self.termination_policy.config.max_steps})"
+                        )
+                        and state.status == AgentStatus.FINALIZING
+                        and self.verifier.completion_report(state).complete
+                    ):
+                        return self._finish(
+                            state,
+                            memory,
+                            status="success",
+                            summary=self._verified_completion_summary(state),
+                        )
                     return self._finish(state, memory, status="stopped", reason=reason)
 
                 try:
                     response = self._complete_with_context_recovery(
                         state=state,
                         memory=memory,
-                        tool_schemas=self._tool_schemas(),
+                        tool_schemas=(
+                            [] if state.status == AgentStatus.FINALIZING else self._tool_schemas()
+                        ),
                     )
                 except ResponseParseError as error:
                     state.record_model_error(str(error))
@@ -137,7 +185,7 @@ class AgentController:
                         Message.from_chat_message(state.messages[-1], step=state.tool_call_count)
                     )
                     self._log("model_response_invalid", step=state.step_count, error=str(error))
-                    self._save_memory(memory, state, status="running")
+                    self._save_memory(memory, state, status=state.status.value)
                     continue
                 except AgentContextOverflowError as error:
                     return self._finish(
@@ -146,15 +194,62 @@ class AgentController:
                         status="stopped",
                         reason=str(error),
                     )
+                except ModelRequestError as error:
+                    memory.last_model_error = error.record
+                    self._log("model_error", **error.record.model_dump(mode="json"))
+                    attempt_text = (
+                        f" after {error.record.attempt} attempts"
+                        if error.record.attempt > 1
+                        else ""
+                    )
+                    details = [
+                        f"status {error.record.status_code}"
+                        if error.record.status_code is not None
+                        else None,
+                        f"code {error.record.error_code}"
+                        if error.record.error_code is not None
+                        else None,
+                        f"request {error.record.request_id}"
+                        if error.record.request_id is not None
+                        else None,
+                    ]
+                    detail_text = ", ".join(item for item in details if item)
+                    suffix = f" ({detail_text})" if detail_text else ""
+                    return self._finish(
+                        state,
+                        memory,
+                        status="blocked",
+                        reason=(
+                            f"model request failed{attempt_text}: {error.record.error_type}{suffix}"
+                        ),
+                    )
                 except Exception as error:
                     return self._finish(
                         state,
                         memory,
                         status="error",
-                        reason=f"model API failed after retries: {type(error).__name__}",
+                        reason=f"model request failed: {type(error).__name__}",
                     )
 
+                raw_assistant_message = response.as_assistant_message()
+                leaked_tool_protocol = (
+                    state.status == AgentStatus.FINALIZING
+                    and contains_embedded_tool_protocol(response.content)
+                )
+                attempted_finalization_tool = bool(response.tool_calls) or leaked_tool_protocol
+                if state.status == AgentStatus.FINALIZING and attempted_finalization_tool:
+                    response = replace(response, content=None)
+                    if leaked_tool_protocol:
+                        self._log(
+                            "finalization_protocol_text_discarded",
+                            step=state.step_count + 1,
+                        )
                 state.record_model_response(response)
+                if response.reasoning_content is not None:
+                    state.provider_reasoning_detected = True
+                    memory.provider_requires_reasoning_content = True
+                assistant_message = response.as_assistant_message()
+                length_limited = response.finish_reason == "length" and not response.tool_calls
                 memory.total_input_tokens += (
                     response.input_tokens
                     if response.input_tokens is not None
@@ -163,11 +258,12 @@ class AgentController:
                 memory.total_output_tokens += (
                     response.output_tokens
                     if response.output_tokens is not None
-                    else self.context_manager.count_message(response.as_assistant_message())
+                    else self.context_manager.count_message(raw_assistant_message)
                 )
                 memory.append_assistant(
-                    response.as_assistant_message(),
+                    assistant_message,
                     step=state.tool_call_count,
+                    ephemeral=length_limited,
                 )
                 self._log(
                     "model_response",
@@ -176,6 +272,71 @@ class AgentController:
                     content_length=len(response.content or ""),
                     tools=[call.name for call in response.tool_calls],
                 )
+                if state.status == AgentStatus.FINALIZING:
+                    for call in response.tool_calls:
+                        self._log(
+                            "tool_call",
+                            step=state.step_count,
+                            tool_call_id=call.id,
+                            name=call.name,
+                            arguments=call.arguments,
+                        )
+                        self._record_blocked_action(
+                            call,
+                            ToolResult(
+                                ok=False,
+                                output="",
+                                error=(
+                                    "All required verification checks already passed; tools are "
+                                    "disabled during finalization."
+                                ),
+                                error_code="finalization_tool_disabled",
+                                retryable=False,
+                            ),
+                            state=state,
+                            memory=memory,
+                        )
+                    return self._finish(
+                        state,
+                        memory,
+                        status="success",
+                        summary=(
+                            response.content.strip()
+                            if response.content and response.content.strip()
+                            else self._verified_completion_summary(state)
+                        ),
+                    )
+                if length_limited:
+                    if (
+                        state.provider_reasoning_detected
+                        and state.consecutive_length_responses >= 2
+                    ):
+                        memory.discard_ephemeral_messages()
+                        continuation = (
+                            "The provider exhausted the output budget in reasoning twice. "
+                            "Thinking is disabled for the next recovery request. Respond "
+                            "immediately with one concise tool action or a complete concise "
+                            "answer; do not repeat analysis or completed work."
+                        )
+                    else:
+                        continuation = (
+                            "The provider truncated the previous response because it reached the "
+                            "output limit. Continue now with low reasoning effort. Return one "
+                            "concise tool action or a complete concise answer; do not repeat "
+                            "analysis or completed work."
+                        )
+                    state.messages.append({"role": "system", "content": continuation})
+                    memory.append_ephemeral_system(
+                        continuation,
+                        step=state.tool_call_count,
+                    )
+                    self._log(
+                        "model_response_continuation",
+                        step=state.step_count,
+                        consecutive=state.consecutive_length_responses,
+                    )
+                    self._save_memory(memory, state, status=state.status.value)
+                    continue
                 if response.tool_calls:
                     terminal_result = self._process_tool_turn(
                         response.tool_calls,
@@ -190,27 +351,13 @@ class AgentController:
                     state.pending_decision = None
                     memory.working.pending_actions.clear()
                 if response.content and response.content.strip():
-                    if self.verifier.can_finish(state):
-                        return self._finish(
-                            state,
-                            memory,
-                            status="success",
-                            summary=response.content.strip(),
-                        )
-                    state.messages.append(
-                        {
-                            "role": "system",
-                            "content": (
-                                "Files changed after the latest successful verification. "
-                                "Run an appropriate test, build, lint, syntax check, or git_diff "
-                                "before finishing."
-                            ),
-                        }
+                    terminal_result = self._handle_final_response(
+                        response.content.strip(),
+                        state=state,
+                        memory=memory,
                     )
-                    memory.messages.append(
-                        Message.from_chat_message(state.messages[-1], step=state.tool_call_count)
-                    )
-                    self._save_memory(memory, state, status="running")
+                    if terminal_result is not None:
+                        return terminal_result
         except KeyboardInterrupt:
             state.interrupted = True
             return self._finish(state, memory, status="stopped", reason="interrupted by user")
@@ -223,7 +370,47 @@ class AgentController:
         memory: MemoryState,
     ) -> AgentResult | None:
         reasoning_calls = [call for call in calls if call.name == "record_decision"]
-        action_calls = [call for call in calls if call.name != "record_decision"]
+        registration_calls = [call for call in calls if call.name == "register_verification"]
+        action_calls = [
+            call for call in calls if call.name not in {"record_decision", "register_verification"}
+        ]
+        awaiting_plan_recovery = (
+            state.verification_plan_recovery_attempts >= 1
+            and state.verification_plan is None
+            and bool(state.modified_files)
+        )
+        if awaiting_plan_recovery and not registration_calls:
+            error = "The single verification-plan recovery turn only allows register_verification."
+            for call in calls:
+                self._log(
+                    "tool_call",
+                    step=state.step_count,
+                    tool_call_id=call.id,
+                    name=call.name,
+                    arguments=call.arguments,
+                )
+                result = ToolResult(
+                    ok=False,
+                    output="",
+                    error=error,
+                    error_code="verification_plan_missing",
+                    retryable=False,
+                )
+                if call.name in {"record_decision", "register_verification"}:
+                    self._record_meta_result(call, result, state=state, memory=memory)
+                else:
+                    self._record_blocked_action(call, result, state=state, memory=memory)
+            return self._finish(
+                state,
+                memory,
+                status="incomplete",
+                reason="no verification plan was registered in the recovery turn",
+                summary=(
+                    state.candidate_final_assessment.summary
+                    if state.candidate_final_assessment is not None
+                    else ""
+                ),
+            )
         mutating_calls = [call for call in action_calls if self._is_state_changing(call.name)]
         pending_decision = state.pending_decision
         state.pending_decision = None
@@ -231,6 +418,9 @@ class AgentController:
             memory.working.pending_actions.clear()
         reasoning_event: ReasoningEvent | None = None
         reasoning_error: str | None = None
+        registration_error: str | None = None
+        registered_plan_id: str | None = None
+        passed_verification_check = False
 
         if len(reasoning_calls) > 1:
             reasoning_error = "Only one record_decision call is allowed per model turn."
@@ -247,11 +437,23 @@ class AgentController:
                 except ValueError as error:
                     reasoning_error = str(error)
 
+        if len(registration_calls) > 1:
+            registration_error = "Only one verification plan may be registered per model turn."
+        elif registration_calls:
+            try:
+                plan = self.verification_runtime.register_plan(registration_calls[0].arguments)
+                state.verification_plan = plan
+                state.verification_results = dict(memory.verification_results)
+                state.status = AgentStatus.RUNNING
+                registered_plan_id = plan.plan_id
+            except ValueError as error:
+                registration_error = str(error)
+
         decision_for_validation = reasoning_event
         if reasoning_event is None and mutating_calls:
             decision_for_validation = pending_decision
 
-        validation_error = reasoning_error
+        validation_error = reasoning_error or registration_error
         if mutating_calls and state.reflection_required:
             validation_error = (
                 "The previous action failed or was denied. Record a reflection in a separate "
@@ -267,15 +469,29 @@ class AgentController:
                 )
             except DecisionValidationError as error:
                 validation_error = str(error)
-
         if validation_error is not None:
             state.record_protocol_failure(validation_error)
         else:
             state.consecutive_protocol_failures = 0
 
         if reasoning_event is not None:
-            self._log("reasoning", **reasoning_event.model_dump(mode="json"))
-            self._save_memory(memory, state, status="running")
+            event_type = (
+                "assessment"
+                if reasoning_event.phase == ReasoningPhase.FINAL_ASSESSMENT
+                else "reasoning"
+            )
+            self._log(event_type, **reasoning_event.model_dump(mode="json"))
+            if reasoning_event.phase == ReasoningPhase.FINAL_ASSESSMENT:
+                assessment = FinalAssessment(
+                    summary=reasoning_event.summary,
+                    changes=sorted(state.modified_files),
+                    claimed_completed=True,
+                    remaining_risks=reasoning_event.open_questions,
+                    evidence_refs=reasoning_event.evidence_refs,
+                )
+                state.candidate_final_assessment = assessment
+                memory.candidate_final_assessment = assessment
+            self._save_memory(memory, state, status=state.status.value)
 
         reasoning_call_id = reasoning_calls[0].id if len(reasoning_calls) == 1 else None
         for call in calls:
@@ -330,6 +546,29 @@ class AgentController:
                 self._record_meta_result(call, result, state=state, memory=memory)
                 continue
 
+            if call.name == "register_verification":
+                if registered_plan_id is not None and call == registration_calls[0]:
+                    result = ToolResult(
+                        ok=True,
+                        output=f"Registered verification plan {registered_plan_id}.",
+                        metadata={"verification_plan_id": registered_plan_id},
+                    )
+                    self._log(
+                        "verification_plan_registered",
+                        plan_id=registered_plan_id,
+                        check_ids=[check.check_id for check in (state.verification_plan.checks)],
+                    )
+                else:
+                    result = ToolResult(
+                        ok=False,
+                        output="",
+                        error=registration_error or "Duplicate verification plan registration.",
+                        error_code="verification_plan_invalid",
+                        retryable=True,
+                    )
+                self._record_meta_result(call, result, state=state, memory=memory)
+                continue
+
             if validation_error is not None:
                 result = ToolResult(
                     ok=False,
@@ -349,20 +588,33 @@ class AgentController:
                 argument_summary=self._action_summary(call),
             )
             result = self.tool_registry.execute(call)
+            verification_result = (
+                self._verification_result(result) if call.name == "run_verification" else None
+            )
             terminal_result = self._record_action_result(call, result, state=state, memory=memory)
             if terminal_result is not None:
                 return terminal_result
+            if verification_result is not None:
+                passed_verification_check = (
+                    passed_verification_check
+                    or verification_result.status == VerificationStatus.PASSED
+                    and verification_result.workspace_revision == state.workspace_revision
+                )
 
-        if reasoning_event is not None and not action_calls:
-            if reasoning_event.phase in {ReasoningPhase.PLAN, ReasoningPhase.REFLECTION}:
+        if (reasoning_event is not None or registration_calls) and not action_calls:
+            if reasoning_event is not None and reasoning_event.phase in {
+                ReasoningPhase.PLAN,
+                ReasoningPhase.REFLECTION,
+            }:
                 state.reasoning_only_turns += 1
             else:
                 state.reasoning_only_turns = 0
-            if reasoning_event.phase == ReasoningPhase.REFLECTION:
+            if reasoning_event is not None and reasoning_event.phase == ReasoningPhase.REFLECTION:
                 state.reflection_required = False
                 memory.reflection_required = False
             elif (
-                reasoning_event.phase == ReasoningPhase.DECISION
+                reasoning_event is not None
+                and reasoning_event.phase == ReasoningPhase.DECISION
                 and reasoning_event.next_action is not None
                 and not state.reflection_required
             ):
@@ -376,13 +628,60 @@ class AgentController:
                 memory.messages.append(
                     Message.from_chat_message(state.messages[-1], step=state.tool_call_count)
                 )
-            self._save_memory(memory, state, status="running")
+            self._save_memory(memory, state, status=state.status.value)
         elif action_calls:
             state.reasoning_only_turns = 0
         if validation_error is not None:
             reason = self.termination_policy.check(state)
             if reason:
                 return self._finish(state, memory, status="stopped", reason=reason)
+        if awaiting_plan_recovery and state.verification_plan is None:
+            return self._finish(
+                state,
+                memory,
+                status="incomplete",
+                reason="the verification plan supplied during recovery was invalid",
+                summary=(
+                    state.candidate_final_assessment.summary
+                    if state.candidate_final_assessment is not None
+                    else ""
+                ),
+            )
+        if passed_verification_check:
+            report = self.verifier.completion_report(state)
+            if report.runnable:
+                terminal_result = self._run_verification_batch(
+                    report.runnable,
+                    state=state,
+                    memory=memory,
+                )
+                if terminal_result is not None:
+                    return terminal_result
+                report = self.verifier.completion_report(state)
+            self._append_system_feedback(
+                state,
+                memory,
+                {
+                    "event": (
+                        "verification_complete"
+                        if report.complete
+                        else "required_verification_incomplete"
+                    ),
+                    "verification_report": report.model_dump(mode="json"),
+                    "instruction": (
+                        "All required checks passed. Provide the concise final answer now; do "
+                        "not register or run the checks again."
+                        if report.complete
+                        else "Use the deterministic results to repair the implementation before "
+                        "claiming completion."
+                    ),
+                },
+            )
+            state.status = AgentStatus.FINALIZING if report.complete else AgentStatus.RUNNING
+            if report.complete:
+                state.pending_decision = None
+                memory.working.pending_actions.clear()
+            self._save_memory(memory, state, status=state.status.value)
         return None
 
     def _record_meta_result(
@@ -406,7 +705,7 @@ class AgentController:
             retryable=result.retryable,
             metadata=result.metadata,
         )
-        self._save_memory(memory, state, status="running")
+        self._save_memory(memory, state, status=state.status.value)
 
     def _record_blocked_action(
         self,
@@ -438,7 +737,7 @@ class AgentController:
             metadata=result.metadata,
             executed=False,
         )
-        self._save_memory(memory, state, status="running")
+        self._save_memory(memory, state, status=state.status.value)
 
     def _record_action_result(
         self,
@@ -447,6 +746,7 @@ class AgentController:
         *,
         state: SessionState,
         memory: MemoryState,
+        append_to_conversation: bool = True,
     ) -> AgentResult | None:
         next_step = state.tool_call_count + 1
         output_ref = (
@@ -465,19 +765,30 @@ class AgentController:
         if not result.ok:
             state.reflection_required = True
             memory.reflection_required = True
-        state.record_tool_result(call, result)
-        self.verifier.observe(state, call, result)
+        if append_to_conversation:
+            state.record_tool_result(call, result)
+        else:
+            state.record_automatic_tool_result(call, result)
         memory.record_tool_result(
             call,
             result,
             step=state.tool_call_count,
             full_output_path=output_ref,
+            append_message=append_to_conversation,
         )
         memory.modified_files = set(state.modified_files)
-        memory.last_file_change_step = state.last_change_step
-        memory.last_verification_step = state.last_verification_step
-        memory.last_verification_success = state.last_verification_success
+        memory.workspace_revision = state.workspace_revision
+        verification_result = self._verification_result(result)
+        if verification_result is not None:
+            persisted_result = memory.verification_results.get(
+                verification_result.check_id,
+                verification_result,
+            )
+            self.verifier.record(state, persisted_result)
+            verification_result = persisted_result
         self._log("observation", **observation.model_dump(mode="json"))
+        if verification_result is not None:
+            self._log("verification_result", **verification_result.model_dump(mode="json"))
         self._log(
             "tool_result",
             tool_call_id=call.id,
@@ -489,7 +800,7 @@ class AgentController:
             metadata=result.metadata,
             output_ref=output_ref,
         )
-        self._save_memory(memory, state, status="running")
+        self._save_memory(memory, state, status=state.status.value)
 
         if result.metadata and result.metadata.get("approval_abort"):
             return self._finish(
@@ -498,10 +809,203 @@ class AgentController:
                 status="stopped",
                 reason="agent aborted by user during tool approval",
             )
-        reason = self.termination_policy.check(state)
+        reason = self.termination_policy.check(state, include_step_limit=False)
         if reason:
             return self._finish(state, memory, status="stopped", reason=reason)
         return None
+
+    @staticmethod
+    def _verified_completion_summary(state: SessionState) -> str:
+        if state.candidate_final_assessment is not None and not contains_embedded_tool_protocol(
+            state.candidate_final_assessment.summary
+        ):
+            return state.candidate_final_assessment.summary
+        modified = ", ".join(sorted(state.modified_files)) or "none"
+        return (
+            "Completed the requested task. All required verification checks passed. "
+            f"Modified files: {modified}."
+        )
+
+    @staticmethod
+    def _verification_result(result: ToolResult) -> VerificationResult | None:
+        metadata = result.metadata or {}
+        value = metadata.get("verification_result")
+        if not isinstance(value, dict):
+            return None
+        try:
+            return VerificationResult.model_validate(value)
+        except ValueError:
+            return None
+
+    def _handle_final_response(
+        self,
+        summary: str,
+        *,
+        state: SessionState,
+        memory: MemoryState,
+    ) -> AgentResult | None:
+        existing_assessment = state.candidate_final_assessment
+        if existing_assessment is None or existing_assessment.summary != summary:
+            assessment = (
+                FinalAssessment(
+                    summary=summary,
+                    changes=sorted(state.modified_files),
+                    claimed_completed=True,
+                )
+                if existing_assessment is None
+                else existing_assessment.model_copy(update={"summary": summary})
+            )
+            state.candidate_final_assessment = assessment
+            memory.candidate_final_assessment = assessment
+            self._log("assessment", **assessment.model_dump(mode="json"))
+
+        report = self.verifier.completion_report(state)
+        if report.complete:
+            return self._finish(state, memory, status="success", summary=summary)
+
+        if state.verification_plan is None:
+            if state.verification_plan_recovery_attempts >= 1:
+                return self._finish(
+                    state,
+                    memory,
+                    status="incomplete",
+                    reason="no executable verification plan was registered after one recovery",
+                    summary=summary,
+                )
+            state.verification_plan_recovery_attempts += 1
+            state.status = AgentStatus.AWAITING_VERIFICATION_PLAN
+            memory.verification_plan_recovery_attempts = state.verification_plan_recovery_attempts
+            self._append_system_feedback(
+                state,
+                memory,
+                {
+                    "error": "verification_plan_missing",
+                    "modified_files": sorted(state.modified_files),
+                    "allowed_next_actions": ["register_verification"],
+                    "recovery_attempts_remaining": 0,
+                },
+            )
+            self._save_memory(memory, state, status=state.status.value)
+            return None
+
+        runnable = report.runnable
+        if not runnable:
+            return self._finish(
+                state,
+                memory,
+                status="incomplete",
+                reason="required verification checks did not pass",
+                summary=summary,
+            )
+
+        state.status = AgentStatus.VERIFYING
+        self._save_memory(memory, state, status=state.status.value)
+        terminal_result = self._run_verification_batch(
+            runnable,
+            state=state,
+            memory=memory,
+        )
+        if terminal_result is not None:
+            return terminal_result
+
+        report = self.verifier.completion_report(state)
+        if report.complete:
+            return self._finish(state, memory, status="success", summary=summary)
+
+        self._append_system_feedback(
+            state,
+            memory,
+            {
+                "error": "required_verification_incomplete",
+                "verification_report": report.model_dump(mode="json"),
+                "instruction": (
+                    "Use the deterministic verification results to repair the implementation. "
+                    "File changes make prior results stale; do not claim completion until all "
+                    "required checks pass."
+                ),
+            },
+        )
+        state.status = AgentStatus.RUNNING
+        self._save_memory(memory, state, status=state.status.value)
+        return None
+
+    def _run_verification_batch(
+        self,
+        check_ids: list[str],
+        *,
+        state: SessionState,
+        memory: MemoryState,
+    ) -> AgentResult | None:
+        """Run registered required checks in order until one does not pass."""
+        state.status = AgentStatus.VERIFYING
+        self._save_memory(memory, state, status=state.status.value)
+        for check_id in check_ids:
+            call = ToolCall(
+                id=f"controller-verify-{uuid4().hex[:12]}",
+                name="run_verification",
+                arguments={"check_id": check_id},
+            )
+            self._log(
+                "action",
+                step=state.step_count,
+                tool_call_id=call.id,
+                tool=call.name,
+                argument_summary=check_id,
+                controller_scheduled=True,
+            )
+            result = self.tool_registry.execute(call)
+            if self._verification_result(result) is None:
+                now = datetime.now(UTC)
+                failed = VerificationResult(
+                    check_id=check_id,
+                    status=VerificationStatus.ERROR,
+                    workspace_revision=state.workspace_revision,
+                    reasons=[result.error or "verification check could not be executed"],
+                    started_at=now,
+                    finished_at=now,
+                )
+                result = ToolResult(
+                    ok=result.ok,
+                    output=result.output,
+                    error=result.error,
+                    metadata={
+                        **(result.metadata or {}),
+                        "verification_result": failed.model_dump(mode="json"),
+                    },
+                    raw_output=result.raw_output,
+                    error_code=result.error_code,
+                    retryable=result.retryable,
+                )
+            terminal_result = self._record_action_result(
+                call,
+                result,
+                state=state,
+                memory=memory,
+                append_to_conversation=False,
+            )
+            if terminal_result is not None:
+                return terminal_result
+            recorded = state.verification_results.get(check_id)
+            if (
+                recorded is None
+                or recorded.status != VerificationStatus.PASSED
+                or recorded.workspace_revision != state.workspace_revision
+            ):
+                break
+        return None
+
+    @staticmethod
+    def _append_system_feedback(
+        state: SessionState,
+        memory: MemoryState,
+        payload: dict[str, Any],
+    ) -> None:
+        message = {
+            "role": "system",
+            "content": json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        }
+        state.messages.append(message)
+        memory.messages.append(Message.from_chat_message(message, step=state.tool_call_count))
 
     def _tool_schemas(self) -> list[dict[str, Any]]:
         schemas = self.tool_registry.schemas()
@@ -554,6 +1058,10 @@ class AgentController:
             command = call.arguments.get("command")
             if isinstance(command, str):
                 return command.split(maxsplit=1)[0]
+        if call.name == "run_verification":
+            check_id = call.arguments.get("check_id")
+            if isinstance(check_id, str):
+                return check_id
         return ""
 
     def _complete_with_context_recovery(
@@ -603,7 +1111,12 @@ class AgentController:
                 effective_estimated_prompt_tokens=estimate.effective,
             )
             try:
-                response = self.model_client.complete(messages=messages, tools=tool_schemas)
+                options = self._model_request_options(state)
+                response = self.model_client.complete(
+                    messages=messages,
+                    tools=tool_schemas,
+                    options=options,
+                )
             except ModelContextLengthError:
                 memory.context_overflow_count += 1
                 self.context_manager.observe_overflow()
@@ -641,17 +1154,47 @@ class AgentController:
             f"Context could not be made safe after {max_retries} compression retries: {last_reason}"
         )
 
+    @staticmethod
+    def _model_request_options(state: SessionState) -> ModelRequestOptions | None:
+        if state.provider_reasoning_detected and state.consecutive_length_responses >= 2:
+            return ModelRequestOptions(thinking_enabled=False)
+        if state.provider_reasoning_detected and state.consecutive_length_responses >= 1:
+            return ModelRequestOptions(reasoning_effort="low")
+        if state.force_thinking_disabled:
+            return ModelRequestOptions(thinking_enabled=False)
+        return None
+
+    @staticmethod
+    def _history_requires_non_thinking(memory: MemoryState) -> bool:
+        if not memory.provider_requires_reasoning_content:
+            return False
+        return any(
+            message.role == "assistant"
+            and bool(message.tool_calls)
+            and message.reasoning_content is None
+            for message in memory.messages
+        )
+
     def _finish(
         self,
         state: SessionState,
         memory: MemoryState,
         *,
-        status: Literal["success", "stopped", "error"],
+        status: Literal["success", "incomplete", "blocked", "stopped", "error"],
         reason: str | None = None,
         summary: str = "",
     ) -> AgentResult:
         result = self._result(state, status=status, reason=reason, summary=summary)
+        state.status = {
+            "success": AgentStatus.COMPLETED,
+            "incomplete": AgentStatus.INCOMPLETE,
+            "blocked": AgentStatus.BLOCKED,
+            "stopped": AgentStatus.STOPPED,
+            "error": AgentStatus.ERROR,
+        }[status]
         memory_status = "completed" if status == "success" else status
+        memory.last_agent_outcome = status
+        memory.discard_provider_state()
         self._save_memory(memory, state, status=memory_status)
         self._log(
             "session_end",
@@ -660,7 +1203,7 @@ class AgentController:
             modified_files=result.modified_files,
             step_count=result.step_count,
             tool_call_count=result.tool_call_count,
-            verification_success=result.verification_success,
+            verification_status=result.verification_status.value,
         )
         return result
 
@@ -671,6 +1214,11 @@ class AgentController:
         *,
         status: str,
     ) -> None:
+        memory.workspace_revision = state.workspace_revision
+        memory.verification_plan = state.verification_plan
+        memory.verification_results = dict(state.verification_results)
+        memory.verification_plan_recovery_attempts = state.verification_plan_recovery_attempts
+        memory.candidate_final_assessment = state.candidate_final_assessment
         memory.status = status
         if self.memory_store is not None:
             self.memory_store.save_state(
@@ -688,7 +1236,7 @@ class AgentController:
     def _result(
         state: SessionState,
         *,
-        status: Literal["success", "stopped", "error"],
+        status: Literal["success", "incomplete", "blocked", "stopped", "error"],
         reason: str | None = None,
         summary: str = "",
     ) -> AgentResult:
@@ -703,7 +1251,7 @@ class AgentController:
             modified_files=tuple(sorted(state.modified_files)),
             step_count=state.step_count,
             tool_call_count=state.tool_call_count - state.initial_tool_call_count,
-            verification_success=state.last_verification_success,
+            verification_status=Verifier.outcome(state),
         )
 
 

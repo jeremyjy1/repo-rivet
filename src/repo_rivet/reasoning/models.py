@@ -107,5 +107,4 @@ class ObservationEvent(BaseModel):
     output_ref: str | None = None
     exit_code: int | None = None
     affected_paths: list[str] = Field(default_factory=list)
-    verification: bool = False
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))

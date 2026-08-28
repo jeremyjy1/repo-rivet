@@ -1,7 +1,7 @@
 from collections.abc import Iterable
 from typing import Any
 
-from repo_rivet.llm.base import ModelResponse
+from repo_rivet.llm.base import ModelRequestOptions, ModelResponse
 from repo_rivet.tools.base import ToolCall, ToolResult
 
 
@@ -15,8 +15,9 @@ class FakeModelClient:
         *,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
+        options: ModelRequestOptions | None = None,
     ) -> ModelResponse:
-        self.requests.append({"messages": messages, "tools": tools})
+        self.requests.append({"messages": messages, "tools": tools, "options": options})
         response = next(self._responses)
         if isinstance(response, Exception):
             raise response

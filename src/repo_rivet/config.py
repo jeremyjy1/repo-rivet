@@ -2,7 +2,7 @@
 
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import (
     AnyHttpUrl,
@@ -36,7 +36,8 @@ class ApiConfig(BaseModel):
     base_url: AnyHttpUrl
     model: str = Field(min_length=1)
     context_window_tokens: int = Field(ge=1_000)
-    max_output_tokens: int = Field(default=4_096, ge=1)
+    thinking_mode: Literal["provider_default", "enabled", "disabled"] = "provider_default"
+    reasoning_effort: Literal["low", "high", "max"] | None = None
     tokenizer_encoding: str | None = Field(default=None, min_length=1)
     timeout_seconds: float = Field(default=60, gt=0, le=600)
     max_retries: int = Field(default=3, ge=0, le=10)
@@ -66,18 +67,13 @@ class ApiConfig(BaseModel):
             raise ValueError("must be replaced with a real model name")
         return value
 
-    @model_validator(mode="after")
-    def validate_token_limits(self) -> "ApiConfig":
-        if self.max_output_tokens >= self.context_window_tokens:
-            raise ValueError("max_output_tokens must be smaller than context_window_tokens")
-        return self
-
 
 class TokenConfig(BaseModel):
     """Provider-independent safety reserves, thresholds, and feedback controls."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
+    reserved_output_tokens: int = Field(default=4_096, ge=100)
     reserved_tool_result_tokens: int = Field(default=2_048, ge=0)
     safety_margin_ratio: float = Field(default=0.15, ge=0, lt=0.5)
     soft_limit_ratio: float = Field(default=0.70, gt=0, lt=1)
@@ -151,7 +147,7 @@ class AppConfig(BaseModel):
     @model_validator(mode="after")
     def validate_prompt_budget(self) -> "AppConfig":
         safety_margin = int(self.api.context_window_tokens * self.token.safety_margin_ratio)
-        fixed_reserve = self.api.max_output_tokens + self.token.reserved_tool_result_tokens
+        fixed_reserve = self.token.reserved_output_tokens + self.token.reserved_tool_result_tokens
         total_reserve = fixed_reserve + safety_margin
         if total_reserve >= self.api.context_window_tokens:
             raise ValueError(

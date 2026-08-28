@@ -4,7 +4,9 @@ import os
 import signal
 import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
+from uuid import uuid4
 
 from pydantic import Field
 
@@ -12,8 +14,20 @@ from repo_rivet.approval.models import Capability
 from repo_rivet.safety.command_policy import CommandPolicy
 from repo_rivet.safety.path_policy import WorkspacePathPolicy
 from repo_rivet.tools.base import BaseTool, ToolArguments, ToolResult
+from repo_rivet.verification.models import ProcessObservation
 
 MAX_OUTPUT_LINES = 200
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessExecution:
+    argv: tuple[str, ...]
+    cwd: Path
+    exit_code: int | None
+    stdout: str
+    stderr: str
+    timed_out: bool
+    duration_seconds: float
 
 
 class RunCommandArguments(ToolArguments):
@@ -56,16 +70,77 @@ class RunCommandTool(BaseTool[RunCommandArguments]):
         cwd = self.path_policy.resolve(arguments.cwd)
         if not cwd.exists() or not cwd.is_dir():
             raise ValueError(f"Command cwd is not a directory: {arguments.cwd}")
-        return run_process(argv, cwd=cwd, timeout_seconds=arguments.timeout_seconds)
+        try:
+            return run_process(argv, cwd=cwd, timeout_seconds=arguments.timeout_seconds)
+        except OSError as error:
+            observation = ProcessObservation(
+                command_id=f"process-{uuid4().hex[:12]}",
+                argv=list(argv),
+                cwd=str(cwd),
+                spawn_error=str(error),
+                duration_ms=0,
+            )
+            return ToolResult(
+                ok=False,
+                output="",
+                error=str(error),
+                error_code="io_error",
+                retryable=True,
+                metadata={"process_observation": observation.model_dump(mode="json")},
+            )
 
 
 def run_process(argv: tuple[str, ...], *, cwd: Path, timeout_seconds: float) -> ToolResult:
     """Execute argv and capture a bounded observation for the model."""
+    execution = execute_process(argv, cwd=cwd, timeout_seconds=timeout_seconds)
+    output, truncated = _format_output(
+        execution.exit_code,
+        execution.stdout,
+        execution.stderr,
+    )
+    raw_output = _format_raw_output(
+        execution.exit_code,
+        execution.stdout,
+        execution.stderr,
+    )
+    metadata = {
+        "exit_code": execution.exit_code,
+        "duration_seconds": round(execution.duration_seconds, 3),
+        "timed_out": execution.timed_out,
+        "truncated": truncated,
+        "process_observation": ProcessObservation(
+            command_id=f"process-{uuid4().hex[:12]}",
+            argv=list(execution.argv),
+            cwd=str(execution.cwd),
+            exit_code=execution.exit_code,
+            timed_out=execution.timed_out,
+            duration_ms=max(0, round(execution.duration_seconds * 1_000)),
+        ).model_dump(mode="json"),
+    }
+    if execution.timed_out:
+        return ToolResult(
+            ok=False,
+            output=output,
+            error=f"Command timed out after {timeout_seconds:g} seconds",
+            metadata=metadata,
+            raw_output=raw_output,
+        )
+    return ToolResult(ok=True, output=output, metadata=metadata, raw_output=raw_output)
+
+
+def execute_process(
+    argv: tuple[str, ...],
+    *,
+    cwd: Path,
+    timeout_seconds: float,
+    stdin: str | None = None,
+) -> ProcessExecution:
+    """Execute one shell-free argv and return unclassified process facts."""
     started_at = time.monotonic()
     process = subprocess.Popen(
         argv,
         cwd=cwd,
-        stdin=subprocess.DEVNULL,
+        stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -75,30 +150,22 @@ def run_process(argv: tuple[str, ...], *, cwd: Path, timeout_seconds: float) -> 
     )
     timed_out = False
     try:
-        stdout, stderr = process.communicate(timeout=timeout_seconds)
+        stdout, stderr = process.communicate(input=stdin, timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
         timed_out = True
         _kill_process(process)
         stdout, stderr = process.communicate()
 
     duration_seconds = time.monotonic() - started_at
-    output, truncated = _format_output(process.returncode, stdout, stderr)
-    raw_output = _format_raw_output(process.returncode, stdout, stderr)
-    metadata = {
-        "exit_code": process.returncode,
-        "duration_seconds": round(duration_seconds, 3),
-        "timed_out": timed_out,
-        "truncated": truncated,
-    }
-    if timed_out:
-        return ToolResult(
-            ok=False,
-            output=output,
-            error=f"Command timed out after {timeout_seconds:g} seconds",
-            metadata=metadata,
-            raw_output=raw_output,
-        )
-    return ToolResult(ok=True, output=output, metadata=metadata, raw_output=raw_output)
+    return ProcessExecution(
+        argv=argv,
+        cwd=cwd,
+        exit_code=process.returncode,
+        stdout=stdout,
+        stderr=stderr,
+        timed_out=timed_out,
+        duration_seconds=duration_seconds,
+    )
 
 
 def _kill_process(process: subprocess.Popen[str]) -> None:

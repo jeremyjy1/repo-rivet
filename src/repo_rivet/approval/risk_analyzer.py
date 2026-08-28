@@ -46,7 +46,7 @@ class RiskAnalyzer:
             reasons.append("request targets a device path")
 
         level = self._base_level(capabilities)
-        if request.tool_name == "run_command":
+        if request.tool_name in {"run_command", "run_verification"}:
             level = max(level, self._assess_command(request, capabilities, reasons))
 
         if (

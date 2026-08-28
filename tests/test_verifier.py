@@ -1,69 +1,131 @@
+from datetime import UTC, datetime
+
 import pytest
 
 from repo_rivet.agent.state import SessionState
-from repo_rivet.agent.verifier import Verifier, is_verification_command
-from repo_rivet.tools.base import ToolCall, ToolResult
-
-
-def record(state: SessionState, verifier: Verifier, call: ToolCall, result: ToolResult) -> None:
-    state.record_tool_result(call, result)
-    verifier.observe(state, call, result)
-
-
-def test_modified_files_require_successful_later_verification() -> None:
-    state = SessionState(task="task")
-    verifier = Verifier()
-    write = ToolCall(id="1", name="write_file", arguments={"path": "app.py"})
-    pytest_call = ToolCall(id="2", name="run_command", arguments={"command": "pytest -q"})
-
-    record(state, verifier, write, ToolResult(ok=True, output="written"))
-    assert not verifier.can_finish(state)
-
-    record(
-        state,
-        verifier,
-        pytest_call,
-        ToolResult(ok=True, output="failed", metadata={"exit_code": 1}),
-    )
-    assert not verifier.can_finish(state)
-
-    record(
-        state,
-        verifier,
-        pytest_call,
-        ToolResult(ok=True, output="passed", metadata={"exit_code": 0}),
-    )
-    assert verifier.can_finish(state)
-
-
-def test_later_change_invalidates_previous_verification() -> None:
-    state = SessionState(task="task")
-    verifier = Verifier()
-    write = ToolCall(id="1", name="write_file", arguments={"path": "app.py"})
-    diff = ToolCall(id="2", name="git_diff", arguments={})
-
-    record(state, verifier, write, ToolResult(ok=True, output="written"))
-    record(state, verifier, diff, ToolResult(ok=True, output="diff"))
-    assert verifier.can_finish(state)
-
-    record(state, verifier, write, ToolResult(ok=True, output="rewritten"))
-    assert not verifier.can_finish(state)
-
-
-@pytest.mark.parametrize(
-    "command",
-    [
-        "pytest -q",
-        "uv run ruff check .",
-        "python -m compileall src",
-        "npm run build",
-        "go test ./...",
-        "cargo check",
-    ],
+from repo_rivet.agent.verifier import Verifier
+from repo_rivet.verification.models import (
+    CommandSpec,
+    VerificationCheck,
+    VerificationKind,
+    VerificationOutcome,
+    VerificationPlan,
+    VerificationResult,
+    VerificationStatus,
 )
-def test_recognize_verification_commands(command: str) -> None:
-    assert is_verification_command(command)
 
 
-def test_do_not_treat_arbitrary_command_as_verification() -> None:
-    assert not is_verification_command("python -c 'print(1)'")
+def plan() -> VerificationPlan:
+    return VerificationPlan(
+        plan_id="plan-1",
+        checks=[
+            VerificationCheck(
+                check_id="build",
+                title="Build project",
+                kind=VerificationKind.BUILD,
+                command=CommandSpec(program="builder"),
+                required=True,
+                provenance="model",
+            )
+        ],
+    )
+
+
+def result(
+    status: VerificationStatus,
+    *,
+    revision: int,
+) -> VerificationResult:
+    now = datetime.now(UTC)
+    return VerificationResult(
+        check_id="build",
+        status=status,
+        workspace_revision=revision,
+        started_at=now,
+        finished_at=now,
+    )
+
+
+def test_modified_files_require_registered_current_passed_checks() -> None:
+    state = SessionState(task="task", modified_files={"app.py"}, workspace_revision=1)
+    verifier = Verifier()
+
+    assert verifier.completion_report(state).pending == ["plan"]
+
+    state.verification_plan = plan()
+    assert verifier.completion_report(state).pending == ["build"]
+
+    verifier.record(state, result(VerificationStatus.FAILED, revision=1))
+    assert verifier.completion_report(state).failed == ["build"]
+
+    verifier.record(state, result(VerificationStatus.PASSED, revision=1))
+    assert verifier.can_finish(state)
+
+
+def test_revision_mismatch_makes_a_passed_result_stale() -> None:
+    state = SessionState(
+        task="task",
+        modified_files={"app.py"},
+        workspace_revision=2,
+        verification_plan=plan(),
+        verification_results={"build": result(VerificationStatus.PASSED, revision=1)},
+    )
+
+    report = Verifier().completion_report(state)
+
+    assert not report.complete
+    assert report.stale == ["build"]
+
+
+def test_unmodified_task_does_not_require_a_verification_plan() -> None:
+    state = SessionState(task="inspect only")
+
+    assert Verifier().can_finish(state)
+    assert Verifier().outcome(state) == VerificationOutcome.NOT_APPLICABLE
+
+
+def test_user_facing_verification_outcome_is_not_a_misleading_boolean() -> None:
+    verifier = Verifier()
+    modified_without_plan = SessionState(task="change", modified_files={"app.py"})
+    failed = SessionState(
+        task="change",
+        modified_files={"app.py"},
+        verification_plan=plan(),
+        verification_results={"build": result(VerificationStatus.FAILED, revision=0)},
+    )
+    passed = SessionState(
+        task="change",
+        modified_files={"app.py"},
+        verification_plan=plan(),
+        verification_results={"build": result(VerificationStatus.PASSED, revision=0)},
+    )
+
+    assert verifier.outcome(modified_without_plan) == VerificationOutcome.NOT_RUN
+    assert verifier.outcome(failed) == VerificationOutcome.FAILED
+    assert verifier.outcome(passed) == VerificationOutcome.PASSED
+
+
+def test_plan_requirement_may_reference_a_required_check_id_directly() -> None:
+    direct = VerificationPlan(
+        plan_id="plan-direct",
+        requirements=["build"],
+        checks=[
+            VerificationCheck(
+                check_id="build",
+                title="Build project",
+                kind=VerificationKind.BUILD,
+                command=CommandSpec(program="builder"),
+                required=True,
+                provenance="model",
+            )
+        ],
+    )
+
+    assert direct.requirements == ["build"]
+
+    with pytest.raises(ValueError, match="not covered by required checks: unknown"):
+        VerificationPlan(
+            plan_id="plan-invalid",
+            requirements=["unknown"],
+            checks=direct.checks,
+        )

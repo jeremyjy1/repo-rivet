@@ -12,6 +12,7 @@ from repo_rivet.memory.models import MemoryState, add_unique
 from repo_rivet.storage.atomic_write import atomic_write_json
 from repo_rivet.storage.event_logger import EventLogger
 from repo_rivet.tools.base import ToolCall, ToolResult
+from repo_rivet.verification.models import VerificationStatus
 
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9_.-]+")
 
@@ -47,12 +48,12 @@ class MemoryStore:
             return None
         directory = (
             self.command_output_dir
-            if call.name in {"run_command", "git_diff"}
+            if call.name in {"run_command", "run_verification", "git_diff"}
             else self.file_snapshot_dir
         )
         directory.mkdir(parents=True, exist_ok=True)
         safe_id = _SAFE_NAME.sub("-", call.id)[:80] or "call"
-        suffix = ".log" if call.name in {"run_command", "git_diff"} else ".txt"
+        suffix = ".log" if call.name in {"run_command", "run_verification", "git_diff"} else ".txt"
         output_path = directory / f"step-{step:04d}-{safe_id}{suffix}"
         sanitized_output = self._event_logger.sanitize(result.raw_output)
         output_path.write_text(str(sanitized_output), encoding="utf-8")
@@ -68,8 +69,12 @@ class MemoryStore:
         if "status" in runtime_state:
             runtime_state["status"] = normalized_status
             memory.status = normalized_status
+        memory_payload = memory.model_dump(mode="json")
+        memory_payload["messages"] = [
+            message.model_dump(mode="json") for message in memory.messages if not message.ephemeral
+        ]
         payload = {
-            "memory": memory.model_dump(mode="json"),
+            "memory": memory_payload,
             "runtime": runtime_state,
             "saved_at": datetime.now(UTC).isoformat(),
         }
@@ -122,7 +127,12 @@ class MemoryStore:
                 add_unique(memory.summary.unresolved_issues, issue)
         if changed:
             memory.reflection_required = True
-            memory.last_verification_success = False
+            memory.workspace_revision += 1
+            for check_id, result in list(memory.verification_results.items()):
+                if result.status != VerificationStatus.STALE:
+                    memory.verification_results[check_id] = result.model_copy(
+                        update={"status": VerificationStatus.STALE}
+                    )
             memory.working.last_verification_result = "invalidated by external file changes"
             memory.summary.verification_status = "invalidated by external file changes"
         return changed

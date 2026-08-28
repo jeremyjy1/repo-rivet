@@ -9,8 +9,12 @@ from pydantic import BaseModel, ConfigDict, Field
 class SessionStatus(StrEnum):
     CREATED = "created"
     RUNNING = "running"
+    VERIFYING = "verifying"
+    AWAITING_VERIFICATION_PLAN = "awaiting_verification_plan"
     PAUSED = "paused"
     COMPLETED = "completed"
+    INCOMPLETE = "incomplete"
+    BLOCKED = "blocked"
     FAILED = "failed"
     ARCHIVED = "archived"
 

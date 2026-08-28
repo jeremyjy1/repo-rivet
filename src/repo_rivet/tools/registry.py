@@ -19,6 +19,8 @@ from repo_rivet.tools.filesystem import (
 from repo_rivet.tools.git import GitDiffTool
 from repo_rivet.tools.meta import RecordDecisionTool
 from repo_rivet.tools.shell import RunCommandTool
+from repo_rivet.tools.verification import RegisterVerificationTool, RunVerificationTool
+from repo_rivet.verification.runtime import VerificationRuntime
 
 _STATE_CHANGING_CAPABILITIES = frozenset(
     {
@@ -41,10 +43,12 @@ class ToolRegistry:
         *,
         workspace: Path | None = None,
         approval_engine: ApprovalEngine | None = None,
+        verification_runtime: VerificationRuntime | None = None,
     ) -> None:
         self._tools: dict[str, BaseTool[Any]] = {}
         self.workspace = workspace
         self.approval_engine = approval_engine
+        self.verification_runtime = verification_runtime
         for tool in tools:
             self.register(tool)
 
@@ -81,7 +85,7 @@ class ToolRegistry:
             if self.approval_engine is None:
                 return tool.execute_validated(validated)
 
-            normalized_arguments = validated.model_dump(mode="json")
+            normalized_arguments = tool.approval_arguments(validated)
             outcome = self.approval_engine.authorize(
                 tool_name=call.name,
                 arguments=normalized_arguments,
@@ -144,17 +148,21 @@ def create_default_registry(
     """Create the local workspace tools and the side-effect-free decision meta tool."""
     path_policy = WorkspacePathPolicy(workspace)
     command_policy = CommandPolicy()
+    verification_runtime = VerificationRuntime(path_policy, command_policy)
     return ToolRegistry(
         [
             RecordDecisionTool(),
+            RegisterVerificationTool(),
             ListFilesTool(path_policy),
             SearchTextTool(path_policy),
             ReadFileTool(path_policy),
             WriteFileTool(path_policy),
             ReplaceTextTool(path_policy),
             RunCommandTool(path_policy, command_policy),
+            RunVerificationTool(verification_runtime),
             GitDiffTool(path_policy),
         ],
         workspace=path_policy.workspace,
         approval_engine=approval_engine,
+        verification_runtime=verification_runtime,
     )

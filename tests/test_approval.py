@@ -1,3 +1,4 @@
+import sys
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -161,6 +162,41 @@ def test_always_ask_prompts_even_for_list_files(tmp_path: Path) -> None:
 
     assert result.ok
     assert [request.tool_name for request in human.requests] == ["list_files"]
+
+
+def test_verification_approval_reviews_the_registered_concrete_command(tmp_path: Path) -> None:
+    human = FakeHumanApprover()
+    engine, memory = create_engine(tmp_path, mode=ApprovalMode.SAFE_AUTO, human=human)
+    registry = create_default_registry(tmp_path, approval_engine=engine)
+    assert registry.verification_runtime is not None
+    registry.verification_runtime.bind(memory)
+    registry.verification_runtime.register_plan(
+        {
+            "checks": [
+                {
+                    "check_id": "smoke",
+                    "title": "Run smoke check",
+                    "kind": "smoke",
+                    "command": {"program": sys.executable, "args": ["-c", "print('ok')"]},
+                    "criteria": {"expected_exit_codes": [0]},
+                    "required": True,
+                    "provenance": "model",
+                }
+            ]
+        }
+    )
+
+    result = registry.execute(
+        ToolCall(id="verify-1", name="run_verification", arguments={"check_id": "smoke"})
+    )
+
+    assert result.ok
+    assert len(human.requests) == 1
+    request = human.requests[0]
+    assert request.tool_name == "run_verification"
+    command = request.normalized_arguments["command"]
+    assert command["program"] == sys.executable
+    assert command["args"] == ["-c", "print('ok')"]
 
 
 def test_llm_auto_accepts_high_confidence_medium_risk_review(tmp_path: Path) -> None:

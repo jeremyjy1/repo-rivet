@@ -12,6 +12,7 @@ from repo_rivet.approval.models import ApprovalMode
 from repo_rivet.approval.normalizer import RequestNormalizer
 from repo_rivet.approval.risk_analyzer import RiskAnalyzer
 from repo_rivet.llm.base import ModelResponse
+from repo_rivet.llm.protocol import validate_tool_call_protocol
 from repo_rivet.memory.models import MemoryState
 from repo_rivet.memory.store import MemoryStore
 from repo_rivet.reasoning.manager import ReasoningManager
@@ -537,6 +538,39 @@ def test_repeated_reflection_only_turns_prompt_for_concrete_progress() -> None:
         for message in final_request
     )
     assert memory.reasoning_events[-1].phase == ReasoningPhase.REFLECTION
+
+
+def test_final_assessment_meta_call_is_closed_before_the_next_model_request() -> None:
+    final_assessment = ToolCall(
+        id="final-1",
+        name="record_decision",
+        arguments={
+            "phase": "final_assessment",
+            "current_goal": "inspect the project",
+            "summary": "The requested inspection is complete.",
+            "evidence_refs": ["obs-read"],
+            "confidence": 0.9,
+        },
+    )
+    model = FakeModelClient(
+        [
+            ModelResponse(tool_calls=[final_assessment]),
+            ModelResponse(content="Inspection complete."),
+        ]
+    )
+    memory = MemoryState(session_id="assessment-protocol")
+    agent = AgentController(
+        model_client=model,
+        tool_registry=cast(ToolRegistry, FakeToolRegistry([])),
+    )
+
+    result = agent.run("inspect", memory=memory)
+
+    assert result.status == "success"
+    validate_tool_call_protocol([message.as_chat_message() for message in memory.messages])
+    assert any(
+        message.role == "tool" and message.tool_call_id == "final-1" for message in memory.messages
+    )
 
 
 def test_failed_action_requires_reflection_before_another_mutation() -> None:

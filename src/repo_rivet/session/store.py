@@ -28,6 +28,12 @@ from repo_rivet.session.lock import SessionLock, process_is_alive
 from repo_rivet.session.models import ActiveSessionPointer, SessionMetadata, SessionStatus
 from repo_rivet.storage.atomic_write import atomic_write_json
 
+_ACTIVE_SESSION_STATUSES = {
+    SessionStatus.RUNNING,
+    SessionStatus.VERIFYING,
+    SessionStatus.AWAITING_VERIFICATION_PLAN,
+}
+
 
 def get_reporivet_home() -> Path:
     """Resolve the global data root without writing into a target repository."""
@@ -232,8 +238,8 @@ class FileSessionStore:
     def archive(self, reference: str) -> SessionMetadata:
         metadata = self.read_metadata(reference)
         self._ensure_unlocked(metadata.session_id)
-        if metadata.status == SessionStatus.RUNNING:
-            raise SessionNotResumable("A running session cannot be archived")
+        if metadata.status in _ACTIVE_SESSION_STATUSES:
+            raise SessionNotResumable("An active session cannot be archived")
         metadata.status = SessionStatus.ARCHIVED
         metadata.updated_at = datetime.now(UTC)
         self._write_metadata(metadata)
@@ -295,7 +301,7 @@ class FileSessionStore:
         return SessionLock(self.sessions_dir / session_id / "lock.json")
 
     def is_interrupted(self, metadata: SessionMetadata) -> bool:
-        if metadata.status != SessionStatus.RUNNING:
+        if metadata.status not in _ACTIVE_SESSION_STATUSES:
             return False
         lock_path = self.sessions_dir / metadata.session_id / "lock.json"
         if not lock_path.exists():
@@ -326,10 +332,11 @@ class FileSessionStore:
             lock_path.unlink()
             repairs.append(f"removed stale lock from process {pid}")
 
-        if loaded.metadata.status == SessionStatus.RUNNING:
+        if loaded.metadata.status in _ACTIVE_SESSION_STATUSES:
+            prior_status = loaded.metadata.status.value
             loaded.memory.status = SessionStatus.PAUSED.value
             loaded.store.save_state(loaded.memory, status=SessionStatus.PAUSED.value)
-            repairs.append("changed interrupted status from running to paused")
+            repairs.append(f"changed interrupted status from {prior_status} to paused")
 
         repairs.extend(self._repair_event_tail(loaded.store.events_path))
         return repairs

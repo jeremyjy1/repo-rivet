@@ -262,7 +262,6 @@ def test_console_reporter_shows_structured_summary_trace_without_tool_duplicatio
         event_id="obs-123",
         ok=True,
         result_summary="Read src/app.py:1-20.",
-        verification=False,
     )
     reporter.log("tool_result", name="read_file", ok=True)
     reporter.log(
@@ -270,14 +269,52 @@ def test_console_reporter_shows_structured_summary_trace_without_tool_duplicatio
         event_id="obs-verify",
         ok=True,
         result_summary="Command finished with exit code 0.",
-        verification=True,
+    )
+    reporter.log(
+        "verification_result",
+        check_id="tests",
+        status="passed",
+        reasons=["all registered success criteria passed"],
     )
 
     assert buffer.getvalue().splitlines() == [
         "[PLAN] Inspect, edit, and verify.",
         "[ACTION] read_file src/app.py",
         "[OBSERVE] Read src/app.py:1-20.",
-        "[VERIFY] Command finished with exit code 0.",
+        "[OBSERVE] Command finished with exit code 0.",
+        "[VERIFY] tests passed · all registered success criteria passed",
+    ]
+
+
+def test_final_assessment_is_never_labeled_as_verification() -> None:
+    buffer = StringIO()
+    reporter = ConsoleEventReporter(
+        Console(file=buffer, force_terminal=False, color_system=None, width=240),
+        reasoning_mode=ReasoningDisplayMode.SUMMARY,
+    )
+
+    reporter.log("assessment", summary="The implementation is complete.")
+
+    assert buffer.getvalue().strip() == "[ASSESS] The implementation is complete."
+
+
+def test_verification_has_one_authoritative_console_result_in_quiet_mode() -> None:
+    buffer = StringIO()
+    reporter = ConsoleEventReporter(
+        Console(file=buffer, force_terminal=False, color_system=None, width=240)
+    )
+
+    reporter.log("tool_result", name="register_verification", ok=True)
+    reporter.log("tool_result", name="run_verification", ok=True, metadata={"exit_code": 0})
+    reporter.log(
+        "verification_result",
+        check_id="cpp-build",
+        status="passed",
+        reasons=["all registered success criteria passed"],
+    )
+
+    assert buffer.getvalue().splitlines() == [
+        "[VERIFY] cpp-build passed · all registered success criteria passed"
     ]
 
 

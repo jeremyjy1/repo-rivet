@@ -20,12 +20,12 @@ api_key = "test-secret"
 base_url = "https://example.com/v1"
 model = "test-model"
 context_window_tokens = 32768
-max_output_tokens = 2048
 tokenizer_encoding = "cl100k_base"
 timeout_seconds = 30
 max_retries = 2
 
 [token]
+reserved_output_tokens = 2048
 reserved_tool_result_tokens = 1024
 safety_margin_ratio = 0.10
 soft_limit_ratio = 0.65
@@ -43,10 +43,10 @@ max_context_overflow_retries = 1
     assert str(config.api.base_url) == "https://example.com/v1"
     assert config.api.model == "test-model"
     assert config.api.context_window_tokens == 32768
-    assert config.api.max_output_tokens == 2048
     assert config.api.tokenizer_encoding == "cl100k_base"
     assert config.api.timeout_seconds == 30
     assert config.api.max_retries == 2
+    assert config.token.reserved_output_tokens == 2048
     assert config.token.reserved_tool_result_tokens == 1024
     assert config.token.safety_margin_ratio == 0.10
     assert config.token.soft_limit_ratio == 0.65
@@ -185,7 +185,7 @@ model = "test-model"
         load_config(config_path)
 
 
-def test_load_config_rejects_output_limit_larger_than_context(tmp_path: Path) -> None:
+def test_load_config_rejects_reserves_that_consume_context(tmp_path: Path) -> None:
     config_path = write_config(
         tmp_path / "reporivet.toml",
         """
@@ -194,9 +194,11 @@ api_key = "test-secret"
 base_url = "https://example.com/v1"
 model = "test-model"
 context_window_tokens = 4096
-max_output_tokens = 4096
+
+[token]
+reserved_output_tokens = 4096
 """,
     )
 
-    with pytest.raises(ConfigurationError, match="max_output_tokens must be smaller"):
+    with pytest.raises(ConfigurationError, match="must leave a positive prompt budget"):
         load_config(config_path)

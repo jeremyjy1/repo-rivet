@@ -9,6 +9,14 @@ from repo_rivet.approval.models import ApprovalMode
 from repo_rivet.memory.token_estimator import ApproximateTokenEstimator
 from repo_rivet.reasoning.models import ObservationEvent, ReasoningEvent
 from repo_rivet.tools.base import ToolCall, ToolResult
+from repo_rivet.verification.models import (
+    FinalAssessment,
+    ModelErrorRecord,
+    ProcessObservation,
+    VerificationPlan,
+    VerificationResult,
+    VerificationStatus,
+)
 
 
 class MemoryConfig(BaseModel):
@@ -18,7 +26,7 @@ class MemoryConfig(BaseModel):
 
     recent_message_limit: int = Field(default=10, ge=4, le=30)
     max_context_tokens: int = Field(default=24_000, ge=1_000)
-    reserved_output_tokens: int = Field(default=4_000, ge=100)
+    reserved_output_tokens: int = Field(default=4_096, ge=100)
     reserved_tool_result_tokens: int = Field(default=2_048, ge=0)
     safety_margin_ratio: float = Field(default=0.15, ge=0, lt=0.5)
     max_tool_output_chars: int = Field(default=12_000, ge=1_000)
@@ -53,6 +61,10 @@ class Message(BaseModel):
 
     role: Literal["system", "user", "assistant", "tool"]
     content: str | None = None
+    # Provider continuation state is needed in memory for the current request chain, but hidden
+    # reasoning must never become durable session memory.
+    reasoning_content: str | None = Field(default=None, exclude=True, repr=False)
+    ephemeral: bool = Field(default=False, exclude=True, repr=False)
     tool_call_id: str | None = None
     name: str | None = None
     tool_calls: list[dict[str, Any]] | None = None
@@ -63,6 +75,7 @@ class Message(BaseModel):
         return cls(
             role=message["role"],
             content=message.get("content"),
+            reasoning_content=message.get("reasoning_content"),
             tool_call_id=message.get("tool_call_id"),
             name=message.get("name"),
             tool_calls=message.get("tool_calls"),
@@ -72,6 +85,8 @@ class Message(BaseModel):
     def as_chat_message(self) -> dict[str, Any]:
         content = self._model_visible_content()
         message: dict[str, Any] = {"role": self.role, "content": content}
+        if self.reasoning_content is not None:
+            message["reasoning_content"] = self.reasoning_content
         if self.tool_call_id is not None:
             message["tool_call_id"] = self.tool_call_id
         if self.name is not None:
@@ -195,10 +210,15 @@ class MemoryState(BaseModel):
     file_memories: dict[str, FileMemory] = Field(default_factory=dict)
     invalidated_files: set[str] = Field(default_factory=set)
     modified_files: set[str] = Field(default_factory=set)
+    workspace_revision: int = Field(default=0, ge=0)
+    verification_plan: VerificationPlan | None = None
+    verification_results: dict[str, VerificationResult] = Field(default_factory=dict)
+    verification_plan_recovery_attempts: int = Field(default=0, ge=0)
+    candidate_final_assessment: FinalAssessment | None = None
+    last_model_error: ModelErrorRecord | None = None
+    provider_requires_reasoning_content: bool = False
     command_outputs: list[CommandOutputMemory] = Field(default_factory=list)
-    last_file_change_step: int | None = None
-    last_verification_step: int | None = None
-    last_verification_success: bool = False
+    process_observations: list[ProcessObservation] = Field(default_factory=list)
     tool_event_step: int = 0
     compaction_count: int = 0
     context_overflow_count: int = 0
@@ -211,7 +231,24 @@ class MemoryState(BaseModel):
     reasoning_events: list[ReasoningEvent] = Field(default_factory=list)
     observation_events: list[ObservationEvent] = Field(default_factory=list)
     reflection_required: bool = False
+    last_agent_outcome: Literal["success", "incomplete", "blocked", "stopped", "error"] | None = (
+        None
+    )
     status: str = "ready"
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_legacy_verification_fields(cls, value: Any) -> Any:
+        """Discard command-name verification state from pre-plan session snapshots."""
+        if not isinstance(value, dict):
+            return value
+        migrated = dict(value)
+        migrated.pop("last_file_change_step", None)
+        migrated.pop("last_verification_step", None)
+        migrated.pop("last_verification_success", None)
+        if "workspace_revision" not in migrated and migrated.get("modified_files"):
+            migrated["workspace_revision"] = 1
+        return migrated
 
     def start_task(
         self,
@@ -245,8 +282,44 @@ class MemoryState(BaseModel):
         self.working.pending_actions.clear()
         self.status = "running"
 
-    def append_assistant(self, message: dict[str, Any], *, step: int) -> None:
-        self.messages.append(Message.from_chat_message(message, step=step))
+    def begin_task_scope(self) -> None:
+        """Start fresh completion evidence after a previously completed request."""
+        if self.last_agent_outcome != "success":
+            self.last_agent_outcome = None
+            return
+        self.modified_files.clear()
+        self.verification_plan = None
+        self.verification_results.clear()
+        self.verification_plan_recovery_attempts = 0
+        self.candidate_final_assessment = None
+        self.last_model_error = None
+        self.reflection_required = False
+        self.working.recent_modified_files.clear()
+        self.working.last_verification_result = None
+        self.last_agent_outcome = None
+
+    def append_assistant(
+        self,
+        message: dict[str, Any],
+        *,
+        step: int,
+        ephemeral: bool = False,
+    ) -> None:
+        value = Message.from_chat_message(message, step=step)
+        value.ephemeral = ephemeral
+        self.messages.append(value)
+
+    def append_ephemeral_system(self, content: str, *, step: int) -> None:
+        self.messages.append(Message(role="system", content=content, step=step, ephemeral=True))
+
+    def discard_ephemeral_messages(self) -> None:
+        self.messages[:] = [message for message in self.messages if not message.ephemeral]
+
+    def discard_provider_state(self) -> None:
+        """Drop hidden continuation data when the current agent run terminates."""
+        self.discard_ephemeral_messages()
+        for message in self.messages:
+            message.reasoning_content = None
 
     def append_tool_message(self, message: dict[str, Any], *, step: int) -> None:
         self.messages.append(Message.from_chat_message(message, step=step))
@@ -258,12 +331,19 @@ class MemoryState(BaseModel):
         *,
         step: int,
         full_output_path: str | None = None,
+        append_message: bool = True,
     ) -> None:
         """Update structured memory and append a bounded, linked tool observation."""
-        from repo_rivet.agent.verifier import is_verification_command
-
         self.tool_event_step = max(self.tool_event_step, step)
         metadata = dict(result.metadata or {})
+        process_value = metadata.get("process_observation")
+        if isinstance(process_value, dict):
+            process_observation = ProcessObservation.model_validate(process_value)
+            if full_output_path:
+                process_observation.stdout_ref = full_output_path
+                process_observation.stderr_ref = full_output_path
+            self.process_observations.append(process_observation)
+            self.process_observations[:] = self.process_observations[-20:]
         context_output = result.output
         path = call.arguments.get("path")
 
@@ -293,8 +373,14 @@ class MemoryState(BaseModel):
             self.file_memories.pop(path, None)
             self.invalidated_files.add(path)
             self.modified_files.add(path)
-            self.last_file_change_step = step
-            self.last_verification_success = False
+            self.workspace_revision += 1
+            for check_id, verification in list(self.verification_results.items()):
+                if verification.status != VerificationStatus.STALE:
+                    self.verification_results[check_id] = verification.model_copy(
+                        update={"status": VerificationStatus.STALE}
+                    )
+            self.summary.verification_status = "stale after workspace modification"
+            self.working.last_verification_result = self.summary.verification_status
             add_unique(self.summary.files_modified, path)
             add_unique(self.summary.completed_actions, f"Modified {path} with {call.name}")
             add_unique(self.working.recent_modified_files, path, limit=20)
@@ -303,8 +389,8 @@ class MemoryState(BaseModel):
                 "Read the file again before relying on its content."
             )
 
-        elif call.name == "run_command":
-            command = call.arguments.get("command")
+        elif call.name in {"run_command", "run_verification"}:
+            command = call.arguments.get("command") or metadata.get("command")
             if isinstance(command, str):
                 exit_code = metadata.get("exit_code")
                 raw_lines = (result.raw_output or result.output).splitlines()
@@ -338,35 +424,30 @@ class MemoryState(BaseModel):
                     kind="log",
                 )
 
-                if is_verification_command(command):
-                    success = result.ok and exit_code == 0 and not metadata.get("timed_out")
-                    self.last_verification_step = step
-                    self.last_verification_success = success
+                verification_value = metadata.get("verification_result")
+                if call.name == "run_verification" and isinstance(verification_value, dict):
+                    verification = VerificationResult.model_validate(verification_value)
+                    if full_output_path:
+                        verification.stdout_ref = full_output_path
+                        verification.stderr_ref = full_output_path
+                    self.verification_results[verification.check_id] = verification
                     self.summary.verification_status = (
-                        f"passed: {command}" if success else f"failed: {command}"
+                        f"{verification.status.value}: {verification.check_id}"
                     )
                     self.working.last_verification_result = self.summary.verification_status
-                    if success:
+                    if verification.status == VerificationStatus.PASSED:
                         self.summary.unresolved_issues = [
                             issue
                             for issue in self.summary.unresolved_issues
-                            if not issue.startswith("Verification failed:")
-                        ]
-                        self.working.unresolved_errors = [
-                            issue
-                            for issue in self.working.unresolved_errors
-                            if not issue.startswith("Verification failed:")
+                            if not issue.startswith(f"Verification {verification.check_id} ")
                         ]
                     else:
-                        issue = f"Verification failed: {command}: {(result.error or tail)[-1_000:]}"
+                        issue = (
+                            f"Verification {verification.check_id} "
+                            f"{verification.status.value}: {'; '.join(verification.reasons)}"
+                        )
                         add_unique(self.summary.unresolved_issues, issue)
                         add_unique(self.working.unresolved_errors, issue, limit=20)
-                        add_unique(self.summary.next_actions, f"Diagnose and rerun {command}")
-
-        elif call.name == "git_diff" and result.ok:
-            self.last_verification_step = step
-            self.last_verification_success = True
-            self.summary.verification_status = "inspected current git diff"
 
         if not result.ok:
             issue = f"{call.name} failed: {result.error or 'unknown error'}"
@@ -382,7 +463,8 @@ class MemoryState(BaseModel):
             error_code=result.error_code,
             retryable=result.retryable,
         )
-        self.append_tool_message(context_result.as_tool_message(call.id), step=step)
+        if append_message:
+            self.append_tool_message(context_result.as_tool_message(call.id), step=step)
 
     def clear_recent_conversation(self) -> None:
         """Clear raw working messages while preserving fixed and structured memory."""

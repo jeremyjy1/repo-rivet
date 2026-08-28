@@ -11,12 +11,14 @@ def test_default_registry_exposes_workspace_and_decision_tools(tmp_path: Path) -
 
     assert registry.names == (
         "record_decision",
+        "register_verification",
         "list_files",
         "search_text",
         "read_file",
         "write_file",
         "replace_text",
         "run_command",
+        "run_verification",
         "git_diff",
     )
     assert [schema["function"]["name"] for schema in registry.schemas()] == list(registry.names)
@@ -41,6 +43,21 @@ def test_registry_validates_tool_arguments(tmp_path: Path) -> None:
 
     assert not result.ok
     assert "Invalid arguments" in (result.error or "")
+
+
+def test_run_verification_rejects_model_supplied_command(tmp_path: Path) -> None:
+    registry = create_default_registry(tmp_path)
+
+    result = registry.execute(
+        ToolCall(
+            id="call-verify",
+            name="run_verification",
+            arguments={"check_id": "tests", "command": "anything"},
+        )
+    )
+
+    assert not result.ok
+    assert result.error_code == "invalid_arguments"
 
 
 def test_git_diff_reports_non_repository_as_failure(tmp_path: Path) -> None:

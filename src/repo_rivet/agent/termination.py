@@ -14,6 +14,7 @@ class TerminationConfig:
     max_consecutive_protocol_failures: int = 5
     max_repeated_tool_calls: int = 3
     max_empty_model_responses: int = 3
+    max_consecutive_length_responses: int = 3
 
     def __post_init__(self) -> None:
         values = {
@@ -23,6 +24,7 @@ class TerminationConfig:
             "max_consecutive_protocol_failures": self.max_consecutive_protocol_failures,
             "max_repeated_tool_calls": self.max_repeated_tool_calls,
             "max_empty_model_responses": self.max_empty_model_responses,
+            "max_consecutive_length_responses": self.max_consecutive_length_responses,
         }
         if any(value <= 0 for value in values.values()):
             raise ValueError("Termination limits must be positive")
@@ -34,10 +36,16 @@ class TerminationPolicy:
     def __init__(self, config: TerminationConfig | None = None) -> None:
         self.config = config or TerminationConfig()
 
-    def check(self, state: SessionState, *, now: float | None = None) -> str | None:
+    def check(
+        self,
+        state: SessionState,
+        *,
+        now: float | None = None,
+        include_step_limit: bool = True,
+    ) -> str | None:
         if state.interrupted:
             return "interrupted by user"
-        if state.step_count >= self.config.max_steps:
+        if include_step_limit and state.step_count >= self.config.max_steps:
             return f"maximum agent steps reached ({self.config.max_steps})"
 
         current_time = time.monotonic() if now is None else now
@@ -61,5 +69,10 @@ class TerminationPolicy:
         if state.empty_model_responses >= self.config.max_empty_model_responses:
             return (
                 f"maximum empty model responses reached ({self.config.max_empty_model_responses})"
+            )
+        if state.consecutive_length_responses >= self.config.max_consecutive_length_responses:
+            return (
+                "maximum consecutive length-limited model responses reached "
+                f"({self.config.max_consecutive_length_responses})"
             )
         return None

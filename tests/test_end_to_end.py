@@ -1,4 +1,3 @@
-import shlex
 import sys
 from pathlib import Path
 
@@ -30,11 +29,26 @@ def test_real_tools_complete_three_step_edit_and_verification_loop(tmp_path: Pat
             "expected_count": 1,
         },
     )
-    verify = ToolCall(
-        id="3",
-        name="run_command",
+    verification_plan = ToolCall(
+        id="verification-plan",
+        name="register_verification",
         arguments={
-            "command": f"{shlex.quote(sys.executable)} -m py_compile discount.py",
+            "requirements": ["module-compiles"],
+            "checks": [
+                {
+                    "check_id": "python-compile",
+                    "title": "Compile discount.py",
+                    "kind": "build",
+                    "command": {
+                        "program": sys.executable,
+                        "args": ["-m", "py_compile", "discount.py"],
+                    },
+                    "criteria": {"expected_exit_codes": [0]},
+                    "required": True,
+                    "claim_ids": ["module-compiles"],
+                    "provenance": "model",
+                }
+            ],
         },
     )
     replace_decision = ToolCall(
@@ -51,24 +65,10 @@ def test_real_tools_complete_three_step_edit_and_verification_loop(tmp_path: Pat
             "confidence": 0.9,
         },
     )
-    verify_decision = ToolCall(
-        id="decision-3",
-        name="record_decision",
-        arguments={
-            "phase": "decision",
-            "current_goal": "Verify the edited module",
-            "summary": "The source changed and now requires syntax verification.",
-            "next_tool": "run_command",
-            "next_tool_argument_summary": "compile discount.py",
-            "expected_result": "Python compilation exits successfully",
-            "confidence": 0.9,
-        },
-    )
     model = FakeModelClient(
         [
             ModelResponse(tool_calls=[read]),
-            ModelResponse(tool_calls=[replace_decision, replace]),
-            ModelResponse(tool_calls=[verify_decision, verify]),
+            ModelResponse(tool_calls=[verification_plan, replace_decision, replace]),
             ModelResponse(content="Rejected negative prices and verified the module."),
         ]
     )
@@ -83,7 +83,7 @@ def test_real_tools_complete_three_step_edit_and_verification_loop(tmp_path: Pat
 
     assert result.status == "success"
     assert result.tool_call_count == 3
-    assert result.verification_success
+    assert result.verification_status.value == "passed"
     assert "raise ValueError" in source_path.read_text(encoding="utf-8")
     log_content = log_path.read_text(encoding="utf-8")
     assert '"event": "session_start"' in log_content

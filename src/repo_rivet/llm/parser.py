@@ -27,15 +27,28 @@ class ResponseParser:
         content = getattr(message, "content", None)
         if content is not None and not isinstance(content, str):
             raise ResponseParseError("Model response content is not text")
+        reasoning_content = self._provider_text(message, "reasoning_content")
 
         tool_calls = [
             self._parse_tool_call(item) for item in getattr(message, "tool_calls", None) or []
         ]
         return ModelResponse(
             content=content,
+            reasoning_content=reasoning_content,
             tool_calls=tool_calls,
             finish_reason=getattr(choice, "finish_reason", None),
         )
+
+    @staticmethod
+    def _provider_text(message: Any, field_name: str) -> str | None:
+        value = getattr(message, field_name, None)
+        if value is None:
+            model_extra = getattr(message, "model_extra", None)
+            if isinstance(model_extra, dict):
+                value = model_extra.get(field_name)
+        if value is not None and not isinstance(value, str):
+            raise ResponseParseError(f"Model response {field_name} is not text")
+        return value
 
     @staticmethod
     def _parse_tool_call(raw_call: Any) -> ToolCall:
