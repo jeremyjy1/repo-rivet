@@ -1185,6 +1185,12 @@ class AgentController:
                     effective_estimated_prompt_tokens=estimate.effective,
                 )
                 continue
+            finally:
+                self._log(
+                    "model_call_finished",
+                    step=state.step_count + 1,
+                    context_recovery_attempt=attempt,
+                )
 
             if response.input_tokens is not None:
                 self.context_manager.observe_usage(response.input_tokens)

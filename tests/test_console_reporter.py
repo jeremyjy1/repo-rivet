@@ -1,6 +1,7 @@
 from io import StringIO
 from pathlib import Path
 
+import pytest
 from rich.console import Console
 
 from repo_rivet.approval.engine import ApprovalEngine
@@ -24,6 +25,95 @@ class RecordingSink:
 
     def log(self, event_type: str, **data: object) -> None:
         self.events.append((event_type, data))
+
+
+class RecordingStatus:
+    def __init__(self) -> None:
+        self.started = False
+        self.stopped = False
+
+    def start(self) -> None:
+        self.started = True
+
+    def stop(self) -> None:
+        self.stopped = True
+
+
+def test_console_reporter_shows_transient_status_while_model_generates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    buffer = StringIO()
+    console = Console(file=buffer, force_terminal=False, color_system=None, width=240)
+    reporter = ConsoleEventReporter(console)
+    status = RecordingStatus()
+    captured: dict[str, str] = {}
+
+    def create_status(message: str, *, spinner: str) -> RecordingStatus:
+        captured["message"] = message
+        captured["spinner"] = spinner
+        return status
+
+    monkeypatch.setattr(console, "status", create_status)
+
+    reporter.log("model_call", step=1)
+
+    assert status.started is True
+    assert status.stopped is False
+    assert "generating the next action" in captured["message"]
+    assert captured["spinner"] == "dots"
+
+    reporter.log("model_call_finished", step=1)
+
+    assert status.stopped is True
+    assert reporter._active_status is None
+    assert buffer.getvalue() == ""
+
+
+@pytest.mark.parametrize(
+    ("tool", "message"),
+    [
+        ("list_files", "Listing workspace files"),
+        ("search_text", "Searching workspace text"),
+        ("read_file", "Reading file"),
+        ("write_file", "Creating file"),
+        ("edit_file", "Applying edits"),
+        ("run_command", "Running command"),
+        ("run_verification", "Running verification"),
+        ("git_diff", "Inspecting Git changes"),
+        ("future_tool", "Running tool"),
+    ],
+)
+def test_console_reporter_animates_every_tool_with_a_future_safe_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tool: str,
+    message: str,
+) -> None:
+    buffer = StringIO()
+    console = Console(file=buffer, force_terminal=True, color_system=None, width=240)
+    reporter = ConsoleEventReporter(console)
+    status = RecordingStatus()
+    captured: dict[str, str] = {}
+
+    def create_status(value: str, *, spinner: str) -> RecordingStatus:
+        captured["message"] = value
+        captured["spinner"] = spinner
+        return status
+
+    monkeypatch.setattr(console, "status", create_status)
+
+    reporter.log("approved_tool_started", tool=tool)
+
+    assert status.started is True
+    assert status.stopped is False
+    assert message in captured["message"]
+    assert tool in captured["message"]
+    assert captured["spinner"] == "dots"
+
+    reporter.log("approved_tool_executed", tool=tool, ok=True)
+
+    assert status.stopped is True
+    assert reporter._active_status is None
+    assert buffer.getvalue() == ""
 
 
 def test_console_reporter_compacts_tool_and_material_approval_events() -> None:
@@ -167,8 +257,35 @@ def test_console_reporter_keeps_progress_for_slow_auto_approved_command() -> Non
     )
 
     assert buffer.getvalue().splitlines() == [
-        "… run_command · running",
+        "… run_command · running command",
         "✓ run_command · exit 0 · 2.5s",
+    ]
+
+
+def test_console_reporter_marks_file_creation_as_started() -> None:
+    buffer = StringIO()
+    reporter = ConsoleEventReporter(
+        Console(file=buffer, force_terminal=False, color_system=None, width=240)
+    )
+
+    reporter.log(
+        "approval_decided",
+        tool="write_file",
+        action="allow",
+        source="allow_all_mode",
+        risk="medium",
+    )
+    reporter.log("approved_tool_started", tool="write_file")
+    reporter.log(
+        "tool_result",
+        name="write_file",
+        ok=True,
+        metadata={"path": "game.cpp", "bytes": 4_096, "line_count": 120},
+    )
+
+    assert buffer.getvalue().splitlines() == [
+        "… write_file · creating file",
+        "✓ write_file",
     ]
 
 

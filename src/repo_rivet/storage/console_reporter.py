@@ -4,6 +4,7 @@ import re
 from typing import Any
 
 from rich.console import Console
+from rich.status import Status
 from rich.text import Text
 
 from repo_rivet.reasoning.models import ReasoningDisplayMode
@@ -38,7 +39,22 @@ _APPROVAL_FAILURE_CODES = {
     "approval_stale",
     "hard_policy_denied",
 }
-_PROGRESS_TOOLS = {"git_diff", "run_command", "run_verification"}
+_TOOL_PROGRESS_LABELS = {
+    "edit_file": "applying edits",
+    "git_diff": "inspecting Git changes",
+    "list_files": "listing workspace files",
+    "read_file": "reading file",
+    "run_command": "running command",
+    "run_verification": "running verification",
+    "search_text": "searching workspace text",
+    "write_file": "creating file",
+}
+_STATUS_STOP_EVENTS = {
+    "approved_tool_executed",
+    "model_call_finished",
+    "session_end",
+    "tool_result",
+}
 
 
 class ConsoleEventReporter:
@@ -54,9 +70,15 @@ class ConsoleEventReporter:
         self.console = console
         self._secrets = tuple(secret for secret in secrets if secret)
         self.reasoning_mode = reasoning_mode
+        self._active_status: Status | None = None
 
     def log(self, event_type: str, **data: Any) -> None:
-        if event_type == "approval_decided":
+        if event_type in _STATUS_STOP_EVENTS:
+            self._stop_status()
+
+        if event_type == "model_call":
+            self._start_model_status()
+        elif event_type == "approval_decided":
             self._approval_decided(data)
         elif event_type == "approved_tool_started":
             self._tool_started(data)
@@ -175,8 +197,26 @@ class ConsoleEventReporter:
 
     def _tool_started(self, data: dict[str, Any]) -> None:
         tool = self._safe(data.get("tool", "unknown tool"))
-        if tool in _PROGRESS_TOOLS:
-            self._print("…", tool, "running", style="bold cyan")
+        progress = _TOOL_PROGRESS_LABELS.get(tool, "running tool")
+        if self.console.is_terminal:
+            sentence = f"{progress[:1].upper()}{progress[1:]} ({tool})…"
+            self._start_status(f"[cyan]{sentence}[/cyan]")
+            return
+        self._print("…", tool, progress, style="bold cyan")
+
+    def _start_model_status(self) -> None:
+        self._start_status("[cyan]Model is generating the next action…[/cyan]")
+
+    def _start_status(self, message: str) -> None:
+        self._stop_status()
+        self._active_status = self.console.status(message, spinner="dots")
+        self._active_status.start()
+
+    def _stop_status(self) -> None:
+        if self._active_status is None:
+            return
+        self._active_status.stop()
+        self._active_status = None
 
     def _tool_result(self, data: dict[str, Any]) -> None:
         if data.get("name") in {
