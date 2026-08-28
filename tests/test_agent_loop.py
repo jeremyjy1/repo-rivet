@@ -353,7 +353,10 @@ def test_started_verification_runs_remaining_required_checks_without_model_round
         "smoke",
     ]
     assert len(model.requests) == 3
-    assert "verification_complete" in str(model.requests[2]["messages"][-1]["content"])
+    assert any(
+        "verification_complete" in str(message.get("content"))
+        for message in model.requests[2]["messages"]
+    )
     assert model.requests[2]["tools"] == []
 
 
@@ -695,7 +698,9 @@ def test_agent_passes_prior_conversation_to_context() -> None:
     contents = [message.get("content") for message in model.requests[1]["messages"]]
     task_spec = next(str(content) for content in contents if "Original task" in str(content))
     assert "first request" in task_spec
-    assert "continue" in task_spec
+    assert "continue" not in task_spec
+    assert "continue" in contents
+    assert any("Durable subsequent user requirements" in str(content) for content in contents)
     assert any("First result." in str(content) for content in contents)
 
 

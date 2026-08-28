@@ -39,10 +39,74 @@ def test_build_keeps_fixed_task_state_summary_and_recent_messages() -> None:
 
     assert messages[0] == {"role": "system", "content": SYSTEM_PROMPT}
     assert "preserve this original task exactly" in messages[1]["content"]
-    assert "Current structured state" in messages[2]["content"]
-    assert f"src/app.py: {'a' * 64}" in messages[2]["content"]
+    assert "Current structured state" in messages[-1]["content"]
+    assert f"src/app.py: {'a' * 64}" in messages[-1]["content"]
     assert any("pytest still fails" in str(message.get("content")) for message in messages)
     assert any(message.get("content") == "recent decision" for message in messages)
+
+
+def test_build_keeps_stable_prefix_and_places_changing_state_after_history() -> None:
+    memory = make_memory()
+    manager = ContextManager()
+    first = manager.build(
+        memory=memory,
+        state_summary="first state",
+        remaining_steps=29,
+        tools=[],
+    )
+
+    memory.start_task(
+        task="also add unit tests",
+        workspace="/workspace",
+        system_prompt=SYSTEM_PROMPT,
+        safety_rules=["stay inside workspace"],
+        completion_rules=["verify after changes"],
+        max_steps=30,
+    )
+    memory.messages.append(Message(role="assistant", content="updated response"))
+    second = manager.build(
+        memory=memory,
+        state_summary="second state",
+        remaining_steps=28,
+        tools=[],
+    )
+
+    assert second[:2] == first[:2]
+    assert "also add unit tests" not in second[1]["content"]
+    update_index = next(
+        index
+        for index, message in enumerate(second)
+        if message.get("content") == "also add unit tests"
+    )
+    response_index = next(
+        index
+        for index, message in enumerate(second)
+        if message.get("content") == "updated response"
+    )
+    state_index = next(
+        index
+        for index, message in enumerate(second)
+        if "Current structured state" in str(message.get("content"))
+    )
+    assert 1 < update_index < response_index < state_index
+    assert "also add unit tests" in second[-2]["content"]
+
+
+def test_normal_pressure_does_not_compact_append_only_history() -> None:
+    memory = make_memory(config=MemoryConfig(recent_message_limit=4))
+    for index in range(20):
+        memory.messages.append(Message(role="assistant", content=f"short message {index}"))
+
+    messages = ContextManager().build(
+        memory=memory,
+        state_summary="state",
+        remaining_steps=5,
+        tools=[],
+    )
+
+    assert len(memory.messages) == 21
+    assert memory.compaction_count == 0
+    assert any(message.get("content") == "short message 0" for message in messages)
 
 
 def test_build_includes_only_bounded_recent_auditable_trace() -> None:
@@ -120,10 +184,20 @@ def test_build_truncates_large_tool_output_without_mutating_memory() -> None:
 
 
 def test_compaction_preserves_original_task_and_structured_unresolved_issue() -> None:
-    memory = make_memory(config=MemoryConfig(recent_message_limit=4))
+    memory = make_memory(
+        config=MemoryConfig(
+            recent_message_limit=4,
+            max_context_tokens=4_000,
+            reserved_output_tokens=1_000,
+            reserved_tool_result_tokens=100,
+            safety_margin_ratio=0.05,
+        )
+    )
     memory.summary.unresolved_issues.append("failing test must remain")
     for index in range(20):
-        memory.messages.append(Message(role="assistant", content=f"old message {index}"))
+        memory.messages.append(
+            Message(role="assistant", content=f"old message {index} " + "x" * 800)
+        )
 
     messages = ContextManager().build(
         memory=memory,
@@ -139,9 +213,17 @@ def test_compaction_preserves_original_task_and_structured_unresolved_issue() ->
 
 
 def test_compaction_does_not_split_assistant_tool_pair() -> None:
-    memory = make_memory(config=MemoryConfig(recent_message_limit=4))
+    memory = make_memory(
+        config=MemoryConfig(
+            recent_message_limit=4,
+            max_context_tokens=4_000,
+            reserved_output_tokens=1_000,
+            reserved_tool_result_tokens=100,
+            safety_margin_ratio=0.05,
+        )
+    )
     for index in range(12):
-        memory.messages.append(Message(role="assistant", content=f"old {index}"))
+        memory.messages.append(Message(role="assistant", content=f"old {index} " + "x" * 800))
     memory.messages.extend(
         [
             Message(

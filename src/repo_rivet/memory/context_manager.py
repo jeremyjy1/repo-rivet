@@ -56,7 +56,7 @@ class ContextBudgetExceededError(ValueError):
 
 
 class ContextManager:
-    """Combine fixed, working, summary, and TurnGroup memory within a safe budget."""
+    """Build a cache-friendly prompt from stable, append-only, and volatile layers."""
 
     def __init__(
         self,
@@ -93,34 +93,57 @@ class ContextManager:
             raise ValueError("Memory must have fixed task information before context is built")
 
         manager = self._manager_for(memory)
-        fixed_messages = self._fixed_messages(memory, state_summary, remaining_steps, tools)
+        stable_messages = self._stable_messages(memory)
+        volatile_messages = self._volatile_messages(
+            memory,
+            state_summary,
+            remaining_steps,
+            tools,
+        )
+        history_messages, provider_tail = self._split_provider_tail(memory.messages)
         full_messages = [
-            *fixed_messages,
-            *(message.as_chat_message() for message in memory.messages),
+            *stable_messages,
+            *(message.as_chat_message() for message in history_messages),
+            *volatile_messages,
+            *(message.as_chat_message() for message in provider_tail),
         ]
         full_estimate = manager.estimate_request(full_messages, tools)
         pressure = manager.pressure_level(full_estimate.effective)
         self.compactor.compact_if_needed(memory, pressure=pressure)
 
-        fixed_estimate = manager.estimate_request(fixed_messages, tools)
+        history_messages, provider_tail = self._split_provider_tail(memory.messages)
+        bounded_provider_tail = [self._bound_message(message, memory) for message in provider_tail]
+        base_messages = [
+            *stable_messages,
+            *volatile_messages,
+            *(message.as_chat_message() for message in bounded_provider_tail),
+        ]
+        fixed_estimate = manager.estimate_request(base_messages, tools)
         manager.state.fixed_prompt_estimate = manager.estimator.base.estimate_request(
-            fixed_messages,
+            base_messages,
             [],
         )
         if fixed_estimate.effective > manager.config.prompt_budget:
             raise ContextBudgetExceededError(
-                "Fixed task, structured state, and tool definitions exceed the safe prompt "
+                "Stable task, structured state, and tool definitions exceed the safe prompt "
                 f"budget ({fixed_estimate.effective} > {manager.config.prompt_budget} tokens)"
             )
 
         selected = self._select_recent(
-            fixed_messages=fixed_messages,
-            messages=memory.messages,
+            stable_messages=stable_messages,
+            volatile_messages=volatile_messages,
+            provider_tail=bounded_provider_tail,
+            messages=history_messages,
             tools=tools,
             memory=memory,
             manager=manager,
         )
-        messages = [*fixed_messages, *(message.as_chat_message() for message in selected)]
+        messages = [
+            *stable_messages,
+            *(message.as_chat_message() for message in selected),
+            *volatile_messages,
+            *(message.as_chat_message() for message in bounded_provider_tail),
+        ]
         self.last_estimate = manager.estimate_request(messages, tools)
         if self.last_estimate.effective > manager.config.prompt_budget:
             raise ContextBudgetExceededError(
@@ -166,7 +189,9 @@ class ContextManager:
     def _select_recent(
         self,
         *,
-        fixed_messages: list[dict[str, Any]],
+        stable_messages: list[dict[str, Any]],
+        volatile_messages: list[dict[str, Any]],
+        provider_tail: list[Message],
         messages: list[Message],
         tools: list[dict[str, Any]],
         memory: MemoryState,
@@ -179,12 +204,14 @@ class ContextManager:
             )
             candidate_groups = [bounded, *selected_groups]
             candidate_messages = [
-                *fixed_messages,
+                *stable_messages,
                 *(
                     message.as_chat_message()
                     for candidate_group in candidate_groups
                     for message in candidate_group.messages
                 ),
+                *volatile_messages,
+                *(message.as_chat_message() for message in provider_tail),
             ]
             estimate = manager.estimate_request(candidate_messages, tools)
             if estimate.effective <= manager.config.prompt_budget:
@@ -194,7 +221,9 @@ class ContextManager:
                 break
 
             fitted = self._force_fit_latest_group(
-                fixed_messages=fixed_messages,
+                stable_messages=stable_messages,
+                volatile_messages=volatile_messages,
+                provider_tail=provider_tail,
                 group=bounded,
                 tools=tools,
                 manager=manager,
@@ -208,7 +237,9 @@ class ContextManager:
     def _force_fit_latest_group(
         self,
         *,
-        fixed_messages: list[dict[str, Any]],
+        stable_messages: list[dict[str, Any]],
+        volatile_messages: list[dict[str, Any]],
+        provider_tail: list[Message],
         group: TurnGroup,
         tools: list[dict[str, Any]],
         manager: TokenBudgetManager,
@@ -216,8 +247,10 @@ class ContextManager:
         fitted = TurnGroup([message.model_copy(deep=True) for message in group.messages])
         while True:
             candidate = [
-                *fixed_messages,
+                *stable_messages,
                 *(message.as_chat_message() for message in fitted.messages),
+                *volatile_messages,
+                *(message.as_chat_message() for message in provider_tail),
             ]
             if manager.estimate_request(candidate, tools).effective <= manager.config.prompt_budget:
                 return fitted
@@ -236,7 +269,15 @@ class ContextManager:
                 max(32, int(len(longest.content or "") * 0.70)),
             )
 
-    def _fixed_messages(
+    @staticmethod
+    def _stable_messages(memory: MemoryState) -> list[dict[str, Any]]:
+        """Return the immutable provider-cache prefix for this session."""
+        return [
+            {"role": "system", "content": memory.fixed.system_prompt},
+            {"role": "user", "content": memory.task_specification()},
+        ]
+
+    def _volatile_messages(
         self,
         memory: MemoryState,
         state_summary: str,
@@ -246,9 +287,21 @@ class ContextManager:
         tool_names = ", ".join(
             str(tool.get("function", {}).get("name", "unknown")) for tool in tools
         )
-        messages: list[dict[str, Any]] = [
-            {"role": "system", "content": memory.fixed.system_prompt},
-            {"role": "user", "content": memory.task_specification()},
+        messages: list[dict[str, Any]] = []
+        if memory.summary.has_content():
+            messages.append({"role": "system", "content": self._format_summary(memory.summary)})
+        if memory.task_updates:
+            updates = "\n".join(f"- {item}" for item in memory.task_updates)
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "Durable subsequent user requirements (preserve verbatim and apply in "
+                        f"order):\n{updates}"
+                    ),
+                }
+            )
+        messages.append(
             {
                 "role": "system",
                 "content": (
@@ -265,11 +318,17 @@ class ContextManager:
                     f"Available tools: {tool_names}\n"
                     f"Remaining agent steps: {max(remaining_steps, 0)}"
                 ),
-            },
-        ]
-        if memory.summary.has_content():
-            messages.append({"role": "system", "content": self._format_summary(memory.summary)})
+            }
+        )
         return messages
+
+    @staticmethod
+    def _split_provider_tail(messages: list[Message]) -> tuple[list[Message], list[Message]]:
+        """Keep provider continuation state after regenerated structured context."""
+        split_at = len(messages)
+        while split_at > 0 and messages[split_at - 1].ephemeral:
+            split_at -= 1
+        return messages[:split_at], messages[split_at:]
 
     @staticmethod
     def _format_current_snapshots(memory: MemoryState) -> str:

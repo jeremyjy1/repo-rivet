@@ -125,7 +125,7 @@ def test_file_modification_invalidates_previous_file_memory() -> None:
     assert "src/app.py" in memory.summary.files_modified
 
 
-def test_task_update_never_overwrites_original_task() -> None:
+def test_task_update_never_changes_stable_task_specification() -> None:
     memory = make_memory()
 
     memory.start_task(
@@ -141,7 +141,8 @@ def test_task_update_never_overwrites_original_task() -> None:
     assert memory.task_updates == ["also add unit tests"]
     specification = memory.task_specification()
     assert "original task must remain" in specification
-    assert "also add unit tests" in specification
+    assert "also add unit tests" not in specification
+    assert memory.messages[-1].content == "also add unit tests"
 
 
 def test_failed_verification_is_preserved_in_structured_summary() -> None:

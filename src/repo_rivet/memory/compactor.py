@@ -21,8 +21,10 @@ class ConversationCompactor:
         *,
         pressure: str,
     ) -> int:
-        over_message_limit = len(memory.messages) > max(14, memory.config.recent_message_limit)
-        if pressure == "normal" and not over_message_limit:
+        # Keeping normal-pressure history append-only lets providers reuse the previous
+        # request prefix. Compaction is an intentional cache-epoch change and is therefore
+        # driven by the token budget, not by a small message-count threshold.
+        if pressure == "normal":
             return 0
         return self.compact(memory, aggressive=pressure in {"aggressive", "overflow"})
 

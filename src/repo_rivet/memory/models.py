@@ -605,14 +605,13 @@ class MemoryState(BaseModel):
         self.messages.clear()
 
     def task_specification(self) -> str:
+        """Render only session-stable task information for the prompt prefix."""
         if self.fixed is None:
             raise ValueError("Memory has no original task")
-        updates = "\n".join(f"- {item}" for item in self.task_updates) or "- none"
         safety = "\n".join(f"- {item}" for item in self.fixed.safety_rules)
         completion = "\n".join(f"- {item}" for item in self.fixed.completion_rules)
         return (
             f"Original task (preserve verbatim):\n{self.fixed.original_task}\n\n"
-            f"Subsequent user requirements:\n{updates}\n\n"
             f"Workspace: {self.fixed.workspace}\n"
             f"Maximum agent steps per request: {self.fixed.max_steps}\n\n"
             f"Safety rules:\n{safety}\n\n"
