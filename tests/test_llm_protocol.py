@@ -58,6 +58,12 @@ def test_duplicate_tool_call_id_is_rejected() -> None:
         )
 
 
+@pytest.mark.parametrize("content", [None, "", "   "])
+def test_empty_assistant_message_is_rejected(content: str | None) -> None:
+    with pytest.raises(InvalidConversationHistory, match="neither assistant content"):
+        validate_tool_call_protocol([{"role": "assistant", "content": content}])
+
+
 def test_detect_dsml_tool_markup_leaked_into_text() -> None:
     assert contains_embedded_tool_protocol(
         'Build passed.\n<｜｜DSML｜｜tool_calls>\n<｜｜DSML｜｜invoke name="run_verification">'

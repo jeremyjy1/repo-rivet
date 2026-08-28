@@ -106,6 +106,7 @@ class AgentController:
 
         workspace = getattr(self.tool_registry, "workspace", None) or Path.cwd().resolve()
         memory = memory or MemoryState(session_id=f"memory-{uuid4().hex[:8]}")
+        repaired_empty_assistant_messages = memory.repair_invalid_assistant_messages()
         memory.begin_task_scope()
         memory.start_task(
             task=task,
@@ -148,6 +149,11 @@ class AgentController:
             self._log(
                 "legacy_decision_state_repaired",
                 reason="trailing decision-validation rejections did not execute tools",
+            )
+        if repaired_empty_assistant_messages:
+            self._log(
+                "invalid_history_repaired",
+                removed_empty_assistant_messages=repaired_empty_assistant_messages,
             )
         self._save_memory(memory, state, status=state.status.value)
         try:
@@ -238,18 +244,25 @@ class AgentController:
                 )
                 attempted_finalization_tool = bool(response.tool_calls) or leaked_tool_protocol
                 if state.status == AgentStatus.FINALIZING and attempted_finalization_tool:
-                    response = replace(response, content=None)
                     if leaked_tool_protocol:
                         self._log(
                             "finalization_protocol_text_discarded",
                             step=state.step_count + 1,
                         )
-                state.record_model_response(response)
+                    response = replace(
+                        response,
+                        content=(
+                            None
+                            if response.tool_calls
+                            else self._verified_completion_summary(state)
+                        ),
+                    )
+                assistant_recorded = state.record_model_response(response)
                 if response.reasoning_content is not None:
                     state.provider_reasoning_detected = True
                     memory.provider_requires_reasoning_content = True
-                assistant_message = response.as_assistant_message()
                 length_limited = response.finish_reason == "length" and not response.tool_calls
+                assistant_message = response.as_assistant_message()
                 memory.total_input_tokens += (
                     response.input_tokens
                     if response.input_tokens is not None
@@ -260,11 +273,19 @@ class AgentController:
                     if response.output_tokens is not None
                     else self.context_manager.count_message(raw_assistant_message)
                 )
-                memory.append_assistant(
-                    assistant_message,
-                    step=state.tool_call_count,
-                    ephemeral=length_limited,
-                )
+                if assistant_recorded:
+                    memory.append_assistant(
+                        assistant_message,
+                        step=state.tool_call_count,
+                        ephemeral=length_limited,
+                    )
+                elif not length_limited:
+                    memory.messages.append(
+                        Message.from_chat_message(
+                            state.messages[-1],
+                            step=state.tool_call_count,
+                        )
+                    )
                 self._log(
                     "model_response",
                     step=state.step_count,

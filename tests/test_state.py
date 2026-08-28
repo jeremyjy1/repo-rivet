@@ -12,6 +12,8 @@ def test_record_model_response_tracks_empty_responses() -> None:
     assert state.step_count == 2
     assert state.empty_model_responses == 0
     assert len(state.messages) == 2
+    assert state.messages[0]["role"] == "system"
+    assert state.messages[1]["role"] == "assistant"
 
 
 def test_record_tool_result_tracks_changes_failures_and_repetition() -> None:

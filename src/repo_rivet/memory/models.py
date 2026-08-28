@@ -95,6 +95,22 @@ class Message(BaseModel):
             message["tool_calls"] = self.tool_calls
         return message
 
+    def is_valid_provider_message(self) -> bool:
+        """Return whether an assistant message has provider-visible content or tool calls."""
+        if self.role != "assistant":
+            return True
+        return bool(
+            (self.content and self.content.strip())
+            or self.tool_calls
+            or (self.reasoning_content and self.reasoning_content.strip())
+        )
+
+    def is_valid_durable_message(self) -> bool:
+        """Return whether persistence will retain a valid provider-visible message."""
+        if self.role != "assistant":
+            return True
+        return bool((self.content and self.content.strip()) or self.tool_calls)
+
     def _model_visible_content(self) -> str | None:
         """Hide session-audit paths that workspace tools cannot read."""
         if self.role != "tool" or not self.content:
@@ -298,6 +314,14 @@ class MemoryState(BaseModel):
         self.working.recent_modified_files.clear()
         self.working.last_verification_result = None
         self.last_agent_outcome = None
+
+    def repair_invalid_assistant_messages(self) -> int:
+        """Remove legacy empty assistant messages rejected by compatible providers."""
+        before = len(self.messages)
+        self.messages[:] = [
+            message for message in self.messages if message.is_valid_provider_message()
+        ]
+        return before - len(self.messages)
 
     def append_assistant(
         self,

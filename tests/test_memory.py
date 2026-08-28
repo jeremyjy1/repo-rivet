@@ -293,6 +293,17 @@ def test_provider_reasoning_and_ephemeral_continuation_are_never_persisted(
     assert len(restored.messages) == len(memory.messages) - 2
 
 
+def test_memory_store_does_not_persist_empty_assistant_messages(tmp_path: Path) -> None:
+    store = MemoryStore.create(tmp_path)
+    memory = make_memory(store.session_id)
+    memory.messages.append(Message(role="assistant", content=None))
+
+    store.save_state(memory, status="paused")
+    restored = store.load_state()
+
+    assert all(message.is_valid_provider_message() for message in restored.messages)
+
+
 def test_resume_detects_external_file_change(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()

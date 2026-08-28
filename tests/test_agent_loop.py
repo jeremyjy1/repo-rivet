@@ -6,6 +6,7 @@ from repo_rivet.agent.termination import TerminationConfig, TerminationPolicy
 from repo_rivet.llm.base import ModelContextLengthError, ModelResponse
 from repo_rivet.llm.openai_compatible import ModelRequestError
 from repo_rivet.llm.parser import ResponseParseError
+from repo_rivet.llm.protocol import validate_tool_call_protocol
 from repo_rivet.memory.models import MemoryState, Message
 from repo_rivet.tools.base import ToolCall, ToolResult
 from repo_rivet.tools.registry import ToolRegistry
@@ -109,6 +110,75 @@ def test_agent_executes_tool_then_returns_final_text() -> None:
     assert result.summary == "Done."
     assert result.step_count == 2
     assert result.tool_call_count == 1
+
+
+def test_empty_model_response_is_replaced_with_local_feedback() -> None:
+    model = FakeModelClient([ModelResponse(), ModelResponse(content="Continued successfully.")])
+    tools = FakeToolRegistry([])
+    memory = MemoryState(session_id="empty-response")
+
+    result = controller(model, tools).run("continue the task", memory=memory)
+
+    assert result.status == "success"
+    assert len(model.requests) == 2
+    second_history = model.requests[1]["messages"]
+    validate_tool_call_protocol(second_history)
+    assert any(
+        message.get("role") == "system" and "response was empty" in message.get("content", "")
+        for message in second_history
+    )
+    assert all(
+        message.get("role") != "assistant"
+        or bool((message.get("content") or "").strip() or message.get("tool_calls"))
+        for message in second_history
+    )
+
+
+def test_resume_removes_legacy_empty_assistant_before_request() -> None:
+    model = FakeModelClient([ModelResponse(content="The resumed task can continue.")])
+    tools = FakeToolRegistry([])
+    events = RecordingSink()
+    memory = MemoryState(
+        session_id="legacy-empty-history",
+        messages=[
+            Message(role="user", content="previous task"),
+            Message(role="assistant", content=None),
+        ],
+    )
+
+    result = controller(model, tools, event_logger=events).run(
+        "continue after resume",
+        memory=memory,
+    )
+
+    assert result.status == "success"
+    validate_tool_call_protocol(model.requests[0]["messages"])
+    assert not any(
+        message.role == "assistant" and not message.is_valid_provider_message()
+        for message in memory.messages
+    )
+    repair_events = [data for event, data in events.events if event == "invalid_history_repaired"]
+    assert repair_events == [{"removed_empty_assistant_messages": 1}]
+
+
+def test_length_response_without_visible_content_is_not_replayed() -> None:
+    model = FakeModelClient(
+        [
+            ModelResponse(finish_reason="length"),
+            ModelResponse(content="Recovered after truncation."),
+        ]
+    )
+    tools = FakeToolRegistry([])
+
+    result = controller(model, tools).run("continue after truncation")
+
+    assert result.status == "success"
+    validate_tool_call_protocol(model.requests[1]["messages"])
+    assert all(
+        message.get("role") != "assistant"
+        or bool((message.get("content") or "").strip() or message.get("tool_calls"))
+        for message in model.requests[1]["messages"]
+    )
 
 
 def test_agent_automatically_runs_registered_checks_before_finishing() -> None:
@@ -287,6 +357,8 @@ def test_finalization_discards_dsml_tool_markup_from_result_and_history() -> Non
     )
     assert "DSML" not in result.summary
     assert all("DSML" not in (message.content or "") for message in memory.messages)
+    assert all(message.is_valid_provider_message() for message in memory.messages)
+    validate_tool_call_protocol([message.as_chat_message() for message in memory.messages])
 
 
 def test_controller_persists_verifying_and_failed_scheduled_check_before_abort() -> None:

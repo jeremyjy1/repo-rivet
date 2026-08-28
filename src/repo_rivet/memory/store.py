@@ -72,7 +72,9 @@ class MemoryStore:
             memory.status = normalized_status
         memory_payload = memory.model_dump(mode="json")
         memory_payload["messages"] = [
-            message.model_dump(mode="json") for message in memory.messages if not message.ephemeral
+            message.model_dump(mode="json")
+            for message in memory.messages
+            if not message.ephemeral and message.is_valid_durable_message()
         ]
         payload = {
             "memory": memory_payload,

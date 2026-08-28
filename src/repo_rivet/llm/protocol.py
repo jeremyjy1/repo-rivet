@@ -37,6 +37,16 @@ def validate_tool_call_protocol(messages: list[dict[str, Any]]) -> None:
             calls = message.get("tool_calls") or []
             if not isinstance(calls, list):
                 raise InvalidConversationHistory(f"message {index} has invalid tool_calls")
+            content = message.get("content")
+            reasoning_content = message.get("reasoning_content")
+            if (
+                not calls
+                and (not isinstance(content, str) or not content.strip())
+                and (not isinstance(reasoning_content, str) or not reasoning_content.strip())
+            ):
+                raise InvalidConversationHistory(
+                    f"message {index} has neither assistant content nor tool calls"
+                )
             for raw_call in calls:
                 if not isinstance(raw_call, dict):
                     raise InvalidConversationHistory(f"message {index} has an invalid tool call")

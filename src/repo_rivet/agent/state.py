@@ -62,22 +62,40 @@ class SessionState:
     reflection_required: bool = False
     pending_decision: ReasoningEvent | None = None
 
-    def record_model_response(self, response: ModelResponse) -> None:
+    def record_model_response(self, response: ModelResponse) -> bool:
         """Advance one model step and track unusable empty responses."""
         self.step_count += 1
         if response.finish_reason == "length" and not response.tool_calls:
             self.consecutive_length_responses += 1
         else:
             self.consecutive_length_responses = 0
-        if (
-            response.finish_reason == "length"
-            or response.tool_calls
+        provider_message_usable = bool(
+            response.tool_calls
             or (response.content and response.content.strip())
-        ):
+            or (
+                response.finish_reason == "length"
+                and response.reasoning_content
+                and response.reasoning_content.strip()
+            )
+        )
+        if response.finish_reason == "length" or provider_message_usable:
             self.empty_model_responses = 0
         else:
             self.empty_model_responses += 1
-        self.messages.append(response.as_assistant_message())
+        if provider_message_usable:
+            self.messages.append(response.as_assistant_message())
+            return True
+        if response.finish_reason != "length":
+            self.messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "The previous model response was empty. Return valid text or a valid "
+                        "function tool call."
+                    ),
+                }
+            )
+        return False
 
     def record_model_error(self, error: str) -> None:
         """Record an unusable model response and request a corrected response."""
