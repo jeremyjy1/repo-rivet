@@ -9,7 +9,7 @@ from typing import Any
 from uuid import uuid4
 
 from repo_rivet.editing.snapshot_store import SnapshotStore
-from repo_rivet.memory.models import MemoryState, add_unique
+from repo_rivet.memory.models import MemoryState, Message, add_unique
 from repo_rivet.storage.atomic_write import atomic_write_json
 from repo_rivet.storage.event_logger import EventLogger
 from repo_rivet.tools.base import ToolCall, ToolResult
@@ -173,8 +173,6 @@ class MemoryStore:
         started: dict[str, str] = {}
         event_started: set[str] = set()
         event_finished: set[str] = set()
-        message_finished: set[str] = set()
-        assistant_call_ids: set[str] = set()
         for message in memory.messages:
             if message.role == "assistant" and message.tool_calls:
                 for call in message.tool_calls:
@@ -184,9 +182,6 @@ class MemoryStore:
                     function = call.get("function", {})
                     name = function.get("name") if isinstance(function, dict) else None
                     started.setdefault(call_id, str(name or "unknown tool"))
-                    assistant_call_ids.add(call_id)
-            elif message.role == "tool" and message.tool_call_id:
-                message_finished.add(message.tool_call_id)
 
         if self.events_path.exists():
             try:
@@ -214,48 +209,37 @@ class MemoryStore:
             except OSError as error:
                 raise ValueError(f"Could not inspect session events: {error}") from None
 
-        missing_results = [
-            call_id for call_id in assistant_call_ids if call_id not in message_finished
-        ]
+        def interruption_error(call_id: str, name: str) -> str:
+            if name == "record_decision":
+                return (
+                    "Decision metadata may already be checkpointed; this meta tool has no local "
+                    "side effects and was not repeated."
+                )
+            if call_id in event_finished:
+                return "Tool completed, but its result was not checkpointed before interruption."
+            if call_id in event_started:
+                return (
+                    "Tool call was interrupted before a result was checkpointed; side effects "
+                    "are unknown and it was not retried."
+                )
+            return "Tool call was not started before interruption and was not retried."
+
+        missing, orphan_results = memory.repair_interrupted_tool_history(
+            error_for=interruption_error
+        )
+        for call_id, name in missing:
+            started.setdefault(call_id, name)
+        missing_results = [call_id for call_id, _ in missing]
         uncertain = [
             call_id
             for call_id in event_started
             if call_id not in event_finished and started.get(call_id) != "record_decision"
         ]
-        if not missing_results and not uncertain:
+        if not missing_results and not uncertain and not orphan_results:
             return []
         affected = list(dict.fromkeys([*missing_results, *uncertain]))
         descriptions = [f"{started[call_id]} ({call_id})" for call_id in affected]
-        from repo_rivet.memory.models import Message
-
-        for call_id in missing_results:
-            if started.get(call_id) == "record_decision":
-                error = (
-                    "Decision metadata may already be checkpointed; this meta tool has no local "
-                    "side effects and was not repeated."
-                )
-            elif call_id in event_finished:
-                error = "Tool completed, but its result was not checkpointed before interruption."
-            elif call_id in event_started:
-                error = (
-                    "Tool call was interrupted before a result was checkpointed; side effects "
-                    "are unknown and it was not retried."
-                )
-            else:
-                error = "Tool call was not started before interruption and was not retried."
-            memory.messages.append(
-                Message(
-                    role="tool",
-                    tool_call_id=call_id,
-                    content=json.dumps(
-                        {
-                            "ok": False,
-                            "error": error,
-                        },
-                        ensure_ascii=False,
-                    ),
-                )
-            )
+        descriptions.extend(f"orphan tool result ({call_id})" for call_id in orphan_results)
         possible_side_effects = any(
             started.get(call_id) != "record_decision" for call_id in affected
         )
@@ -275,6 +259,8 @@ class MemoryStore:
         already_recorded = any(
             message.role == "system" and message.content == warning for message in memory.messages
         )
+        if already_recorded and not missing and not orphan_results:
+            return []
         if not already_recorded:
             memory.messages.append(Message(role="system", content=warning))
         add_unique(memory.working.unresolved_errors, warning, limit=20)

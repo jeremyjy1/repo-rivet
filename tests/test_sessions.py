@@ -9,6 +9,7 @@ import pytest
 from rich.console import Console
 
 from repo_rivet.cli import cli
+from repo_rivet.llm.protocol import validate_tool_call_protocol
 from repo_rivet.memory.context_manager import SYSTEM_PROMPT
 from repo_rivet.memory.models import Message
 from repo_rivet.session.errors import (
@@ -296,6 +297,42 @@ def test_interrupted_assistant_tool_group_receives_synthetic_results(tmp_path: P
     assert result.tool_call_id == "write-1"
     assert "not retried" in (result.content or "")
     assert loaded.memory.messages[-1].role == "system"
+
+
+def test_interrupted_tool_group_is_repaired_in_place_after_following_messages(
+    tmp_path: Path,
+) -> None:
+    manager = make_store(tmp_path)
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    loaded = manager.create(workspace=workspace)
+    loaded.memory.messages.extend(
+        [
+            Message(
+                role="assistant",
+                tool_calls=[
+                    {
+                        "id": "write-1",
+                        "type": "function",
+                        "function": {"name": "write_file", "arguments": "{}"},
+                    }
+                ],
+            ),
+            Message(role="user", content="continue after interruption"),
+            Message(role="tool", tool_call_id="write-1", content='{"ok": true}'),
+        ]
+    )
+
+    repairs = loaded.store.reconcile_interrupted_tool_calls(loaded.memory)
+
+    validate_tool_call_protocol([message.as_chat_message() for message in loaded.memory.messages])
+    assert repairs == ["write_file (write-1)", "orphan tool result (write-1)"]
+    assert [message.role for message in loaded.memory.messages[:3]] == [
+        "assistant",
+        "tool",
+        "user",
+    ]
+    assert "interrupted_tool_call" in (loaded.memory.messages[1].content or "")
 
 
 def test_repair_truncates_only_invalid_final_event_and_keeps_backup(tmp_path: Path) -> None:

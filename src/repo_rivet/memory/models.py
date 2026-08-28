@@ -1,6 +1,7 @@
 """Typed fixed, working, summary, file, and command memory models."""
 
 import json
+from collections.abc import Callable
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -322,6 +323,89 @@ class MemoryState(BaseModel):
             message for message in self.messages if message.is_valid_provider_message()
         ]
         return before - len(self.messages)
+
+    def repair_interrupted_tool_history(
+        self,
+        *,
+        error_for: Callable[[str, str], str] | None = None,
+    ) -> tuple[list[tuple[str, str]], list[str]]:
+        """Close unfinished tool groups in place and discard orphan tool results."""
+        repaired: list[Message] = []
+        pending: dict[str, str] = {}
+        pending_step = 0
+        missing: list[tuple[str, str]] = []
+        orphan_results: list[str] = []
+        seen_call_ids: set[str] = set()
+
+        def close_pending() -> None:
+            for call_id, name in pending.items():
+                error = (
+                    error_for(call_id, name)
+                    if error_for is not None
+                    else (
+                        "The previous run ended before this tool result was recorded. "
+                        "The tool was not retried automatically."
+                    )
+                )
+                repaired.append(
+                    Message(
+                        role="tool",
+                        tool_call_id=call_id,
+                        content=json.dumps(
+                            {
+                                "ok": False,
+                                "error": error,
+                                "error_code": "interrupted_tool_call",
+                            },
+                            ensure_ascii=False,
+                        ),
+                        step=pending_step,
+                    )
+                )
+                missing.append((call_id, name))
+            pending.clear()
+
+        for message in self.messages:
+            if pending:
+                if message.role == "tool":
+                    call_id = message.tool_call_id
+                    if isinstance(call_id, str) and call_id in pending:
+                        repaired.append(message)
+                        del pending[call_id]
+                    else:
+                        orphan_results.append(str(call_id or "missing"))
+                    continue
+                close_pending()
+
+            if message.role == "assistant" and message.tool_calls:
+                valid_calls: list[dict[str, Any]] = []
+                for raw_call in message.tool_calls:
+                    if not isinstance(raw_call, dict):
+                        continue
+                    call_id = raw_call.get("id")
+                    function = raw_call.get("function")
+                    name = function.get("name") if isinstance(function, dict) else None
+                    if not isinstance(call_id, str) or not call_id or call_id in seen_call_ids:
+                        continue
+                    valid_calls.append(raw_call)
+                    pending[call_id] = str(name or "unknown tool")
+                    seen_call_ids.add(call_id)
+                if valid_calls:
+                    repaired.append(message.model_copy(update={"tool_calls": valid_calls}))
+                    pending_step = message.step
+                elif message.content and message.content.strip():
+                    repaired.append(message.model_copy(update={"tool_calls": None}))
+                continue
+
+            if message.role == "tool":
+                orphan_results.append(str(message.tool_call_id or "missing"))
+                continue
+            repaired.append(message)
+
+        if pending:
+            close_pending()
+        self.messages[:] = repaired
+        return missing, orphan_results
 
     def append_assistant(
         self,

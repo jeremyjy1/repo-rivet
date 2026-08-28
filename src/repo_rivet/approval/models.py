@@ -2,7 +2,7 @@
 
 from datetime import UTC, datetime
 from enum import IntEnum, StrEnum
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -81,6 +81,9 @@ class ApprovalRequest(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     fingerprint: str
     assessment: RiskAssessment
+    task_summary: str = ""
+    deterministic_effects: set[str] = Field(default_factory=set)
+    available_constraints: set[str] = Field(default_factory=set)
 
 
 class ApprovalDecision(BaseModel):
@@ -93,7 +96,7 @@ class ApprovalDecision(BaseModel):
     request_fingerprint: str
     scope: ApprovalScope = ApprovalScope.ONCE
     expires_at: datetime | None = None
-    llm_confidence: float | None = Field(default=None, ge=0, le=1)
+    constraints: list[str] = Field(default_factory=list)
     abort_agent: bool = False
     guidance: str | None = Field(default=None, min_length=1, max_length=1_000)
 
@@ -121,11 +124,26 @@ class ApprovalGrant(BaseModel):
         return self
 
 
+ReviewEffect = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")]
+ReviewFact = Annotated[str, Field(min_length=1, max_length=300)]
+
+
 class LLMReviewResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    decision: Literal["allow", "ask", "deny"]
-    risk_level: RiskLevel
-    confidence: float = Field(ge=0, le=1)
-    reason: str
-    conditions: list[str] = Field(default_factory=list)
+    recommendation: Literal["allow", "ask", "deny"]
+    risk_level: Literal["safe", "low", "medium", "high", "critical"]
+    task_relevance: Literal["required", "helpful", "unrelated", "uncertain"]
+    recognized_effects: list[ReviewEffect] = Field(max_length=50)
+    unknowns: list[ReviewFact] = Field(default_factory=list, max_length=20)
+    required_constraints: list[ReviewEffect] = Field(default_factory=list, max_length=20)
+    reason: str = Field(min_length=1, max_length=400)
+    user_prompt: str | None = Field(default=None, max_length=300)
+
+    @model_validator(mode="after")
+    def validate_user_prompt(self) -> "LLMReviewResult":
+        if self.recommendation == "ask" and not self.user_prompt:
+            raise ValueError("user_prompt is required when recommendation is ask")
+        if self.recommendation != "ask" and self.user_prompt is not None:
+            raise ValueError("user_prompt must be null unless recommendation is ask")
+        return self

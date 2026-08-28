@@ -141,10 +141,24 @@ class TerminalHumanApprover:
         if llm_review is not None:
             review = Text()
             review.append(
-                f"{llm_review.decision.upper()} · confidence {llm_review.confidence:.2f}\n",
+                f"{llm_review.recommendation.upper()} · "
+                f"risk {llm_review.risk_level} · "
+                f"relevance {llm_review.task_relevance}\n",
                 style="bold",
             )
-            review.append(llm_review.reason)
+            review.append(_display_value(llm_review.reason))
+            if llm_review.recognized_effects:
+                review.append("\nEffects: ")
+                review.append(_display_value(llm_review.recognized_effects))
+            if llm_review.unknowns:
+                review.append("\nUnknowns: ", style="yellow")
+                review.append("; ".join(_display_value(item) for item in llm_review.unknowns))
+            if llm_review.required_constraints:
+                review.append("\nConstraints: ")
+                review.append(_display_value(llm_review.required_constraints))
+            if llm_review.user_prompt:
+                review.append("\nApproval question: ", style="bold yellow")
+                review.append(_display_value(llm_review.user_prompt))
             sections.extend((Text("\nLLM review", style="bold"), review))
 
         options = Table.grid(padding=(0, 2))

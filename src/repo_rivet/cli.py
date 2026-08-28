@@ -714,7 +714,6 @@ def _build_approval_engine(
         ),
         human_approver=human_approver,
         llm_reviewer=llm_reviewer,
-        minimum_llm_confidence=config.approval.llm.minimum_confidence,
         max_llm_risk=risk_levels[config.approval.llm.max_auto_approve_risk],
         event_logger=event_logger,
     )

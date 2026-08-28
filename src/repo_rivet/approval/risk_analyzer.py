@@ -3,6 +3,11 @@
 from pathlib import Path
 
 from repo_rivet.approval.models import ApprovalRequest, Capability, RiskAssessment, RiskLevel
+from repo_rivet.approval.review_context import (
+    attach_review_facts,
+    command_effect_paths,
+    command_effects,
+)
 from repo_rivet.approval.safe_rules import is_obviously_safe
 
 _SENSITIVE_NAMES = frozenset(
@@ -37,6 +42,25 @@ class RiskAnalyzer:
         if outside_paths:
             capabilities.add(Capability.OUTSIDE_WORKSPACE)
             reasons.append("requested path resolves outside the configured workspace")
+
+        if request.tool_name in {"run_command", "run_verification"}:
+            semantic_effects = command_effects(request)
+            if "filesystem_read" in semantic_effects:
+                capabilities.add(Capability.FILESYSTEM_READ)
+            if "filesystem_write" in semantic_effects:
+                capabilities.add(Capability.FILESYSTEM_WRITE)
+            command_read_paths, command_write_paths = command_effect_paths(request)
+            affected_paths.extend(
+                path
+                for path in [*command_read_paths, *command_write_paths]
+                if path not in affected_paths
+            )
+            workspace = Path(request.workspace)
+            if any(not Path(path).is_relative_to(workspace) for path in command_write_paths):
+                capabilities.add(Capability.OUTSIDE_WORKSPACE)
+                reasons.append("command writes to a path outside the configured workspace")
+            elif any(not Path(path).is_relative_to(workspace) for path in command_read_paths):
+                reasons.append("command reads a path outside the configured workspace")
 
         sensitive_paths = [path for path in affected_paths if _is_sensitive_path(path)]
         if sensitive_paths and Capability.FILESYSTEM_READ in capabilities:
@@ -74,6 +98,7 @@ class RiskAnalyzer:
         )
         request.assessment = assessment
         assessment.obviously_safe = is_obviously_safe(request)
+        attach_review_facts(request)
         return assessment
 
     @staticmethod

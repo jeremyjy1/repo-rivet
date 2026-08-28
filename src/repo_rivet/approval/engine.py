@@ -18,6 +18,10 @@ from repo_rivet.approval.models import (
     RiskLevel,
 )
 from repo_rivet.approval.normalizer import RequestNormalizer
+from repo_rivet.approval.review_context import (
+    AUTO_APPROVAL_BLOCKING_EFFECTS,
+    IMPORTANT_EFFECTS,
+)
 from repo_rivet.approval.risk_analyzer import RiskAnalyzer
 
 
@@ -44,7 +48,6 @@ class ApprovalEngine:
         grant_store: ApprovalGrantStore,
         human_approver: HumanApprover,
         llm_reviewer: LLMApprovalReviewer | None = None,
-        minimum_llm_confidence: float = 0.90,
         max_llm_risk: RiskLevel = RiskLevel.MEDIUM,
         event_logger: EventSink | None = None,
     ) -> None:
@@ -55,7 +58,6 @@ class ApprovalEngine:
         self.grant_store = grant_store
         self.human_approver = human_approver
         self.llm_reviewer = llm_reviewer
-        self.minimum_llm_confidence = minimum_llm_confidence
         self.max_llm_risk = max_llm_risk
         self.event_logger = event_logger
         self.sync_memory_rule()
@@ -107,6 +109,7 @@ class ApprovalEngine:
             session_id=session_id,
             declared_capabilities=capabilities,
         )
+        request.task_summary = self._task_summary()
         self.risk_analyzer.assess(request)
         self._log_request(request)
 
@@ -231,19 +234,20 @@ class ApprovalEngine:
         )
 
     def _review_with_llm_or_human(self, request: ApprovalRequest) -> ApprovalDecision:
-        if request.assessment.level > self.max_llm_risk or self.llm_reviewer is None:
+        if self.llm_reviewer is None:
             return self.human_approver.ask(request)
         try:
             review = self.llm_reviewer.review(request)
         except Exception:
             review = None
+        self._log_review(request, review)
         if review is not None and self._accept_llm_approval(request, review):
             return self._decision(
                 request,
                 action=ApprovalAction.ALLOW,
                 source="llm_reviewer",
                 reason=review.reason,
-                llm_confidence=review.confidence,
+                constraints=review.required_constraints,
             )
         return self.human_approver.ask(request, llm_review=review)
 
@@ -252,19 +256,23 @@ class ApprovalEngine:
         request: ApprovalRequest,
         review: LLMReviewResult,
     ) -> bool:
-        forbidden = {
-            Capability.GIT_HISTORY_REWRITE,
-            Capability.OUTSIDE_WORKSPACE,
-            Capability.PRIVILEGE_ESCALATION,
-            Capability.SECRET_READ,
-        }
-        return (
-            review.decision == "allow"
-            and review.confidence >= self.minimum_llm_confidence
-            and request.assessment.level <= self.max_llm_risk
-            and review.risk_level <= self.max_llm_risk
-            and not request.assessment.capabilities & forbidden
-        )
+        if review.recommendation != "allow":
+            return False
+        if review.task_relevance not in {"required", "helpful"} or review.unknowns:
+            return False
+        review_risk = RiskLevel[review.risk_level.upper()]
+        if request.assessment.level > self.max_llm_risk or review_risk > self.max_llm_risk:
+            return False
+
+        deterministic_important = request.deterministic_effects & IMPORTANT_EFFECTS
+        recognized = set(review.recognized_effects)
+        if request.deterministic_effects & AUTO_APPROVAL_BLOCKING_EFFECTS:
+            return False
+        if not deterministic_important <= recognized:
+            return False
+        if (recognized & IMPORTANT_EFFECTS) - request.deterministic_effects:
+            return False
+        return set(review.required_constraints) <= request.available_constraints
 
     @staticmethod
     def _decision(
@@ -274,7 +282,7 @@ class ApprovalEngine:
         source: str,
         reason: str,
         scope: ApprovalScope = ApprovalScope.ONCE,
-        llm_confidence: float | None = None,
+        constraints: list[str] | None = None,
         guidance: str | None = None,
     ) -> ApprovalDecision:
         return ApprovalDecision(
@@ -284,9 +292,19 @@ class ApprovalEngine:
             risk_level=request.assessment.level,
             request_fingerprint=request.fingerprint,
             scope=scope,
-            llm_confidence=llm_confidence,
+            constraints=constraints or [],
             guidance=guidance,
         )
+
+    def _task_summary(self) -> str:
+        memory = self.grant_store.memory
+        if memory.working.current_focus:
+            return memory.working.current_focus
+        if memory.task_updates:
+            return memory.task_updates[-1]
+        if memory.fixed is not None:
+            return memory.fixed.original_task
+        return ""
 
     def _log_request(self, request: ApprovalRequest) -> None:
         self._log(
@@ -314,11 +332,39 @@ class ApprovalEngine:
             source=decision.source,
             reason=decision.reason,
             risk=decision.risk_level.name.lower(),
-            confidence=decision.llm_confidence,
+            constraints=decision.constraints,
             scope=decision.scope.value,
             abort_agent=decision.abort_agent,
             guidance=decision.guidance,
             **self._request_details(request),
+        )
+
+    def _log_review(
+        self,
+        request: ApprovalRequest,
+        review: LLMReviewResult | None,
+    ) -> None:
+        if review is None:
+            self._log(
+                "llm_approval_review_failed",
+                request_id=request.request_id,
+                tool=request.tool_name,
+                fingerprint=request.fingerprint,
+            )
+            return
+        self._log(
+            "llm_approval_reviewed",
+            request_id=request.request_id,
+            tool=request.tool_name,
+            fingerprint=request.fingerprint,
+            recommendation=review.recommendation,
+            risk=review.risk_level,
+            task_relevance=review.task_relevance,
+            recognized_effects=review.recognized_effects,
+            unknowns=review.unknowns,
+            required_constraints=review.required_constraints,
+            reason=review.reason,
+            user_prompt=review.user_prompt,
         )
 
     @staticmethod

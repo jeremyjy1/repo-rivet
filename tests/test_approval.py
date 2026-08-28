@@ -1,3 +1,4 @@
+import json
 import sys
 from io import StringIO
 from pathlib import Path
@@ -24,6 +25,7 @@ from repo_rivet.approval.models import (
     RiskLevel,
 )
 from repo_rivet.approval.normalizer import RequestNormalizer
+from repo_rivet.approval.review_context import build_review_payload
 from repo_rivet.approval.risk_analyzer import RiskAnalyzer
 from repo_rivet.config import ApiConfig
 from repo_rivet.memory.models import MemoryState
@@ -322,14 +324,17 @@ def test_verification_approval_reviews_the_registered_concrete_command(tmp_path:
     assert command["args"] == ["-c", "print('ok')"]
 
 
-def test_llm_auto_accepts_high_confidence_medium_risk_review(tmp_path: Path) -> None:
+def test_llm_auto_accepts_complete_medium_risk_review(tmp_path: Path) -> None:
     human = FakeHumanApprover(action=ApprovalAction.DENY)
     reviewer = FakeReviewer(
         LLMReviewResult(
-            decision="allow",
-            risk_level=RiskLevel.MEDIUM,
-            confidence=0.95,
+            recommendation="allow",
+            risk_level="medium",
+            task_relevance="required",
+            recognized_effects=["process_execution", "execute_project_code"],
+            required_constraints=["shell_free_argv", "timeout_60", "workspace_cwd"],
             reason="bounded test command",
+            user_prompt=None,
         )
     )
     engine, _ = create_engine(
@@ -348,8 +353,50 @@ def test_llm_auto_accepts_high_confidence_medium_risk_review(tmp_path: Path) -> 
 
     assert outcome.decision.action == ApprovalAction.ALLOW
     assert outcome.decision.source == "llm_reviewer"
+    assert outcome.decision.constraints == [
+        "shell_free_argv",
+        "timeout_60",
+        "workspace_cwd",
+    ]
     assert len(reviewer.requests) == 1
     assert human.requests == []
+
+
+def test_llm_review_audit_event_records_facts_without_confidence(tmp_path: Path) -> None:
+    reviewer = FakeReviewer(
+        LLMReviewResult(
+            recommendation="allow",
+            risk_level="medium",
+            task_relevance="helpful",
+            recognized_effects=["process_execution", "execute_project_code"],
+            required_constraints=["shell_free_argv"],
+            reason="The test command is relevant and bounded.",
+            user_prompt=None,
+        )
+    )
+    engine, _ = create_engine(
+        tmp_path,
+        mode=ApprovalMode.LLM_AUTO,
+        reviewer=reviewer,
+    )
+    events = EventCollector()
+    engine.event_logger = events
+
+    engine.authorize(
+        tool_name="run_command",
+        arguments={"command": "pytest -q", "cwd": ".", "timeout_seconds": 60},
+        capabilities={Capability.PROCESS_EXECUTE},
+        session_id=engine.session_id,
+    )
+
+    review_event = next(data for event, data in events.events if event == "llm_approval_reviewed")
+    assert review_event["recommendation"] == "allow"
+    assert review_event["task_relevance"] == "helpful"
+    assert review_event["recognized_effects"] == [
+        "process_execution",
+        "execute_project_code",
+    ]
+    assert "confidence" not in review_event
 
 
 def test_invalid_or_unavailable_llm_review_falls_back_to_human(tmp_path: Path) -> None:
@@ -426,14 +473,60 @@ def test_openai_reviewer_treats_invalid_json_as_failure() -> None:
     assert reviewer.review(request) is None
 
 
+def test_openai_reviewer_rejects_legacy_confidence_schema() -> None:
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content=json.dumps(
+                        {
+                            "decision": "allow",
+                            "risk_level": 2,
+                            "confidence": 0.99,
+                            "reason": "legacy output",
+                            "conditions": [],
+                        }
+                    )
+                )
+            )
+        ]
+    )
+    client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **_: response))
+    )
+    reviewer = OpenAIApprovalReviewer(
+        ApiConfig(
+            api_key="test-secret",
+            base_url="https://example.com/v1",
+            model="reviewer",
+            context_window_tokens=8_192,
+        ),
+        client=client,
+    )
+    request = ApprovalRequest(
+        request_id="request",
+        session_id="session",
+        tool_name="run_command",
+        arguments={},
+        normalized_arguments={},
+        workspace="/workspace",
+        fingerprint="fingerprint",
+        assessment={"level": RiskLevel.MEDIUM},
+    )
+
+    assert reviewer.review(request) is None
+
+
 def test_llm_cannot_auto_approve_high_risk_network_command(tmp_path: Path) -> None:
     human = FakeHumanApprover(action=ApprovalAction.DENY)
     reviewer = FakeReviewer(
         LLMReviewResult(
-            decision="allow",
-            risk_level=RiskLevel.LOW,
-            confidence=1,
+            recommendation="allow",
+            risk_level="low",
+            task_relevance="required",
+            recognized_effects=["process_execution", "network_access"],
             reason="unsafe optimistic review",
+            user_prompt=None,
         )
     )
     engine, _ = create_engine(
@@ -452,8 +545,327 @@ def test_llm_cannot_auto_approve_high_risk_network_command(tmp_path: Path) -> No
 
     assert outcome.request.assessment.level == RiskLevel.HIGH
     assert outcome.decision.action == ApprovalAction.DENY
-    assert reviewer.requests == []
+    assert len(reviewer.requests) == 1
     assert len(human.requests) == 1
+    assert human.llm_reviews == [reviewer.result]
+
+
+def test_hard_policy_denial_never_calls_llm_reviewer(tmp_path: Path) -> None:
+    reviewer = FakeReviewer(None)
+    engine, _ = create_engine(
+        tmp_path,
+        mode=ApprovalMode.LLM_AUTO,
+        reviewer=reviewer,
+    )
+
+    outcome = engine.authorize(
+        tool_name="run_command",
+        arguments={"command": "sudo pytest", "cwd": "."},
+        capabilities={Capability.PROCESS_EXECUTE},
+        session_id=engine.session_id,
+    )
+
+    assert outcome.decision.action == ApprovalAction.DENY
+    assert outcome.decision.source == "hard_policy"
+    assert reviewer.requests == []
+
+
+def test_compiler_output_outside_workspace_is_hard_denied_before_llm(tmp_path: Path) -> None:
+    reviewer = FakeReviewer(None)
+    engine, _ = create_engine(
+        tmp_path,
+        mode=ApprovalMode.LLM_AUTO,
+        reviewer=reviewer,
+    )
+
+    outcome = engine.authorize(
+        tool_name="run_command",
+        arguments={
+            "command": "g++ main.cpp -o ../app",
+            "cwd": ".",
+            "timeout_seconds": 60,
+        },
+        capabilities={Capability.PROCESS_EXECUTE},
+        session_id=engine.session_id,
+    )
+
+    assert outcome.decision.source == "hard_policy"
+    assert outcome.decision.action == ApprovalAction.DENY
+    assert Capability.OUTSIDE_WORKSPACE in outcome.request.assessment.capabilities
+    assert reviewer.requests == []
+
+
+def test_llm_deny_is_advice_and_falls_back_to_human(tmp_path: Path) -> None:
+    human = FakeHumanApprover(action=ApprovalAction.ALLOW)
+    reviewer = FakeReviewer(
+        LLMReviewResult(
+            recommendation="deny",
+            risk_level="high",
+            task_relevance="uncertain",
+            recognized_effects=["process_execution", "execute_project_code"],
+            unknowns=["project test behavior is not known"],
+            reason="The command needs a user decision.",
+            user_prompt=None,
+        )
+    )
+    engine, _ = create_engine(
+        tmp_path,
+        mode=ApprovalMode.LLM_AUTO,
+        human=human,
+        reviewer=reviewer,
+    )
+
+    outcome = engine.authorize(
+        tool_name="run_command",
+        arguments={"command": "pytest -q", "cwd": ".", "timeout_seconds": 60},
+        capabilities={Capability.PROCESS_EXECUTE},
+        session_id=engine.session_id,
+    )
+
+    assert outcome.decision.action == ApprovalAction.ALLOW
+    assert outcome.decision.source == "human"
+    assert human.llm_reviews == [reviewer.result]
+
+
+def test_llm_allow_with_missing_effect_coverage_falls_back_to_human(tmp_path: Path) -> None:
+    human = FakeHumanApprover()
+    reviewer = FakeReviewer(
+        LLMReviewResult(
+            recommendation="allow",
+            risk_level="medium",
+            task_relevance="required",
+            recognized_effects=[],
+            reason="The edit appears relevant.",
+            user_prompt=None,
+        )
+    )
+    engine, _ = create_engine(
+        tmp_path,
+        mode=ApprovalMode.LLM_AUTO,
+        human=human,
+        reviewer=reviewer,
+    )
+
+    outcome = engine.authorize(
+        tool_name="write_file",
+        arguments={"path": "new.py", "content": "value = 1\n"},
+        capabilities={Capability.FILESYSTEM_WRITE},
+        session_id=engine.session_id,
+    )
+
+    assert outcome.decision.source == "human"
+    assert outcome.request.deterministic_effects == {"filesystem_write"}
+    assert human.llm_reviews == [reviewer.result]
+
+
+def test_llm_allow_with_unknowns_or_unavailable_constraints_falls_back_to_human(
+    tmp_path: Path,
+) -> None:
+    human = FakeHumanApprover()
+    reviewer = FakeReviewer(
+        LLMReviewResult(
+            recommendation="allow",
+            risk_level="medium",
+            task_relevance="helpful",
+            recognized_effects=["process_execution", "execute_project_code"],
+            unknowns=["test configuration has not been resolved"],
+            required_constraints=["network_isolation"],
+            reason="Important facts remain unknown.",
+            user_prompt=None,
+        )
+    )
+    engine, _ = create_engine(
+        tmp_path,
+        mode=ApprovalMode.LLM_AUTO,
+        human=human,
+        reviewer=reviewer,
+    )
+
+    outcome = engine.authorize(
+        tool_name="run_command",
+        arguments={"command": "pytest -q", "cwd": ".", "timeout_seconds": 60},
+        capabilities={Capability.PROCESS_EXECUTE},
+        session_id=engine.session_id,
+    )
+
+    assert outcome.decision.source == "human"
+    assert "network_isolation" not in outcome.request.available_constraints
+    assert human.llm_reviews == [reviewer.result]
+
+
+def test_git_write_cannot_be_auto_approved_by_llm(tmp_path: Path) -> None:
+    human = FakeHumanApprover()
+    reviewer = FakeReviewer(
+        LLMReviewResult(
+            recommendation="allow",
+            risk_level="medium",
+            task_relevance="required",
+            recognized_effects=["process_execution", "git_write"],
+            reason="The commit is task-related.",
+            user_prompt=None,
+        )
+    )
+    engine, _ = create_engine(
+        tmp_path,
+        mode=ApprovalMode.LLM_AUTO,
+        human=human,
+        reviewer=reviewer,
+    )
+
+    outcome = engine.authorize(
+        tool_name="run_command",
+        arguments={"command": "git add app.py", "cwd": ".", "timeout_seconds": 60},
+        capabilities={Capability.PROCESS_EXECUTE},
+        session_id=engine.session_id,
+    )
+
+    assert "git_write" in outcome.request.deterministic_effects
+    assert outcome.decision.source == "human"
+
+
+def test_review_payload_expands_package_script_as_untrusted_semantic_context(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "package.json").write_text(
+        json.dumps({"scripts": {"test": "vitest run"}}),
+        encoding="utf-8",
+    )
+    human = FakeHumanApprover()
+    engine, _ = create_engine(tmp_path, mode=ApprovalMode.SAFE_AUTO, human=human)
+
+    outcome = engine.authorize(
+        tool_name="run_command",
+        arguments={"command": "npm test", "cwd": ".", "timeout_seconds": 60},
+        capabilities={Capability.PROCESS_EXECUTE},
+        session_id=engine.session_id,
+    )
+
+    payload = build_review_payload(outcome.request)
+    stage = payload["execution_plan"]["stages"][0]
+    assert stage["semantic_context"] == {
+        "script_name": "test",
+        "resolved_script": "vitest run",
+    }
+    assert "execute_project_code" in outcome.request.deterministic_effects
+
+
+def test_package_installation_facts_force_human_review(tmp_path: Path) -> None:
+    human = FakeHumanApprover()
+    reviewer = FakeReviewer(
+        LLMReviewResult(
+            recommendation="allow",
+            risk_level="medium",
+            task_relevance="required",
+            recognized_effects=[
+                "process_execution",
+                "filesystem_write",
+                "network_access",
+                "package_installation",
+            ],
+            reason="Dependencies are required.",
+            user_prompt=None,
+        )
+    )
+    engine, _ = create_engine(
+        tmp_path,
+        mode=ApprovalMode.LLM_AUTO,
+        human=human,
+        reviewer=reviewer,
+    )
+
+    outcome = engine.authorize(
+        tool_name="run_command",
+        arguments={"command": "npm install", "cwd": ".", "timeout_seconds": 60},
+        capabilities={Capability.PROCESS_EXECUTE},
+        session_id=engine.session_id,
+    )
+
+    assert {
+        "network_access",
+        "package_installation",
+        "execute_install_scripts",
+    } <= outcome.request.deterministic_effects
+    assert outcome.decision.source == "human"
+
+
+def test_openai_reviewer_receives_structured_plan_and_no_output_limit(tmp_path: Path) -> None:
+    captured: dict[str, object] = {}
+
+    def create(**arguments: object) -> object:
+        captured.update(arguments)
+        content = {
+            "recommendation": "ask",
+            "risk_level": "medium",
+            "task_relevance": "required",
+            "recognized_effects": [
+                "process_execution",
+                "filesystem_read",
+                "filesystem_write",
+                "compile_workspace_code",
+            ],
+            "unknowns": ["compiler behavior is not sandboxed"],
+            "required_constraints": ["shell_free_argv", "timeout_60"],
+            "reason": "Compilation is relevant but needs confirmation.",
+            "user_prompt": "Allow compilation of quick_sort.cpp into the build directory?",
+        }
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(content)))]
+        )
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    reviewer = OpenAIApprovalReviewer(
+        ApiConfig(
+            api_key="test-secret",
+            base_url="https://example.com/v1",
+            model="reviewer",
+            context_window_tokens=8_192,
+        ),
+        client=client,
+    )
+    human = FakeHumanApprover()
+    memory = MemoryState(session_id="approval-test")
+    memory.start_task(
+        task="implement and verify quick_sort.cpp",
+        workspace=str(tmp_path),
+        system_prompt="system",
+        safety_rules=[],
+        completion_rules=[],
+        max_steps=10,
+    )
+    engine = ApprovalEngine(
+        mode=ApprovalMode.LLM_AUTO,
+        normalizer=RequestNormalizer(tmp_path),
+        risk_analyzer=RiskAnalyzer(),
+        hard_policy=HardSafetyPolicy(),
+        grant_store=ApprovalGrantStore(memory),
+        human_approver=human,
+        llm_reviewer=reviewer,
+    )
+
+    outcome = engine.authorize(
+        tool_name="run_command",
+        arguments={
+            "command": "g++ quick_sort.cpp -o .reporivet/build/quick_sort",
+            "cwd": ".",
+            "timeout_seconds": 60,
+        },
+        capabilities={Capability.PROCESS_EXECUTE},
+        session_id=engine.session_id,
+    )
+
+    assert outcome.decision.source == "human"
+    assert "max_tokens" not in captured
+    messages = captured["messages"]
+    assert isinstance(messages, list)
+    user_payload = json.loads(messages[1]["content"].split("\n", 1)[1])
+    assert user_payload["task"]["summary"] == "implement and verify quick_sort.cpp"
+    assert user_payload["execution_plan"]["stages"][0]["program"] == "g++"
+    assert user_payload["deterministic_effects"]["write_paths"] == [
+        str((tmp_path / ".reporivet/build/quick_sort").resolve())
+    ]
+    assert "filesystem_write" in user_payload["deterministic_effects"]["capabilities"]
+    assert "shell_free_argv" in user_payload["available_constraints"]
+    assert "network_isolation" not in user_payload["available_constraints"]
 
 
 def test_shell_syntax_is_never_obviously_safe(tmp_path: Path) -> None:
@@ -700,6 +1112,38 @@ def test_terminal_command_approval_uses_readable_fields_without_internal_json(
     assert "Timeout" in output and "90 seconds" in output
     assert "Normalized request" not in output
     assert request.fingerprint[:12] not in output
+
+
+def test_terminal_approval_explains_structured_llm_review(tmp_path: Path) -> None:
+    engine, _ = create_engine(tmp_path, mode=ApprovalMode.ALLOW_ALL)
+    request = engine.authorize(
+        tool_name="run_command",
+        arguments={"command": "npm install", "cwd": ".", "timeout_seconds": 60},
+        capabilities={Capability.PROCESS_EXECUTE},
+        session_id=engine.session_id,
+    ).request
+    review = LLMReviewResult(
+        recommendation="ask",
+        risk_level="high",
+        task_relevance="helpful",
+        recognized_effects=["process_execution", "network_access", "package_installation"],
+        unknowns=["third-party install scripts are unknown"],
+        required_constraints=["shell_free_argv", "timeout_60"],
+        reason="Dependency installation has external effects.",
+        user_prompt="Allow network access and third-party install scripts?",
+    )
+    buffer = StringIO()
+    console = Console(file=buffer, force_terminal=False, color_system=None, width=200)
+
+    TerminalHumanApprover(console, reader=lambda _: "1").ask(request, llm_review=review)
+
+    output = buffer.getvalue()
+    assert "ASK · risk high · relevance helpful" in output
+    assert "Effects: process_execution, network_access, package_installation" in output
+    assert "Unknowns: third-party install scripts are unknown" in output
+    assert "Constraints: shell_free_argv, timeout_60" in output
+    assert "Approval question: Allow network access and third-party install scripts?" in output
+    assert "confidence" not in output.lower()
 
 
 def test_terminal_option_five_marks_agent_abort(tmp_path: Path) -> None:

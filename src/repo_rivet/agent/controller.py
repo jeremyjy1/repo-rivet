@@ -106,6 +106,7 @@ class AgentController:
 
         workspace = getattr(self.tool_registry, "workspace", None) or Path.cwd().resolve()
         memory = memory or MemoryState(session_id=f"memory-{uuid4().hex[:8]}")
+        repaired_interrupted_calls = self._repair_interrupted_history(memory)
         repaired_empty_assistant_messages = memory.repair_invalid_assistant_messages()
         memory.begin_task_scope()
         memory.start_task(
@@ -154,6 +155,11 @@ class AgentController:
             self._log(
                 "invalid_history_repaired",
                 removed_empty_assistant_messages=repaired_empty_assistant_messages,
+            )
+        if repaired_interrupted_calls:
+            self._log(
+                "interrupted_history_repaired",
+                calls=repaired_interrupted_calls,
             )
         self._save_memory(memory, state, status=state.status.value)
         try:
@@ -381,7 +387,35 @@ class AgentController:
                         return terminal_result
         except KeyboardInterrupt:
             state.interrupted = True
+            repaired_interrupted_calls = self._repair_interrupted_history(memory)
+            if repaired_interrupted_calls:
+                self._log(
+                    "interrupted_history_repaired",
+                    calls=repaired_interrupted_calls,
+                )
             return self._finish(state, memory, status="stopped", reason="interrupted by user")
+
+    def _repair_interrupted_history(self, memory: MemoryState) -> list[str]:
+        if self.memory_store is not None:
+            return self.memory_store.reconcile_interrupted_tool_calls(memory)
+
+        missing, orphan_results = memory.repair_interrupted_tool_history()
+        descriptions = [f"{name} ({call_id})" for call_id, name in missing]
+        descriptions.extend(f"orphan tool result ({call_id})" for call_id in orphan_results)
+        if not descriptions:
+            return []
+        warning = (
+            "The previous run contained an incomplete tool-call group: "
+            + ", ".join(descriptions)
+            + ". It was closed without retrying any tool. Inspect current state before repeating "
+            "a write or command."
+        )
+        memory.messages.append(Message(role="system", content=warning))
+        if warning not in memory.working.unresolved_errors:
+            memory.working.unresolved_errors.append(warning)
+        if warning not in memory.summary.unresolved_issues:
+            memory.summary.unresolved_issues.append(warning)
+        return descriptions
 
     def _process_tool_turn(
         self,

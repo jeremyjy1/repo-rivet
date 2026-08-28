@@ -97,7 +97,6 @@ class ApprovalLLMConfig(BaseModel):
     enabled: bool = True
     model: str | None = Field(default=None, min_length=1)
     max_auto_approve_risk: str = "medium"
-    minimum_confidence: float = Field(default=0.90, ge=0, le=1)
     timeout_seconds: float = Field(default=10, gt=0, le=120)
 
     @field_validator("max_auto_approve_risk")
@@ -198,7 +197,6 @@ def _apply_approval_environment(raw_config: dict[str, Any]) -> None:
     }
     llm_overrides = {
         "model": os.environ.get("REPORIVET_APPROVAL_LLM_MODEL"),
-        "minimum_confidence": os.environ.get("REPORIVET_APPROVAL_MIN_CONFIDENCE"),
     }
     if not any((*overrides.values(), *llm_overrides.values())):
         return

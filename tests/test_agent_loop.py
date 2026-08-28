@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import cast
 
 from repo_rivet.agent.controller import AgentController
@@ -8,6 +9,7 @@ from repo_rivet.llm.openai_compatible import ModelRequestError
 from repo_rivet.llm.parser import ResponseParseError
 from repo_rivet.llm.protocol import validate_tool_call_protocol
 from repo_rivet.memory.models import MemoryState, Message
+from repo_rivet.memory.store import MemoryStore
 from repo_rivet.tools.base import ToolCall, ToolResult
 from repo_rivet.tools.registry import ToolRegistry
 from repo_rivet.verification.models import ModelErrorRecord
@@ -159,6 +161,78 @@ def test_resume_removes_legacy_empty_assistant_before_request() -> None:
     )
     repair_events = [data for event, data in events.events if event == "invalid_history_repaired"]
     assert repair_events == [{"removed_empty_assistant_messages": 1}]
+
+
+def test_interrupted_tool_call_is_closed_before_same_process_continues(tmp_path: Path) -> None:
+    read = call("interrupted-read", "read_file", {"path": "app.py"})
+    model = FakeModelClient(
+        [
+            ModelResponse(tool_calls=[read]),
+            ModelResponse(content="Continued after the interruption."),
+        ]
+    )
+
+    class InterruptOnceRegistry(FakeToolRegistry):
+        def execute(self, tool_call: ToolCall) -> ToolResult:
+            self.calls.append(tool_call)
+            raise KeyboardInterrupt
+
+    tools = InterruptOnceRegistry([])
+    events = RecordingSink()
+    memory = MemoryState(session_id="same-process-interruption")
+    agent = AgentController(
+        model_client=model,
+        tool_registry=cast(ToolRegistry, tools),
+        event_logger=events,
+        memory_store=MemoryStore(tmp_path / "session"),
+    )
+
+    interrupted = agent.run("inspect app.py", memory=memory)
+    continued = agent.run("continue", memory=memory)
+
+    assert interrupted.status == "stopped"
+    assert interrupted.reason == "interrupted by user"
+    assert continued.status == "success"
+    validate_tool_call_protocol(model.requests[1]["messages"])
+    synthetic = next(
+        message
+        for message in memory.messages
+        if message.role == "tool" and message.tool_call_id == "interrupted-read"
+    )
+    assert "not retried" in (synthetic.content or "")
+    assert any(event == "interrupted_history_repaired" for event, _ in events.events)
+
+
+def test_resume_repairs_tool_result_that_was_appended_after_user_message() -> None:
+    model = FakeModelClient([ModelResponse(content="Recovered the saved conversation.")])
+    tools = FakeToolRegistry([])
+    memory = MemoryState(
+        session_id="misordered-tool-result",
+        messages=[
+            Message(
+                role="assistant",
+                tool_calls=[
+                    {
+                        "id": "write-1",
+                        "type": "function",
+                        "function": {"name": "write_file", "arguments": "{}"},
+                    }
+                ],
+            ),
+            Message(role="user", content="continue after interruption"),
+            Message(role="tool", tool_call_id="write-1", content='{"ok": true}'),
+        ],
+    )
+
+    result = controller(model, tools).run("continue safely", memory=memory)
+
+    assert result.status == "success"
+    validate_tool_call_protocol(model.requests[0]["messages"])
+    roles = [message.role for message in memory.messages[:3]]
+    assert roles == ["assistant", "tool", "user"]
+    repaired_result = memory.messages[1]
+    assert repaired_result.tool_call_id == "write-1"
+    assert "interrupted_tool_call" in (repaired_result.content or "")
 
 
 def test_length_response_without_visible_content_is_not_replayed() -> None:

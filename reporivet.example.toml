@@ -43,8 +43,8 @@ remember_session_denials = true
 [approval.llm]
 enabled = true
 # model = "approval-model"
+# A local gate sends higher-risk allow recommendations to human approval.
 max_auto_approve_risk = "medium"
-minimum_confidence = 0.90
 timeout_seconds = 10
 
 [approval.safety]

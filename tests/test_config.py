@@ -77,7 +77,6 @@ remember_session_approvals = false
 enabled = true
 model = "review-model"
 max_auto_approve_risk = "low"
-minimum_confidence = 0.95
 
 [approval.safety]
 deny_secret_access = false
@@ -96,7 +95,6 @@ max_summary_chars = 600
     assert not config.approval.remember_session_approvals
     assert config.approval.llm.model == "review-model"
     assert config.approval.llm.max_auto_approve_risk == "low"
-    assert config.approval.llm.minimum_confidence == 0.95
     assert not config.approval.safety.deny_secret_access
     assert config.reasoning.display.value == "trace"
     assert config.reasoning.recent_event_limit == 12
