@@ -316,6 +316,26 @@ def test_length_response_without_visible_content_is_not_replayed() -> None:
         or bool((message.get("content") or "").strip() or message.get("tool_calls"))
         for message in model.requests[1]["messages"]
     )
+    assert model.requests[1]["options"].thinking_enabled is False
+
+
+def test_length_response_without_reasoning_restarts_without_partial_content() -> None:
+    model = FakeModelClient(
+        [
+            ModelResponse(content="unfinished private analysis", finish_reason="length"),
+            ModelResponse(content="Recovered from durable facts."),
+        ]
+    )
+
+    result = controller(model, FakeToolRegistry([])).run("continue safely")
+
+    assert result.status == "success"
+    second_messages = model.requests[1]["messages"]
+    assert all(
+        message.get("content") != "unfinished private analysis" for message in second_messages
+    )
+    assert model.requests[1]["options"].thinking_enabled is False
+    assert "without returning replayable reasoning state" in second_messages[-1]["content"]
 
 
 def test_agent_automatically_runs_registered_checks_before_finishing() -> None:
@@ -854,12 +874,18 @@ def test_missing_durable_reasoning_for_tool_history_disables_thinking_on_resume(
             Message(role="tool", tool_call_id="old-call", content="{}"),
         ],
     )
-    model = FakeModelClient([ModelResponse(content="Resumed safely.")])
+    model = FakeModelClient(
+        [
+            ModelResponse(content="unfinished recovery", finish_reason="length"),
+            ModelResponse(content="Resumed safely."),
+        ]
+    )
 
     result = controller(model, FakeToolRegistry([])).run("continue", memory=memory)
 
     assert result.status == "success"
     assert model.requests[0]["options"].thinking_enabled is False
+    assert model.requests[1]["options"].thinking_enabled is False
 
 
 def test_agent_stops_repeated_identical_tool_calls() -> None:
@@ -875,6 +901,40 @@ def test_agent_stops_repeated_identical_tool_calls() -> None:
     assert result.tool_call_count == 3
 
 
+def test_agent_renews_step_checkpoint_once_for_observed_progress() -> None:
+    read = call("read", "read_file", {"path": "app.py"})
+    model = FakeModelClient(
+        [
+            ModelResponse(tool_calls=[read]),
+            ResponseParseError("invalid response 1"),
+            ResponseParseError("invalid response 2"),
+            ResponseParseError("invalid response 3"),
+        ]
+    )
+    tools = FakeToolRegistry([ToolResult(ok=True, output="value = 1")])
+    events = RecordingSink()
+    termination = TerminationPolicy(TerminationConfig(max_steps=2, max_empty_model_responses=10))
+
+    result = controller(
+        model,
+        tools,
+        termination=termination,
+        event_logger=events,
+    ).run("inspect and continue")
+
+    assert result.status == "stopped"
+    assert result.step_count == 4
+    assert "no meaningful progress" in (result.reason or "")
+    renewals = [data for name, data in events.events if name == "agent_step_checkpoint_renewed"]
+    assert renewals == [
+        {
+            "previous_checkpoint": 2,
+            "next_checkpoint": 4,
+            "progress_revision": 1,
+        }
+    ]
+
+
 def test_agent_recovers_from_invalid_model_response() -> None:
     model = FakeModelClient(
         [ResponseParseError("bad tool JSON"), ModelResponse(content="Recovered.")]
@@ -888,6 +948,44 @@ def test_agent_recovers_from_invalid_model_response() -> None:
     assert any(
         "bad tool JSON" in message.get("content", "") for message in model.requests[1]["messages"]
     )
+
+
+def test_agent_replaces_truncated_whole_file_edit_with_bounded_recovery() -> None:
+    parse_error = ResponseParseError(
+        "Tool call edit_file contains invalid JSON arguments: Unterminated string",
+        code="invalid_tool_arguments_json",
+        tool_name="edit_file",
+        argument_chars=27_952,
+    )
+    model = FakeModelClient(
+        [
+            ModelResponse(tool_calls=[decision("decision", "edit_file")]),
+            parse_error,
+            ModelResponse(content="Stopped before applying the malformed edit."),
+        ]
+    )
+    events = RecordingSink()
+
+    result = controller(
+        model,
+        FakeToolRegistry([]),
+        event_logger=events,
+    ).run("refactor the file")
+
+    assert result.status == "success"
+    recovery_messages = model.requests[2]["messages"]
+    recovery = next(
+        str(message.get("content", ""))
+        for message in reversed(recovery_messages)
+        if message.get("role") == "system"
+        and "whole-file payload" in str(message.get("content", ""))
+    )
+    assert "snapshot-bound edit_file operation" in recovery
+    assert "previous oversized edit decision has been cancelled" in recovery
+    invalid_event = next(data for name, data in events.events if name == "model_response_invalid")
+    assert invalid_event["recovery"] == "bounded_edit"
+    assert invalid_event["pending_decision_cancelled"] is True
+    assert invalid_event["argument_chars"] == 27_952
 
 
 def test_agent_returns_error_after_model_client_retries_fail() -> None:

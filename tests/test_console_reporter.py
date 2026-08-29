@@ -69,6 +69,34 @@ def test_console_reporter_shows_transient_status_while_model_generates(
     assert buffer.getvalue() == ""
 
 
+def test_console_reporter_shows_approval_model_review_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    buffer = StringIO()
+    console = Console(file=buffer, force_terminal=False, color_system=None, width=240)
+    reporter = ConsoleEventReporter(console)
+    status = RecordingStatus()
+    captured: dict[str, str] = {}
+
+    def create_status(message: str, *, spinner: str) -> RecordingStatus:
+        captured["message"] = message
+        captured["spinner"] = spinner
+        return status
+
+    monkeypatch.setattr(console, "status", create_status)
+
+    reporter.log("llm_approval_review_started", tool="edit_file")
+
+    assert status.started is True
+    assert "Approval model is reviewing edit_file" in captured["message"]
+    assert captured["spinner"] == "dots"
+
+    reporter.log("llm_approval_reviewed", tool="edit_file")
+
+    assert status.stopped is True
+    assert reporter._active_status is None
+
+
 @pytest.mark.parametrize(
     ("tool", "message"),
     [
@@ -197,6 +225,24 @@ def test_console_reporter_shows_controller_owned_plan_progress() -> None:
         "[PLAN 1/2] Update collision handling · completed",
     ]
     assert "plan-hidden" not in buffer.getvalue()
+
+
+def test_console_reporter_announces_automatic_plan_transition() -> None:
+    buffer = StringIO()
+    reporter = ConsoleEventReporter(
+        Console(file=buffer, force_terminal=False, color_system=None, width=240)
+    )
+
+    reporter.log(
+        "auto_plan_started",
+        source="controller",
+        reason="task description declares project-wide scope",
+    )
+
+    assert buffer.getvalue().strip() == (
+        "[PLAN] entered read-only planning (controller) · "
+        "task description declares project-wide scope"
+    )
 
 
 def test_console_reporter_shows_denial_once_without_exposing_inline_secret() -> None:

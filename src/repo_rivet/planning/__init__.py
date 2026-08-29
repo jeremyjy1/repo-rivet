@@ -11,6 +11,7 @@ from repo_rivet.planning.models import (
     PlanStepStatus,
     WorkflowMode,
 )
+from repo_rivet.planning.policy import AutoPlanMode, AutoPlanPolicy
 
 __all__ = [
     "PlanArtifact",
@@ -22,4 +23,6 @@ __all__ = [
     "PlanStepStatus",
     "PlanModeViolation",
     "WorkflowMode",
+    "AutoPlanMode",
+    "AutoPlanPolicy",
 ]

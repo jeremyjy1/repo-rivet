@@ -20,7 +20,7 @@ from repo_rivet.tools.filesystem import (
 )
 from repo_rivet.tools.git import GitDiffTool, GitStatusTool
 from repo_rivet.tools.meta import RecordDecisionTool
-from repo_rivet.tools.planning import SubmitPlanTool, UpdatePlanTool
+from repo_rivet.tools.planning import RequestPlanTool, SubmitPlanTool, UpdatePlanTool
 from repo_rivet.tools.shell import RunCommandTool
 from repo_rivet.tools.verification import RegisterVerificationTool, RunVerificationTool
 from repo_rivet.verification.runtime import VerificationRuntime
@@ -190,6 +190,7 @@ def create_default_registry(
             RegisterVerificationTool(),
             SubmitPlanTool(),
             UpdatePlanTool(),
+            RequestPlanTool(),
             ListFilesTool(path_policy),
             SearchTextTool(path_policy, editing_runtime),
             ReadFileTool(path_policy, editing_runtime),

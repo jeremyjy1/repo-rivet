@@ -657,7 +657,9 @@ class MemoryState(BaseModel):
         return (
             f"Original task (preserve verbatim):\n{self.fixed.original_task}\n\n"
             f"Workspace: {self.fixed.workspace}\n"
-            f"Maximum agent steps per request: {self.fixed.max_steps}\n\n"
+            "Agent progress checkpoint window: "
+            f"{self.fixed.max_steps} model steps. A new window is granted only after "
+            "locally observed progress.\n\n"
             f"Safety rules:\n{safety}\n\n"
             f"Completion rules:\n{completion}"
         )

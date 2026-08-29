@@ -40,6 +40,11 @@ global_enabled = true
 # Optionally select one installed global Skill by default.
 # default_global = "my-team-workflow"
 
+[planning]
+# off, adaptive, or always. Adaptive keeps simple work direct and lets the Controller or model
+# enter read-only Plan Mode for complex work. Generated plans still require user review.
+auto_plan = "adaptive"
+
 [approval]
 # allow-all, llm-auto, safe-auto, or always-ask
 mode = "safe-auto"

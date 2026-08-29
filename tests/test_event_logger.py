@@ -34,6 +34,27 @@ def test_event_logger_redacts_inline_authorization_values(tmp_path: Path) -> Non
     assert "[REDACTED]" in raw_line
 
 
+def test_event_logger_keeps_non_secret_token_and_content_metrics(tmp_path: Path) -> None:
+    log_path = tmp_path / "session.jsonl"
+    logger = EventLogger(log_path)
+
+    logger.log(
+        "model_usage",
+        raw_estimated_prompt_tokens=12_345,
+        completion_tokens=678,
+        content_length=900,
+        access_token="must-not-leak",
+        content="private file contents",
+    )
+
+    data = json.loads(log_path.read_text(encoding="utf-8"))["data"]
+    assert data["raw_estimated_prompt_tokens"] == 12_345
+    assert data["completion_tokens"] == 678
+    assert data["content_length"] == 900
+    assert data["access_token"] == "[REDACTED]"
+    assert data["content"] == "[REDACTED]"
+
+
 def test_create_session_logger_uses_jsonl_file(tmp_path: Path) -> None:
     logger = create_session_logger(tmp_path)
 

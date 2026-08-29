@@ -16,6 +16,7 @@ from pydantic import (
 from pydantic.functional_validators import field_validator
 
 from repo_rivet.approval.models import ApprovalMode, NonInteractivePolicy
+from repo_rivet.planning.policy import AutoPlanMode
 from repo_rivet.reasoning.models import ReasoningConfig
 
 DEFAULT_CONFIG_PATH = Path("reporivet.toml")
@@ -152,6 +153,14 @@ class SkillsConfig(BaseModel):
     default_global: str | None = Field(default=None, min_length=2, max_length=64)
 
 
+class PlanningConfig(BaseModel):
+    """Select whether Controller may enter the read-only planning workflow automatically."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    auto_plan: AutoPlanMode = AutoPlanMode.ADAPTIVE
+
+
 class AppConfig(BaseModel):
     """Top-level RepoRivet configuration."""
 
@@ -162,6 +171,7 @@ class AppConfig(BaseModel):
     approval: ApprovalConfig = Field(default_factory=ApprovalConfig)
     reasoning: ReasoningConfig = Field(default_factory=ReasoningConfig)
     skills: SkillsConfig = Field(default_factory=SkillsConfig)
+    planning: PlanningConfig = Field(default_factory=PlanningConfig)
 
     @model_validator(mode="after")
     def validate_prompt_budget(self) -> "AppConfig":

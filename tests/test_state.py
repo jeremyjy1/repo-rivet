@@ -43,4 +43,26 @@ def test_record_tool_result_tracks_changes_failures_and_repetition() -> None:
     assert state.consecutive_failures == 0
     assert state.modified_files == {"app.py"}
     assert state.workspace_revision == 1
+    assert state.progress_revision == 1
     assert "not found" in state.state_summary()
+
+
+def test_only_new_successful_tool_observations_count_as_progress() -> None:
+    state = SessionState(task="task")
+    read = ToolCall(id="read-1", name="read_file", arguments={"path": "app.py"})
+    result = ToolResult(ok=True, output="value = 1")
+
+    state.record_tool_result(read, result)
+    state.record_tool_result(read, result)
+    state.record_tool_result(
+        ToolCall(id="decision", name="record_decision", arguments={"summary": "read it"}),
+        ToolResult(ok=True, output="recorded"),
+    )
+
+    assert state.progress_revision == 1
+    assert state.made_progress_since_checkpoint
+
+    state.step_count = 30
+    state.renew_step_checkpoint(30)
+    assert state.step_limit == 60
+    assert not state.made_progress_since_checkpoint

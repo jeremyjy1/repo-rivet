@@ -50,6 +50,9 @@ _TOOL_PROGRESS_LABELS = {
 }
 _STATUS_STOP_EVENTS = {
     "approved_tool_executed",
+    "approval_awaiting_human",
+    "llm_approval_review_failed",
+    "llm_approval_reviewed",
     "model_call_finished",
     "session_end",
     "tool_result",
@@ -77,6 +80,9 @@ class ConsoleEventReporter:
 
         if event_type == "model_call":
             self._start_model_status()
+        elif event_type == "llm_approval_review_started":
+            tool = self._safe(data.get("tool", "tool"), limit=80)
+            self._start_status(f"[cyan]Approval model is reviewing {tool}…[/cyan]")
         elif event_type == "approval_decided":
             self._approval_decided(data)
         elif event_type == "approved_tool_started":
@@ -95,6 +101,14 @@ class ConsoleEventReporter:
             self._verification(data)
         elif event_type in {"plan_step_started", "plan_step_finished"}:
             self._plan_step(data)
+        elif event_type == "auto_plan_started":
+            source = self._safe(data.get("source", "controller"), limit=40)
+            reason = self._safe(data.get("reason", "complex task"), limit=300)
+            self._print_trace_label(
+                "PLAN",
+                f"entered read-only planning ({source}) · {reason}",
+                style="bold cyan",
+            )
         elif event_type == "tool_result":
             self._tool_result(data)
 

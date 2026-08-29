@@ -13,9 +13,13 @@ RepoRivet 是一个本地优先的单智能体编程工具。它使用模型原�
 
 交互对话：uv run reporivet chat --workspace ./examples/buggy_project。支持 /help、/history、/clear、/compact、/compact aggressive、/approval、/approval <mode> 和 /exit。手动压缩只处理近期原文并立即保存，固定任务和结构化状态不变。会话采用固定任务、近期工作记忆、结构化摘要和本地持久化四层记忆；原始任务不会被压缩覆盖，文件内容通过 SHA-256 判断是否需要重新注入，长命令只把头尾送入模型，完整脱敏输出保存在全局的 ~/.reporivet/sessions（可用 REPORIVET_HOME 修改根目录）。
 
+本地 GUI：运行 `uv run reporivet gui --workspace ./examples/buggy_project`，命令会在随机本机端口启动服务并打开一次性认证链接。GUI 与 CLI 共用 Agent Core、会话、审批、Plan、Skill 和验证状态，提供会话切换、实时 SSE 时间线、四选项审批、Markdown 回答、文件快照、Git Diff、Plan 审阅及执行。默认只监听回环地址；非回环监听必须显式传入 `--unsafe-network`。写请求同时校验 HttpOnly 会话 Cookie、CSRF、Origin 和 Host，模型 API Key 不会发送到浏览器。前端源码位于 `frontend/`，使用 `npm run build` 将静态资源打包到 Python wheel。
+
 多会话管理：使用 `reporivet session list` 查看会话，`session current` 查看当前工作区选择，`session use ID` 只切换选择但不运行模型，`session resume [ID]` 恢复交互执行并先显示已保存的对话历史。直接通过 `chat --session ID` 或工作区 active 会话加载已有会话时也会显示历史，新建会话不显示空历史。还支持 `session show/new/rename/fork/archive/delete/repair`；短 ID 必须唯一，完成或失败的会话需要先 fork。每个工作区的 active 指针、meta.json、state.json、summary.json、events.jsonl 和运行锁均由本地管理；恢复时会核对已读文件哈希，将外部变化和中断工具标为未知状态，并且不会自动重试写入或命令。
 
-核心能力：浏览、搜索和读取代码；基于持久化内容快照和原始快照行号安全创建、修改文件；限时执行本地命令；查看 Git Diff；基于显式计划和确定性成功条件的修改后验证；带安全余量、服务端 usage 校准和超限恢复的上下文管理；会话恢复；四模式工具审批；工具请求、审批风险、审批决定和执行结果的实时终端显示；最大步数、运行时间、重复调用与连续失败保护；JSONL 事件日志及凭据过滤。
+自动规划通过 `[planning] auto_plan = "adaptive"` 配置，也可用 `--auto-plan off|adaptive|always` 覆盖。`adaptive` 对明确的项目级、多文件或长规格任务在首次调用前进入 Plan Mode，并允许模型在发现范围不确定时通过 `request_plan` 请求切换；简单且边界明确的修改继续直接执行。自动规划只会启用 Controller 强制的只读工具集，生成的 Plan Artifact 仍停在 `plan_ready` 等待用户审阅，不会自动批准计划、编辑或命令。
+
+核心能力：浏览、搜索和读取代码；基于持久化内容快照和原始快照行号安全创建、修改文件；限时执行本地命令；查看 Git Diff；基于显式计划和确定性成功条件的修改后验证；带安全余量、服务端 usage 校准和超限恢复的上下文管理；会话恢复；四模式工具审批；工具请求、审批风险、审批决定和执行结果的实时终端显示；基于可观测进度的模型步骤检查点、运行时间、重复调用与连续失败保护；JSONL 事件日志及凭据过滤。
 
 文件编辑使用 RivetPatch：`read_file` 返回带行号的 `snapshot_id`，`edit_file` 只接受针对该原始快照的结构化行替换、插入和删除操作。目标行必须已经展示；过期快照、路径不匹配、越界、重叠和无效编辑会在写入前被拒绝。预检完成后审批界面展示确定性 Diff，批准后再次核对磁盘版本并执行单文件原子替换；成功结果返回新快照并使旧验证失效。`write_file` 仅创建新文件，不覆盖现有路径。当前版本不提供结构块编辑、自动三方合并或多文件批量事务。
 

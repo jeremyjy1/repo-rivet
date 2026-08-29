@@ -27,7 +27,8 @@ from repo_rivet.llm.protocol import contains_embedded_tool_protocol
 from repo_rivet.memory.models import MemoryState, Message
 from repo_rivet.memory.store import MemoryStore
 from repo_rivet.planning.errors import PlanModeViolation
-from repo_rivet.planning.models import PlanStatus, WorkflowMode
+from repo_rivet.planning.models import PlanStatus, PlanStepStatus, WorkflowMode
+from repo_rivet.planning.policy import AutoPlanMode, AutoPlanPolicy
 from repo_rivet.planning.runtime import PLANNING_TOOL_NAMES, PlanRuntime
 from repo_rivet.reasoning.manager import ReasoningManager
 from repo_rivet.reasoning.models import ReasoningEvent, ReasoningPhase
@@ -38,6 +39,7 @@ from repo_rivet.skills.errors import SkillError
 from repo_rivet.skills.requirements import SkillRequirementEvaluator, SkillRequirementReport
 from repo_rivet.skills.runtime import CONTROL_TOOLS, SkillRuntime
 from repo_rivet.tools.base import DecisionPolicy, ToolCall, ToolResult
+from repo_rivet.tools.planning import RequestPlanArguments
 from repo_rivet.tools.registry import ToolRegistry
 from repo_rivet.verification.models import (
     FINAL_ASSESSMENT_SUMMARY_MAX_CHARS,
@@ -89,6 +91,7 @@ class AgentController:
         memory_store: MemoryStore | None = None,
         reasoning_manager: ReasoningManager | None = None,
         skill_runtime: SkillRuntime | None = None,
+        auto_plan_policy: AutoPlanPolicy | None = None,
     ) -> None:
         self.model_client = model_client
         self.tool_registry = tool_registry
@@ -99,6 +102,7 @@ class AgentController:
         self.memory_store = memory_store
         self.reasoning_manager = reasoning_manager or ReasoningManager()
         self.skill_runtime = skill_runtime
+        self.auto_plan_policy = auto_plan_policy or AutoPlanPolicy()
         self.skill_requirements = SkillRequirementEvaluator()
         runtime = getattr(tool_registry, "verification_runtime", None)
         workspace = getattr(tool_registry, "workspace", None) or Path.cwd().resolve()
@@ -130,6 +134,21 @@ class AgentController:
         memory.begin_task_scope()
         if workflow_mode is not None:
             memory.workflow_mode = workflow_mode
+        auto_plan_reason = (
+            self.auto_plan_policy.preflight_reason(task)
+            if memory.workflow_mode == WorkflowMode.EXECUTE and self._can_start_new_plan(memory)
+            else None
+        )
+        remaining_plan_steps = 0
+        if (
+            memory.workflow_mode == WorkflowMode.EXECUTE
+            and memory.plan_artifact is not None
+            and memory.plan_artifact.status == PlanStatus.EXECUTING
+        ):
+            remaining_plan_steps = sum(
+                step.status != PlanStepStatus.COMPLETED for step in memory.plan_artifact.steps
+            )
+        step_limit = self.termination_policy.config.max_steps
         repaired_interrupted_calls = self._repair_interrupted_history(memory)
         repaired_empty_assistant_messages = memory.repair_invalid_assistant_messages()
         memory.start_task(
@@ -147,7 +166,7 @@ class AgentController:
                 "After file changes, complete a successful verification before finishing.",
                 "Report modified files, verification, and unresolved errors explicitly.",
             ],
-            max_steps=self.termination_policy.config.max_steps,
+            max_steps=step_limit,
         )
         repaired_legacy_reflection = self._repair_legacy_protocol_reflection(memory)
         approval_engine = getattr(self.tool_registry, "approval_engine", None)
@@ -164,6 +183,7 @@ class AgentController:
                 else AgentStatus.RUNNING
             ),
             workflow_mode=memory.workflow_mode,
+            step_limit=step_limit,
             tool_call_count=memory.tool_event_step,
             initial_tool_call_count=memory.tool_event_step,
             modified_files=set(memory.modified_files),
@@ -192,6 +212,32 @@ class AgentController:
                     memory,
                     status="blocked",
                     reason=str(error),
+                )
+        auto_plan_started = False
+        if auto_plan_reason is not None:
+            planning_supported = self.skill_runtime is None or self.skill_runtime.supports_mode(
+                WorkflowMode.PLANNING
+            )
+            if planning_supported:
+                self._enter_planning_mode(state=state, memory=memory)
+                auto_plan_started = True
+            elif self.auto_plan_policy.mode == AutoPlanMode.ALWAYS:
+                active = self.skill_runtime.active if self.skill_runtime is not None else None
+                return self._finish(
+                    state,
+                    memory,
+                    status="blocked",
+                    reason=(
+                        "auto-plan is always, but global skill "
+                        f"{active.manifest.id if active is not None else 'unknown'} "
+                        "does not support planning mode"
+                    ),
+                )
+            else:
+                self._log(
+                    "auto_plan_skipped",
+                    reason=auto_plan_reason,
+                    detail="active global skill does not support planning mode",
                 )
         if self.skill_runtime is not None and not self.skill_runtime.supports_mode(
             state.workflow_mode
@@ -239,33 +285,7 @@ class AgentController:
                     + "; ".join(stale_reasons),
                 )
         if state.workflow_mode == WorkflowMode.PLANNING:
-            existing_plan = memory.plan_artifact
-            plan_tool = (
-                "update_plan"
-                if existing_plan is not None
-                and existing_plan.status not in {PlanStatus.CANCELLED, PlanStatus.COMPLETED}
-                else "submit_plan"
-            )
-            self._append_system_feedback(
-                state,
-                memory,
-                {
-                    "workflow_mode": "planning",
-                    "current_plan": (
-                        memory.plan_artifact.model_dump(mode="json")
-                        if memory.plan_artifact is not None
-                        else None
-                    ),
-                    "instruction": (
-                        "Inspect the workspace using planning tools only. Submit a structured "
-                        f"Plan Artifact with {plan_tool} when it is ready for user review. "
-                        "When updating, retain the exact IDs and specifications of completed "
-                        "steps that remain valid; the Controller carries their progress forward. "
-                        "Do not reintroduce work already completed outside the remaining plan. "
-                        "A tool-free response does not finish planning."
-                    ),
-                },
-            )
+            self._append_planning_feedback(state=state, memory=memory)
         elif (
             state.workflow_mode == WorkflowMode.EXECUTE
             and memory.plan_artifact is not None
@@ -284,7 +304,21 @@ class AgentController:
                     ),
                 },
             )
-        self._log("session_start", task=state.task)
+        self._log(
+            "session_start",
+            task=state.task,
+            progress_checkpoint_window=self.termination_policy.config.max_steps,
+            remaining_plan_steps=remaining_plan_steps,
+            next_step_checkpoint=step_limit,
+            auto_plan_mode=self.auto_plan_policy.mode.value,
+            auto_plan_reason=auto_plan_reason if auto_plan_started else None,
+        )
+        if auto_plan_started:
+            self._log(
+                "auto_plan_started",
+                source="controller",
+                reason=auto_plan_reason,
+            )
         if repaired_legacy_reflection:
             self._log(
                 "legacy_decision_state_repaired",
@@ -303,25 +337,9 @@ class AgentController:
         self._save_memory(memory, state, status=state.status.value)
         try:
             while True:
-                reason = self.termination_policy.check(state)
-                if reason:
-                    if (
-                        reason
-                        == (
-                            "maximum agent steps reached "
-                            f"({self.termination_policy.config.max_steps})"
-                        )
-                        and state.status == AgentStatus.FINALIZING
-                        and self.verifier.completion_report(state).complete
-                        and self._skill_completion_report(memory).complete
-                    ):
-                        return self._finish(
-                            state,
-                            memory,
-                            status="success",
-                            summary=self._verified_completion_summary(state),
-                        )
-                    return self._finish(state, memory, status="stopped", reason=reason)
+                terminal_result = self._check_termination(state=state, memory=memory)
+                if terminal_result is not None:
+                    return terminal_result
 
                 try:
                     tool_schemas = self._tool_schemas(state.workflow_mode)
@@ -339,11 +357,69 @@ class AgentController:
                         ),
                     )
                 except ResponseParseError as error:
-                    state.record_model_error(str(error))
+                    bounded_edit_recovery = (
+                        error.code == "invalid_tool_arguments_json"
+                        and error.tool_name in {"edit_file", "write_file"}
+                    )
+                    cancelled_pending_decision = False
+                    if bounded_edit_recovery:
+                        pending_action = (
+                            state.pending_decision.next_action
+                            if state.pending_decision is not None
+                            else None
+                        )
+                        if (
+                            pending_action is not None
+                            and pending_action.tool_name == error.tool_name
+                        ):
+                            state.pending_decision = None
+                            cancelled_pending_decision = True
+                        memory.working.pending_actions.clear()
+                    recovery_instruction = None
+                    if bounded_edit_recovery:
+                        if error.tool_name == "edit_file":
+                            bounded_action = (
+                                "Reread the smallest necessary range, then issue one small, "
+                                "coherent, snapshot-bound edit_file operation. Continue the "
+                                "refactor through separate edits, using each newly returned "
+                                "snapshot."
+                            )
+                        else:
+                            bounded_action = (
+                                "Create only a minimal valid file with write_file, then read it "
+                                "and expand it through separate small snapshot-bound edit_file "
+                                "operations."
+                            )
+                        fresh_decision = (
+                            " Record a fresh decision for the smaller action because the "
+                            "previous oversized edit decision has been cancelled."
+                            if cancelled_pending_decision
+                            else " Record the required decision for the smaller action."
+                        )
+                        recovery_instruction = (
+                            "The edit arguments were truncated or malformed. Do not retry the "
+                            "whole-file payload and do not attempt to reconstruct the truncated "
+                            f"JSON. {bounded_action}{fresh_decision}"
+                        )
+                    state.record_model_error(
+                        str(error),
+                        recovery_instruction=recovery_instruction,
+                    )
                     memory.messages.append(
                         Message.from_chat_message(state.messages[-1], step=state.tool_call_count)
                     )
-                    self._log("model_response_invalid", step=state.step_count, error=str(error))
+                    self._log(
+                        "model_response_invalid",
+                        step=state.step_count,
+                        error=str(error),
+                        error_code=error.code,
+                        tool_name=error.tool_name,
+                        argument_chars=error.argument_chars,
+                        recovery=(
+                            "bounded_edit" if bounded_edit_recovery else "retry_valid_response"
+                        ),
+                        pending_decision_cancelled=cancelled_pending_decision,
+                    )
                     self._save_memory(memory, state, status=state.status.value)
                     continue
                 except AgentContextOverflowError as error:
@@ -481,7 +557,23 @@ class AgentController:
                         ),
                     )
                 if length_limited:
-                    if (
+                    replayable_reasoning = bool(
+                        response.reasoning_content and response.reasoning_content.strip()
+                    )
+                    if not replayable_reasoning:
+                        # A compatible provider may truncate a thinking response without
+                        # exposing the hidden state that it requires on the next request.
+                        # Restart from durable facts with thinking disabled instead of sending
+                        # an incomplete assistant message that the provider will reject.
+                        memory.discard_ephemeral_messages()
+                        state.force_thinking_disabled = True
+                        continuation = (
+                            "The provider truncated the previous response without returning "
+                            "replayable reasoning state. Thinking is disabled for this recovery "
+                            "request. Restart from the available facts and return one concise "
+                            "tool action or a complete concise answer."
+                        )
+                    elif (
                         state.provider_reasoning_detected
                         and state.consecutive_length_responses >= 2
                     ):
@@ -508,6 +600,8 @@ class AgentController:
                         "model_response_continuation",
                         step=state.step_count,
                         consecutive=state.consecutive_length_responses,
+                        replayable_reasoning=replayable_reasoning,
+                        thinking_disabled=state.force_thinking_disabled,
                     )
                     self._save_memory(memory, state, status=state.status.value)
                     continue
@@ -600,6 +694,140 @@ class AgentController:
             memory.summary.unresolved_issues.append(warning)
         return descriptions
 
+    @staticmethod
+    def _can_start_new_plan(memory: MemoryState) -> bool:
+        artifact = memory.plan_artifact
+        return artifact is None or artifact.status in {PlanStatus.CANCELLED, PlanStatus.COMPLETED}
+
+    @staticmethod
+    def _enter_planning_mode(*, state: SessionState, memory: MemoryState) -> None:
+        memory.workflow_mode = WorkflowMode.PLANNING
+        state.workflow_mode = WorkflowMode.PLANNING
+        state.status = AgentStatus.PLANNING
+        state.pending_decision = None
+        memory.working.pending_actions.clear()
+
+    def _append_planning_feedback(
+        self,
+        *,
+        state: SessionState,
+        memory: MemoryState,
+    ) -> None:
+        existing_plan = memory.plan_artifact
+        plan_tool = (
+            "update_plan"
+            if existing_plan is not None
+            and existing_plan.status not in {PlanStatus.CANCELLED, PlanStatus.COMPLETED}
+            else "submit_plan"
+        )
+        self._append_system_feedback(
+            state,
+            memory,
+            {
+                "workflow_mode": "planning",
+                "current_plan": (
+                    existing_plan.model_dump(mode="json") if existing_plan is not None else None
+                ),
+                "instruction": (
+                    "Inspect the workspace using planning tools only. Submit a structured "
+                    f"Plan Artifact with {plan_tool} when it is ready for user review. "
+                    "When updating, retain the exact IDs and specifications of completed "
+                    "steps that remain valid; the Controller carries their progress forward. "
+                    "Do not reintroduce work already completed outside the remaining plan. "
+                    "A tool-free response does not finish planning."
+                ),
+            },
+        )
+
+    def _handle_request_plan(
+        self,
+        *,
+        request_plan_calls: list[ToolCall],
+        all_calls: list[ToolCall],
+        state: SessionState,
+        memory: MemoryState,
+    ) -> AgentResult | None:
+        selected = request_plan_calls[0]
+        error: str | None = None
+        reason: str | None = None
+        if len(request_plan_calls) > 1:
+            error = "Only one request_plan call is allowed per model turn."
+        elif state.workflow_mode != WorkflowMode.EXECUTE:
+            error = "request_plan is only available in Execute Mode."
+        elif not self.auto_plan_policy.model_may_request:
+            error = "request_plan is disabled by the configured auto-plan mode."
+        elif not self._can_start_new_plan(memory):
+            error = "An active plan already exists; revise or finish that plan instead."
+        elif self.skill_runtime is not None and not self.skill_runtime.supports_mode(
+            WorkflowMode.PLANNING
+        ):
+            active = self.skill_runtime.active
+            error = (
+                f"Global skill {active.manifest.id if active is not None else 'unknown'} "
+                "does not support planning mode."
+            )
+        else:
+            try:
+                arguments = RequestPlanArguments.model_validate(selected.arguments)
+                reason = arguments.reason
+            except ValueError as validation_error:
+                error = f"Invalid request_plan arguments: {validation_error}"
+
+        transitioned = error is None
+        mixed_call_error = (
+            "request_plan switched the Controller to read-only Plan Mode; co-issued operations "
+            "were not executed. Continue with planning tools in the next response."
+        )
+        for call in all_calls:
+            self._log(
+                "tool_call",
+                step=state.step_count,
+                tool_call_id=call.id,
+                name=call.name,
+                arguments=call.arguments,
+            )
+            if call == selected and transitioned:
+                result = ToolResult(
+                    ok=True,
+                    output="Controller entered read-only Plan Mode.",
+                    metadata={"auto_plan_source": "model", "reason": reason},
+                )
+                self._record_meta_result(call, result, state=state, memory=memory)
+            elif call.name == "request_plan":
+                self._record_meta_result(
+                    call,
+                    ToolResult(
+                        ok=False,
+                        output="",
+                        error=error or "Duplicate request_plan call.",
+                        error_code="auto_plan_rejected",
+                        retryable=True,
+                    ),
+                    state=state,
+                    memory=memory,
+                )
+            else:
+                self._record_blocked_action(
+                    call,
+                    ToolResult(
+                        ok=False,
+                        output="",
+                        error=mixed_call_error if transitioned else (error or mixed_call_error),
+                        error_code="auto_plan_transition",
+                        retryable=True,
+                    ),
+                    state=state,
+                    memory=memory,
+                )
+
+        if not transitioned:
+            return None
+        self._enter_planning_mode(state=state, memory=memory)
+        self._append_planning_feedback(state=state, memory=memory)
+        self._log("auto_plan_started", source="model", reason=reason)
+        self._save_memory(memory, state, status=state.status.value)
+        return None
+
     def _process_tool_turn(
         self,
         calls: list[ToolCall],
@@ -675,6 +903,15 @@ class AgentController:
             calls = [call for call in calls if call not in forbidden_by_skill]
             if not calls:
                 return None
+
+        request_plan_calls = [call for call in calls if call.name == "request_plan"]
+        if request_plan_calls:
+            return self._handle_request_plan(
+                request_plan_calls=request_plan_calls,
+                all_calls=calls,
+                state=state,
+                memory=memory,
+            )
 
         if state.workflow_mode == WorkflowMode.PLANNING:
             forbidden_calls: list[tuple[ToolCall, PlanModeViolation]] = []
@@ -1181,9 +1418,9 @@ class AgentController:
                 memory.skill_completion_recovery_attempts = 0
                 self._save_memory(memory, state, status=state.status.value)
         if validation_error is not None:
-            reason = self.termination_policy.check(state)
-            if reason:
-                return self._finish(state, memory, status="stopped", reason=reason)
+            terminal_result = self._check_termination(state=state, memory=memory)
+            if terminal_result is not None:
+                return terminal_result
         if awaiting_plan_recovery and state.verification_plan is None:
             return self._request_verification_plan_recovery(
                 state=state,
@@ -1253,6 +1490,13 @@ class AgentController:
         state: SessionState,
         memory: MemoryState,
     ) -> None:
+        if call.name in {
+            "register_verification",
+            "request_plan",
+            "submit_plan",
+            "update_plan",
+        }:
+            state.record_meaningful_progress(call, result)
         message = result.as_tool_message(call.id)
         state.messages.append(message)
         memory.append_tool_message(message, step=state.tool_call_count)
@@ -1387,6 +1631,50 @@ class AgentController:
         if reason:
             return self._finish(state, memory, status="stopped", reason=reason)
         return None
+
+    def _check_termination(
+        self,
+        *,
+        state: SessionState,
+        memory: MemoryState,
+    ) -> AgentResult | None:
+        reason = self.termination_policy.check(state)
+        if reason is None:
+            return None
+        checkpoint_reason = self.termination_policy.step_checkpoint_reason(state)
+        if reason != checkpoint_reason:
+            return self._finish(state, memory, status="stopped", reason=reason)
+        if (
+            state.status == AgentStatus.FINALIZING
+            and self.verifier.completion_report(state).complete
+            and self._skill_completion_report(memory).complete
+        ):
+            return self._finish(
+                state,
+                memory,
+                status="success",
+                summary=self._verified_completion_summary(state),
+            )
+        if state.made_progress_since_checkpoint:
+            previous_checkpoint = self.termination_policy.step_limit(state)
+            state.renew_step_checkpoint(self.termination_policy.config.max_steps)
+            self._log(
+                "agent_step_checkpoint_renewed",
+                previous_checkpoint=previous_checkpoint,
+                next_checkpoint=self.termination_policy.step_limit(state),
+                progress_revision=state.progress_revision,
+            )
+            self._save_memory(memory, state, status=state.status.value)
+            return None
+        return self._finish(
+            state,
+            memory,
+            status="stopped",
+            reason=(
+                "no meaningful progress during the current agent-step window "
+                f"({self.termination_policy.config.max_steps} steps)"
+            ),
+        )
 
     @staticmethod
     def _verified_completion_summary(state: SessionState) -> str:
@@ -1869,6 +2157,14 @@ class AgentController:
                 for schema in schemas
                 if schema.get("function", {}).get("name") != "submit_plan"
                 and (schema.get("function", {}).get("name") != "update_plan" or has_plan)
+                and (
+                    schema.get("function", {}).get("name") != "request_plan"
+                    or (
+                        self.auto_plan_policy.model_may_request
+                        and self.plan_runtime.memory is not None
+                        and self._can_start_new_plan(self.plan_runtime.memory)
+                    )
+                )
             ]
         if self.skill_runtime is not None:
             names = {str(schema.get("function", {}).get("name", "")) for schema in schemas}
@@ -2007,7 +2303,10 @@ class AgentController:
                 messages = self.context_manager.build(
                     memory=memory,
                     state_summary=state.state_summary(),
-                    remaining_steps=self.termination_policy.config.max_steps - state.step_count,
+                    remaining_steps=max(
+                        0,
+                        self.termination_policy.step_limit(state) - state.step_count,
+                    ),
                     tools=tool_schemas,
                     policy_messages=self._skill_policy_messages(),
                 )
@@ -2081,12 +2380,12 @@ class AgentController:
 
     @staticmethod
     def _model_request_options(state: SessionState) -> ModelRequestOptions | None:
+        if state.force_thinking_disabled:
+            return ModelRequestOptions(thinking_enabled=False)
         if state.provider_reasoning_detected and state.consecutive_length_responses >= 2:
             return ModelRequestOptions(thinking_enabled=False)
         if state.provider_reasoning_detected and state.consecutive_length_responses >= 1:
             return ModelRequestOptions(reasoning_effort="low")
-        if state.force_thinking_disabled:
-            return ModelRequestOptions(thinking_enabled=False)
         return None
 
     @staticmethod

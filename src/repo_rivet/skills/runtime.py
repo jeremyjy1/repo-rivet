@@ -9,7 +9,13 @@ from repo_rivet.skills.models import ActiveSkillPin, SkillActivation, SkillBundl
 from repo_rivet.skills.registry import SkillRegistry
 
 CONTROL_TOOLS = frozenset(
-    {"record_decision", "register_verification", "submit_plan", "update_plan"}
+    {
+        "record_decision",
+        "register_verification",
+        "request_plan",
+        "submit_plan",
+        "update_plan",
+    }
 )
 # These are Controller protocol tools rather than task capabilities. Keeping the mode-valid
 # subset prevents a narrowed Skill from deadlocking decision, verification, or Plan workflows.

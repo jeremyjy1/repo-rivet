@@ -60,6 +60,25 @@ max_context_overflow_retries = 1
     assert config.approval.non_interactive.value == "deny"
     assert config.skills.global_enabled
     assert config.skills.default_global is None
+    assert config.planning.auto_plan.value == "adaptive"
+
+
+def test_load_config_accepts_auto_plan_mode(tmp_path: Path) -> None:
+    config_path = write_config(
+        tmp_path / "reporivet.toml",
+        """
+[api]
+api_key = "test-secret"
+base_url = "https://example.com/v1"
+model = "test-model"
+context_window_tokens = 32768
+
+[planning]
+auto_plan = "always"
+""",
+    )
+
+    assert load_config(config_path).planning.auto_plan.value == "always"
 
 
 def test_load_config_accepts_approval_settings(tmp_path: Path) -> None:

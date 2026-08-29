@@ -14,6 +14,7 @@ def test_default_registry_exposes_workspace_and_decision_tools(tmp_path: Path) -
         "register_verification",
         "submit_plan",
         "update_plan",
+        "request_plan",
         "list_files",
         "search_text",
         "read_file",

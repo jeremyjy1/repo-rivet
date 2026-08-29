@@ -37,3 +37,22 @@ class UpdatePlanTool(BaseTool[UpdatePlanArguments]):
 
     def run(self, arguments: UpdatePlanArguments) -> ToolResult:
         return ToolResult(ok=True, output="Updated plan schema is valid.")
+
+
+class RequestPlanArguments(ToolArguments):
+    reason: str = Field(min_length=1, max_length=1_000)
+    expected_scope: str = Field(min_length=1, max_length=500)
+
+
+class RequestPlanTool(BaseTool[RequestPlanArguments]):
+    name = "request_plan"
+    description = (
+        "Request a Controller-enforced transition into read-only Plan Mode before taking any "
+        "action. Use this as the only operation in the response when the task has uncertain, "
+        "multi-file, architectural, migration, or recovery scope. Planning still requires user "
+        "review and grants no execution or approval rights."
+    )
+    arguments_type = RequestPlanArguments
+
+    def run(self, arguments: RequestPlanArguments) -> ToolResult:
+        return ToolResult(ok=True, output="Plan Mode requested.")

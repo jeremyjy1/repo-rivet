@@ -247,8 +247,9 @@ def test_chat_loop_history_and_help_commands_do_not_call_agent() -> None:
 
     output = buffer.getvalue()
     assert len(agent.requests) == 1
-    assert "Original task: task" in output
+    assert "You: task" in output
     assert "RepoRivet: completed task" in output
+    assert output.index("You: task") < output.index("RepoRivet: completed task")
     assert "/clear" in output
     assert "/compact" in output
     assert "/approval" in output
@@ -281,8 +282,53 @@ def test_chat_loop_displays_loaded_session_history_on_start() -> None:
     assert exit_code == 0
     assert agent.requests == []
     assert "Conversation history" in output
-    assert "Original task: inspect [bold]the project[/bold]" in output
+    assert "You: inspect [bold]the project[/bold]" in output
     assert "RepoRivet: inspection complete" in output
+    assert output.index("You: inspect") < output.index("RepoRivet: inspection complete")
+
+
+def test_loaded_history_preserves_interleaved_turn_order_without_task_duplicates() -> None:
+    agent = FakeConversationAgent()
+    memory = MemoryState(session_id="ordered-history")
+    memory.start_task(
+        task="first request",
+        workspace="/workspace",
+        system_prompt=SYSTEM_PROMPT,
+        safety_rules=["stay in workspace"],
+        completion_rules=["verify changes"],
+        max_steps=30,
+    )
+    memory.messages.append(Message(role="assistant", content="first response"))
+    memory.start_task(
+        task="second request",
+        workspace="/workspace",
+        system_prompt=SYSTEM_PROMPT,
+        safety_rules=["stay in workspace"],
+        completion_rules=["verify changes"],
+        max_steps=30,
+    )
+    memory.messages.append(Message(role="assistant", content="second response"))
+    buffer = StringIO()
+
+    _chat_loop(
+        agent,
+        memory,
+        Console(file=buffer, force_terminal=False, color_system=None),
+        lambda _: "/exit",
+        show_history_on_start=True,
+    )
+
+    output = buffer.getvalue()
+    entries = [
+        "You: first request",
+        "RepoRivet: first response",
+        "You: second request",
+        "RepoRivet: second response",
+    ]
+    positions = [output.index(entry) for entry in entries]
+    assert positions == sorted(positions)
+    assert output.count("first request") == 1
+    assert output.count("second request") == 1
 
 
 def test_chat_can_show_and_switch_approval_mode() -> None:

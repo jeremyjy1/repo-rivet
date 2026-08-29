@@ -1,6 +1,7 @@
 """Layer deterministic safety, modes, grants, LLM advice, and human decisions."""
 
 import hashlib
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -242,11 +243,23 @@ class ApprovalEngine:
     def _review_with_llm_or_human(self, request: ApprovalRequest) -> ApprovalDecision:
         if self.llm_reviewer is None:
             return self.human_approver.ask(request)
+        self._log(
+            "llm_approval_review_started",
+            request_id=request.request_id,
+            tool=request.tool_name,
+            fingerprint=request.fingerprint,
+            risk=request.assessment.level.name.lower(),
+        )
+        review_started = time.monotonic()
         try:
             review = self.llm_reviewer.review(request)
         except Exception:
             review = None
-        self._log_review(request, review)
+        self._log_review(
+            request,
+            review,
+            duration_seconds=time.monotonic() - review_started,
+        )
         if review is not None and self._accept_llm_approval(request, review):
             return self._decision(
                 request,
@@ -392,6 +405,8 @@ class ApprovalEngine:
         self,
         request: ApprovalRequest,
         review: LLMReviewResult | None,
+        *,
+        duration_seconds: float,
     ) -> None:
         if review is None:
             self._log(
@@ -399,6 +414,7 @@ class ApprovalEngine:
                 request_id=request.request_id,
                 tool=request.tool_name,
                 fingerprint=request.fingerprint,
+                duration_seconds=duration_seconds,
             )
             return
         self._log(
@@ -414,6 +430,7 @@ class ApprovalEngine:
             required_constraints=review.required_constraints,
             reason=review.reason,
             user_prompt=review.user_prompt,
+            duration_seconds=duration_seconds,
         )
 
     @staticmethod

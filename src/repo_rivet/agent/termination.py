@@ -36,6 +36,13 @@ class TerminationPolicy:
     def __init__(self, config: TerminationConfig | None = None) -> None:
         self.config = config or TerminationConfig()
 
+    def step_limit(self, state: SessionState) -> int:
+        """Return the current progress-checkpoint boundary."""
+        return state.step_limit or self.config.max_steps
+
+    def step_checkpoint_reason(self, state: SessionState) -> str:
+        return f"maximum agent step checkpoint reached ({self.step_limit(state)})"
+
     def check(
         self,
         state: SessionState,
@@ -45,8 +52,9 @@ class TerminationPolicy:
     ) -> str | None:
         if state.interrupted:
             return "interrupted by user"
-        if include_step_limit and state.step_count >= self.config.max_steps:
-            return f"maximum agent steps reached ({self.config.max_steps})"
+        step_limit = self.step_limit(state)
+        if include_step_limit and state.step_count >= step_limit:
+            return self.step_checkpoint_reason(state)
 
         current_time = time.monotonic() if now is None else now
         if current_time - state.started_at >= self.config.max_seconds:

@@ -20,6 +20,7 @@ from repo_rivet.approval.engine import ApprovalEngine
 from repo_rivet.approval.grant_store import ApprovalGrantStore
 from repo_rivet.approval.hard_policy import HardSafetyPolicy, HardSafetySettings
 from repo_rivet.approval.human_approver import (
+    HumanApprover,
     NonInteractiveHumanApprover,
     TerminalHumanApprover,
 )
@@ -38,6 +39,7 @@ from repo_rivet.memory.store import MemoryStore
 from repo_rivet.memory.token_calibrator import TokenCalibrationStore
 from repo_rivet.memory.token_estimator import create_token_estimator
 from repo_rivet.planning.models import PlanArtifact, PlanStatus, WorkflowMode
+from repo_rivet.planning.policy import AutoPlanMode, AutoPlanPolicy
 from repo_rivet.reasoning.manager import ReasoningManager
 from repo_rivet.reasoning.models import ReasoningDisplayMode
 from repo_rivet.safety.path_policy import PathPolicyError
@@ -254,6 +256,15 @@ def build_parser() -> argparse.ArgumentParser:
         "uninstall", help="Remove one installed global Skill"
     )
     skill_uninstall.add_argument("skill_id")
+
+    gui_parser = subparsers.add_parser("gui", help="Start the local RepoRivet web client")
+    gui_parser.add_argument("--workspace", type=Path, default=Path.cwd())
+    _add_model_runtime_arguments(gui_parser)
+    gui_parser.add_argument("--host", default="127.0.0.1")
+    gui_parser.add_argument("--port", type=int, default=0)
+    gui_parser.add_argument("--open", action=argparse.BooleanOptionalAction, default=True)
+    gui_parser.add_argument("--unsafe-network", action="store_true")
+    gui_parser.add_argument("--session")
     return parser
 
 
@@ -275,8 +286,21 @@ def _add_model_runtime_arguments(parser: argparse.ArgumentParser) -> None:
         default=Path("reporivet.toml"),
         help="Local API configuration file (default: reporivet.toml)",
     )
-    parser.add_argument("--max-steps", type=int, default=30)
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=30,
+        help=(
+            "Model-step progress checkpoint window; renewed after locally observed progress "
+            "(default: 30)"
+        ),
+    )
     parser.add_argument("--max-seconds", type=float, default=600)
+    parser.add_argument(
+        "--auto-plan",
+        choices=[mode.value for mode in AutoPlanMode],
+        help="Override automatic planning: off, adaptive, or always",
+    )
     parser.add_argument(
         "--reasoning",
         choices=[mode.value for mode in ReasoningDisplayMode],
@@ -322,6 +346,10 @@ def cli(
         return _session_command(arguments, output, prompt_reader=prompt_reader)
     if arguments.command == "skill":
         return _skill_command(arguments, output)
+    if arguments.command == "gui":
+        from repo_rivet.web.server import run_gui
+
+        return run_gui(arguments, output)
     output.print("[red]Unknown command.[/red]")
     return 2
 
@@ -939,12 +967,21 @@ def _build_runtime(
     console: Console,
     *,
     approval_prompt_reader: PromptReader | None = None,
+    human_approver_override: HumanApprover | None = None,
+    additional_event_sinks: tuple[EventSink, ...] = (),
+    console_events: bool = True,
+    termination_policy: TerminationPolicy | None = None,
 ) -> Runtime:
-    termination = TerminationConfig(
-        max_steps=arguments.max_steps,
-        max_seconds=arguments.max_seconds,
+    termination = termination_policy or TerminationPolicy(
+        TerminationConfig(
+            max_steps=arguments.max_steps,
+            max_seconds=arguments.max_seconds,
+        )
     )
     config = load_config(arguments.config)
+    auto_plan_mode = AutoPlanMode(
+        getattr(arguments, "auto_plan", None) or config.planning.auto_plan
+    )
     memory_config = _memory_config(
         config,
     )
@@ -1011,14 +1048,17 @@ def _build_runtime(
         session_lock.__exit__(None, None, None)
         raise
     try:
-        runtime_events = CompositeEventSink(
-            store,
-            ConsoleEventReporter(
-                console,
-                secrets=secrets,
-                reasoning_mode=reasoning_mode,
-            ),
-        )
+        event_sinks: list[EventSink] = [store]
+        if console_events:
+            event_sinks.append(
+                ConsoleEventReporter(
+                    console,
+                    secrets=secrets,
+                    reasoning_mode=reasoning_mode,
+                )
+            )
+        event_sinks.extend(additional_event_sinks)
+        runtime_events = CompositeEventSink(*event_sinks)
         approval_engine = _build_approval_engine(
             config=config,
             arguments=arguments,
@@ -1026,6 +1066,7 @@ def _build_runtime(
             event_logger=runtime_events,
             console=console,
             prompt_reader=approval_prompt_reader,
+            human_approver_override=human_approver_override,
         )
         registry = create_default_registry(
             workspace,
@@ -1084,14 +1125,15 @@ def _build_runtime(
                     activation=memory.active_skill.activation.value,
                 )
         controller = AgentController(
-            model_client=OpenAICompatibleClient(config.api),
+            model_client=OpenAICompatibleClient(config.api, event_logger=runtime_events),
             tool_registry=registry,
             context_manager=ContextManager(token_manager=token_manager),
-            termination_policy=TerminationPolicy(termination),
+            termination_policy=termination,
             event_logger=runtime_events,
             memory_store=store,
             reasoning_manager=reasoning_manager,
             skill_runtime=skill_runtime,
+            auto_plan_policy=AutoPlanPolicy(auto_plan_mode),
         )
         memory.status = SessionStatus.RUNNING.value
         store.save_state(memory, status=SessionStatus.RUNNING.value)
@@ -1135,12 +1177,13 @@ def _build_approval_engine(
     event_logger: EventSink,
     console: Console,
     prompt_reader: PromptReader | None,
+    human_approver_override: HumanApprover | None = None,
 ) -> ApprovalEngine:
     mode = ApprovalMode(
         arguments.approval_mode or memory.approval_mode_override or config.approval.mode
     )
     interactive = arguments.command == "chat" or prompt_reader is not None or sys.stdin.isatty()
-    human_approver = (
+    human_approver = human_approver_override or (
         TerminalHumanApprover(
             console,
             reader=prompt_reader,
@@ -1243,6 +1286,7 @@ def _print_runtime(console: Console, workspace: Path, runtime: Runtime) -> None:
             f"Token estimator: {runtime.controller.context_manager.token_manager.name}\n"
             f"Approval mode: {runtime.registry.approval_engine.mode.value}\n"
             f"Decision trace: {runtime.controller.reasoning_manager.config.display.value}\n"
+            f"Auto plan: {runtime.controller.auto_plan_policy.mode.value}\n"
             f"System Skills: {system_skill_label or 'none'}\n"
             f"Global Skill: {global_skill_label}\n"
             f"Safe prompt budget: "
@@ -1594,13 +1638,19 @@ def _print_chat_history(
         console.print("No conversation history.")
         return
 
+    if visible_messages:
+        # Memory messages already preserve turn order. Reprinting fixed/task-update layers
+        # ahead of them duplicates user prompts and groups speakers out of chronology.
+        for message in visible_messages:
+            label = "You" if message.role == "user" else "RepoRivet"
+            _print_history_entry(console, label, message.content or "")
+        return
+
+    # Migration fallback for older sessions that predate durable conversation messages.
     if memory.fixed is not None:
         _print_history_entry(console, "Original task", memory.fixed.original_task)
     for update in memory.task_updates:
         _print_history_entry(console, "Task update", update)
-    for message in visible_messages:
-        label = "You" if message.role == "user" else "RepoRivet"
-        _print_history_entry(console, label, message.content or "")
 
 
 def _print_history_entry(console: Console, label: str, content: str) -> None:

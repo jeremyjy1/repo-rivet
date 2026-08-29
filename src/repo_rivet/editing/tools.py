@@ -15,7 +15,9 @@ class EditFileTool(BaseTool[EditFileArguments]):
         "Atomically edit one existing file using structured line operations anchored to a "
         "snapshot_id returned by read_file. Every target line must have been shown. All line "
         "numbers refer to the original snapshot. Supports replace, delete, insert_before, "
-        "insert_after, insert_start, and insert_end; structural block editing is not supported."
+        "insert_after, insert_start, and insert_end; structural block editing is not supported. "
+        "Keep each request to a small coherent section. Never replace an entire large file in "
+        "one call; apply multiple snapshot-bound edits and reread between calls."
     )
     arguments_type = EditFileArguments
     capabilities = frozenset({Capability.FILESYSTEM_READ, Capability.FILESYSTEM_WRITE})

@@ -6,13 +6,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-_SENSITIVE_KEY_PARTS = (
-    "api_key",
-    "authorization",
-    "content",
-    "password",
-    "secret",
-    "token",
+_SENSITIVE_KEYS = frozenset(
+    {
+        "api_key",
+        "authorization",
+        "content",
+        "password",
+        "secret",
+        "token",
+    }
 )
 _INLINE_SECRET_PATTERN = re.compile(
     r"(?i)\b(api[_-]?key|authorization|password|secret|token)\b(\s*[:=]\s*)(?:bearer\s+)?[^\s,;]+"
@@ -52,8 +54,7 @@ class EventLogger:
         return self._sanitize(value)
 
     def _sanitize(self, value: Any, *, key: str = "") -> Any:
-        normalized_key = key.lower()
-        if any(part in normalized_key for part in _SENSITIVE_KEY_PARTS):
+        if _is_sensitive_key(key):
             return "[REDACTED]"
         if isinstance(value, dict):
             return {
@@ -73,6 +74,14 @@ class EventLogger:
         if value is None or isinstance(value, (bool, int, float)):
             return value
         return str(value)
+
+
+def _is_sensitive_key(key: str) -> bool:
+    """Redact credential values without hiding ordinary metrics such as token counts."""
+    normalized = key.lower().replace("-", "_")
+    if normalized in _SENSITIVE_KEYS:
+        return True
+    return normalized.endswith(("_api_key", "_authorization", "_password", "_secret", "_token"))
 
 
 def create_session_logger(

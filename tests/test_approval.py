@@ -437,6 +437,10 @@ def test_llm_review_audit_event_records_facts_without_confidence(tmp_path: Path)
     )
 
     review_event = next(data for event, data in events.events if event == "llm_approval_reviewed")
+    review_started = next(
+        data for event, data in events.events if event == "llm_approval_review_started"
+    )
+    assert review_started["tool"] == "run_command"
     assert review_event["recommendation"] == "allow"
     assert review_event["task_relevance"] == "helpful"
     assert review_event["recognized_effects"] == [
@@ -444,6 +448,7 @@ def test_llm_review_audit_event_records_facts_without_confidence(tmp_path: Path)
         "execute_project_code",
     ]
     assert "confidence" not in review_event
+    assert review_event["duration_seconds"] >= 0
 
 
 def test_invalid_or_unavailable_llm_review_falls_back_to_human(tmp_path: Path) -> None:

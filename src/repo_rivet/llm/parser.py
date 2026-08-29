@@ -10,6 +10,19 @@ from repo_rivet.tools.base import ToolCall
 class ResponseParseError(ValueError):
     """Raised when a provider response cannot be represented safely."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "invalid_model_response",
+        tool_name: str | None = None,
+        argument_chars: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.tool_name = tool_name
+        self.argument_chars = argument_chars
+
 
 class ResponseParser:
     """Parse text and native function calls from a provider response."""
@@ -27,7 +40,7 @@ class ResponseParser:
         content = getattr(message, "content", None)
         if content is not None and not isinstance(content, str):
             raise ResponseParseError("Model response content is not text")
-        reasoning_content = self._provider_text(message, "reasoning_content")
+        reasoning_content = self._provider_reasoning_text(message)
 
         tool_calls = [
             self._parse_tool_call(item) for item in getattr(message, "tool_calls", None) or []
@@ -50,6 +63,14 @@ class ResponseParser:
             raise ResponseParseError(f"Model response {field_name} is not text")
         return value
 
+    @classmethod
+    def _provider_reasoning_text(cls, message: Any) -> str | None:
+        """Normalize common compatible-provider names into reasoning_content."""
+        reasoning = cls._provider_text(message, "reasoning_content")
+        if reasoning is not None:
+            return reasoning
+        return cls._provider_text(message, "reasoning")
+
     @staticmethod
     def _parse_tool_call(raw_call: Any) -> ToolCall:
         call_type = getattr(raw_call, "type", "function")
@@ -70,7 +91,10 @@ class ResponseParser:
                 arguments = json.loads(raw_arguments)
             except json.JSONDecodeError as error:
                 raise ResponseParseError(
-                    f"Tool call {name} contains invalid JSON arguments: {error.msg}"
+                    f"Tool call {name} contains invalid JSON arguments: {error.msg}",
+                    code="invalid_tool_arguments_json",
+                    tool_name=name,
+                    argument_chars=len(raw_arguments),
                 ) from None
         elif isinstance(raw_arguments, dict):
             arguments = raw_arguments
@@ -78,5 +102,9 @@ class ResponseParser:
             raise ResponseParseError(f"Tool call {name} has unsupported arguments")
 
         if not isinstance(arguments, dict):
-            raise ResponseParseError(f"Tool call {name} arguments must be a JSON object")
+            raise ResponseParseError(
+                f"Tool call {name} arguments must be a JSON object",
+                code="invalid_tool_arguments_type",
+                tool_name=name,
+            )
         return ToolCall(id=call_id, name=name, arguments=arguments)

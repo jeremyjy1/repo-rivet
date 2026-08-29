@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from repo_rivet.agent.controller import AgentController
+from repo_rivet.agent.termination import TerminationConfig, TerminationPolicy
 from repo_rivet.editing.document import TextDocument
 from repo_rivet.llm.base import ModelResponse
 from repo_rivet.memory.models import MemoryState
@@ -14,6 +15,7 @@ from repo_rivet.planning.models import (
     PlanStepStatus,
     WorkflowMode,
 )
+from repo_rivet.planning.policy import AutoPlanMode, AutoPlanPolicy
 from repo_rivet.planning.runtime import PLANNING_TOOL_NAMES, PlanRuntime
 from repo_rivet.reasoning.models import ObservationEvent
 from repo_rivet.safety.path_policy import WorkspacePathPolicy
@@ -355,3 +357,135 @@ def test_plan_mode_hides_and_rejects_mutating_capabilities(tmp_path: Path) -> No
 def test_plan_mode_violation_is_typed() -> None:
     with pytest.raises(PlanModeViolation, match="run_command is unavailable"):
         PlanRuntime.ensure_tool_allowed("run_command")
+
+
+def test_controller_reports_progress_checkpoint_and_remaining_plan_steps(
+    tmp_path: Path,
+) -> None:
+    memory = inspected_memory(tmp_path)
+    runtime = PlanRuntime(WorkspacePathPolicy(tmp_path))
+    runtime.bind(memory)
+    runtime.submit({"plan": plan_payload()})
+    runtime.approve()
+    model = FakeModelClient([ModelResponse(content="More plan work remains.")])
+    registry = create_default_registry(tmp_path)
+
+    class RecordingSink:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, dict[str, object]]] = []
+
+        def log(self, event_type: str, **data: object) -> None:
+            self.events.append((event_type, data))
+
+    events = RecordingSink()
+    agent = AgentController(
+        model_client=model,
+        tool_registry=registry,
+        termination_policy=TerminationPolicy(TerminationConfig(max_steps=3)),
+        event_logger=events,
+    )
+
+    agent.run("Execute the approved plan", memory=memory)
+
+    session_start = next(data for name, data in events.events if name == "session_start")
+    assert session_start["progress_checkpoint_window"] == 3
+    assert session_start["remaining_plan_steps"] == 2
+    assert session_start["next_step_checkpoint"] == 3
+
+
+def test_adaptive_policy_only_preflights_clear_complexity_signals() -> None:
+    policy = AutoPlanPolicy(AutoPlanMode.ADAPTIVE)
+
+    assert policy.preflight_reason("Fix the typo in app.py") is None
+    assert policy.preflight_reason("整体重构这个项目并迁移架构") is not None
+    assert policy.preflight_reason("- inspect\n- design\n- implement\n- verify") is not None
+    assert AutoPlanPolicy(AutoPlanMode.OFF).preflight_reason("整体重构项目") is None
+
+
+def test_always_auto_plan_enters_read_only_workflow_before_first_model_call(
+    tmp_path: Path,
+) -> None:
+    memory = inspected_memory(tmp_path)
+    submit = ToolCall(
+        id="submit",
+        name="submit_plan",
+        arguments={"plan": plan_payload()},
+    )
+    model = FakeModelClient([ModelResponse(tool_calls=[submit])])
+    registry = create_default_registry(tmp_path)
+    agent = AgentController(
+        model_client=model,
+        tool_registry=registry,
+        auto_plan_policy=AutoPlanPolicy(AutoPlanMode.ALWAYS),
+    )
+
+    result = agent.run("Fix app.py", memory=memory)
+
+    assert result.status == "plan_ready"
+    visible_tools = {schema["function"]["name"] for schema in model.requests[0]["tools"]}
+    assert visible_tools == PLANNING_TOOL_NAMES
+    assert "write_file" not in visible_tools
+
+
+def test_model_can_request_adaptive_plan_before_any_action(tmp_path: Path) -> None:
+    memory = inspected_memory(tmp_path)
+    request = ToolCall(
+        id="request-plan",
+        name="request_plan",
+        arguments={
+            "reason": "The change spans uncertain boundaries",
+            "expected_scope": "Inspect dependencies and prepare bounded file steps",
+        },
+    )
+    coissued_write = ToolCall(
+        id="unsafe-write",
+        name="write_file",
+        arguments={"path": "should-not-exist.py", "content": "unsafe = True\n"},
+    )
+    submit = ToolCall(
+        id="submit",
+        name="submit_plan",
+        arguments={"plan": plan_payload()},
+    )
+    model = FakeModelClient(
+        [
+            ModelResponse(tool_calls=[request, coissued_write]),
+            ModelResponse(tool_calls=[submit]),
+        ]
+    )
+    registry = create_default_registry(tmp_path)
+    agent = AgentController(
+        model_client=model,
+        tool_registry=registry,
+        auto_plan_policy=AutoPlanPolicy(AutoPlanMode.ADAPTIVE),
+    )
+
+    result = agent.run("Decide the safe implementation scope", memory=memory)
+
+    assert result.status == "plan_ready"
+    first_tools = {schema["function"]["name"] for schema in model.requests[0]["tools"]}
+    second_tools = {schema["function"]["name"] for schema in model.requests[1]["tools"]}
+    assert "request_plan" in first_tools
+    assert "submit_plan" not in first_tools
+    assert second_tools == PLANNING_TOOL_NAMES
+    assert not (tmp_path / "should-not-exist.py").exists()
+    request_result = next(item for item in memory.messages if item.tool_call_id == "request-plan")
+    assert "read-only Plan Mode" in (request_result.content or "")
+    blocked_write = next(item for item in memory.messages if item.tool_call_id == "unsafe-write")
+    assert "were not executed" in (blocked_write.content or "")
+
+
+def test_auto_plan_off_hides_model_transition_tool(tmp_path: Path) -> None:
+    model = FakeModelClient([ModelResponse(content="No change is required.")])
+    registry = create_default_registry(tmp_path)
+    agent = AgentController(
+        model_client=model,
+        tool_registry=registry,
+        auto_plan_policy=AutoPlanPolicy(AutoPlanMode.OFF),
+    )
+
+    result = agent.run("Inspect the current state", memory=MemoryState(session_id="off"))
+
+    assert result.status == "success"
+    visible_tools = {schema["function"]["name"] for schema in model.requests[0]["tools"]}
+    assert "request_plan" not in visible_tools

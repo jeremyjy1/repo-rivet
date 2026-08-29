@@ -1,5 +1,6 @@
 """Mutable state for one explicit RepoRivet agent loop."""
 
+import hashlib
 import json
 import time
 from dataclasses import dataclass, field
@@ -18,6 +19,7 @@ from repo_rivet.verification.models import (
 )
 
 _FILE_MODIFICATION_TOOLS = frozenset({"edit_file", "write_file"})
+_PROGRESS_NEUTRAL_TOOLS = frozenset({"record_decision"})
 
 
 class AgentStatus(StrEnum):
@@ -44,6 +46,10 @@ class SessionState:
     workflow_mode: WorkflowMode = WorkflowMode.EXECUTE
     messages: list[dict[str, Any]] = field(default_factory=list)
     step_count: int = 0
+    step_limit: int | None = None
+    progress_revision: int = 0
+    checkpoint_progress_revision: int = 0
+    progress_signatures: set[str] = field(default_factory=set)
     tool_call_count: int = 0
     initial_tool_call_count: int = 0
     modified_files: set[str] = field(default_factory=set)
@@ -107,19 +113,17 @@ class SessionState:
             )
         return False
 
-    def record_model_error(self, error: str) -> None:
+    def record_model_error(self, error: str, *, recovery_instruction: str | None = None) -> None:
         """Record an unusable model response and request a corrected response."""
         self.step_count += 1
         self.empty_model_responses += 1
         self.recent_errors.append(error)
         self.recent_errors[:] = self.recent_errors[-5:]
+        instruction = recovery_instruction or ("Return valid text or a valid function tool call.")
         self.messages.append(
             {
                 "role": "system",
-                "content": (
-                    f"The previous model response was invalid: {error}. "
-                    "Return valid text or a valid function tool call."
-                ),
+                "content": f"The previous model response was invalid: {error}. {instruction}",
             }
         )
 
@@ -148,6 +152,7 @@ class SessionState:
 
         if result.ok:
             self.consecutive_failures = 0
+            self.record_meaningful_progress(call, result)
         else:
             self.consecutive_failures += 1
             if result.error:
@@ -164,6 +169,36 @@ class SessionState:
                     self.verification_results[check_id] = verification.model_copy(
                         update={"status": VerificationStatus.STALE}
                     )
+
+    def record_meaningful_progress(self, call: ToolCall, result: ToolResult) -> None:
+        """Record a new successful observation without trusting model claims."""
+        if not result.ok or call.name in _PROGRESS_NEUTRAL_TOOLS:
+            return
+        serialized = json.dumps(
+            {
+                "name": call.name,
+                "arguments": call.arguments,
+                "output": result.output,
+                "metadata": result.metadata,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+        signature = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+        if signature in self.progress_signatures:
+            return
+        self.progress_signatures.add(signature)
+        self.progress_revision += 1
+
+    @property
+    def made_progress_since_checkpoint(self) -> bool:
+        return self.progress_revision > self.checkpoint_progress_revision
+
+    def renew_step_checkpoint(self, window: int) -> None:
+        """Grant another bounded window after locally observed progress."""
+        self.checkpoint_progress_revision = self.progress_revision
+        self.step_limit = self.step_count + window
 
     def record_verification_result(self, result: VerificationResult) -> None:
         self.verification_results[result.check_id] = result
@@ -207,7 +242,9 @@ class SessionState:
         return (
             f"Agent status: {self.status.value}.\n"
             f"Workflow mode: {self.workflow_mode.value}.\n"
-            f"Model steps: {self.step_count}. Tool calls: {self.tool_call_count}.\n"
+            f"Model steps: {self.step_count}. Next progress checkpoint: "
+            f"{self.step_limit or '?'}. "
+            f"Tool calls: {self.tool_call_count}.\n"
             f"Modified files: {modified}.\n"
             f"Workspace revision: {self.workspace_revision}.\n"
             f"Verification checks: {verification}.\n"
