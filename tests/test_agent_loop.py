@@ -494,31 +494,95 @@ def test_controller_persists_verifying_and_failed_scheduled_check_before_abort()
     assert memory.status == "stopped"
 
 
-def test_missing_verification_plan_gets_one_recovery_then_finishes_incomplete() -> None:
+def test_file_change_without_verification_plan_is_blocked_before_execution() -> None:
     write = call("1", "write_file", {"path": "app.py", "content": "new"})
     model = FakeModelClient(
         [
             ModelResponse(tool_calls=[decision("d1", "write_file"), write]),
-            ModelResponse(content="Done without a plan."),
-            ModelResponse(content="Still done without a plan."),
+            ModelResponse(
+                tool_calls=[
+                    verification_plan(),
+                    decision("d2", "write_file"),
+                    call("2", "write_file", {"path": "app.py", "content": "new"}),
+                ]
+            ),
+            ModelResponse(content="Implemented and verified."),
         ]
     )
-    tools = FakeToolRegistry([ToolResult(ok=True, output="written")])
+    tools = FakeToolRegistry(
+        [
+            ToolResult(ok=True, output="written"),
+            passed_verification_result(),
+        ]
+    )
     memory = MemoryState(session_id="missing-plan")
 
     result = controller(model, tools).run("fix the bug", memory=memory)
 
-    assert result.status == "incomplete"
-    assert result.reason == "no executable verification plan was registered after one recovery"
+    assert result.status == "success"
     assert len(model.requests) == 3
-    assert memory.verification_plan_recovery_attempts == 1
-    assert memory.candidate_final_assessment
-    recovery = model.requests[2]["messages"]
-    assert any("verification_plan_missing" in str(message.get("content")) for message in recovery)
+    assert [executed.name for executed in tools.calls] == ["write_file", "run_verification"]
+    blocked_result = next(
+        message
+        for message in memory.messages
+        if message.role == "tool" and message.tool_call_id == "1"
+    )
+    assert "verification_plan_missing" in (blocked_result.content or "")
+
+
+def test_legacy_missing_plan_recovery_allows_protocol_correction() -> None:
+    model = FakeModelClient(
+        [
+            ModelResponse(tool_calls=[decision("d1", "edit_file")]),
+            ModelResponse(tool_calls=[verification_plan()]),
+            ModelResponse(content="Recovered and verified."),
+        ]
+    )
+    tools = FakeToolRegistry([passed_verification_result(revision=0)])
+    memory = MemoryState(session_id="legacy-missing-plan")
+    memory.modified_files.add("app.py")
+    memory.verification_plan_recovery_attempts = 1
+
+    result = controller(model, tools).run("continue", memory=memory)
+
+    assert result.status == "success"
+    assert len(model.requests) == 3
+    assert memory.verification_plan_recovery_attempts == 0
+    rejected_decision = next(
+        message
+        for message in memory.messages
+        if message.role == "tool" and message.tool_call_id == "d1"
+    )
+    assert '"retryable": true' in (rejected_decision.content or "")
+    second_recovery = model.requests[1]["messages"]
+    assert any(
+        "register_verification only" in str(message.get("content")) for message in second_recovery
+    )
+
+
+def test_missing_plan_recovery_is_bounded() -> None:
+    model = FakeModelClient(
+        [
+            ModelResponse(content="Still not registering a plan."),
+            ModelResponse(content="Still not registering a plan."),
+            ModelResponse(content="Still not registering a plan."),
+        ]
+    )
+    memory = MemoryState(session_id="bounded-missing-plan")
+    memory.modified_files.add("app.py")
+    memory.verification_plan_recovery_attempts = 1
+
+    result = controller(model, FakeToolRegistry([])).run("continue", memory=memory)
+
+    assert result.status == "incomplete"
+    assert result.reason == (
+        "no executable verification plan was registered after 3 recovery attempts"
+    )
+    assert len(model.requests) == 3
+    assert memory.verification_plan_recovery_attempts == 3
 
 
 def test_provider_block_preserves_candidate_assessment_and_error_details() -> None:
-    write = call("1", "write_file", {"path": "app.py", "content": "new"})
     provider_error = ModelRequestError(
         ModelErrorRecord(
             error_type="BadRequestError",
@@ -537,16 +601,16 @@ def test_provider_block_preserves_candidate_assessment_and_error_details() -> No
     )
     model = FakeModelClient(
         [
-            ModelResponse(tool_calls=[decision("d1", "write_file"), write]),
             ModelResponse(content="Candidate final answer."),
             provider_error,
         ]
     )
     memory = MemoryState(session_id="blocked-provider")
+    memory.modified_files.add("app.py")
 
     result = controller(
         model,
-        FakeToolRegistry([ToolResult(ok=True, output="written")]),
+        FakeToolRegistry([]),
     ).run("fix", memory=memory)
 
     assert result.status == "blocked"
@@ -700,7 +764,6 @@ def test_agent_passes_prior_conversation_to_context() -> None:
     assert "first request" in task_spec
     assert "continue" not in task_spec
     assert "continue" in contents
-    assert any("Durable subsequent user requirements" in str(content) for content in contents)
     assert any("First result." in str(content) for content in contents)
 
 

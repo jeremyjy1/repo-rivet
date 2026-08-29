@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
@@ -43,6 +44,48 @@ def decision(
             "next_tool_argument_summary": "target app.py",
             "expected_result": "The declared action produces a local observation",
             "confidence": 0.85,
+        },
+    )
+
+
+def verification_plan() -> ToolCall:
+    return ToolCall(
+        id="verification-plan",
+        name="register_verification",
+        arguments={
+            "requirements": ["tests-pass"],
+            "checks": [
+                {
+                    "check_id": "tests",
+                    "title": "Run tests",
+                    "kind": "test",
+                    "command": {"program": "pytest", "args": ["-q"]},
+                    "criteria": {"expected_exit_codes": [0]},
+                    "required": True,
+                    "claim_ids": ["tests-pass"],
+                    "provenance": "model",
+                }
+            ],
+        },
+    )
+
+
+def passed_verification_result(*, revision: int = 1) -> ToolResult:
+    now = datetime.now(UTC).isoformat()
+    return ToolResult(
+        ok=True,
+        output="passed",
+        metadata={
+            "exit_code": 0,
+            "verification_result": {
+                "check_id": "tests",
+                "status": "passed",
+                "workspace_revision": revision,
+                "exit_code": 0,
+                "reasons": ["all registered success criteria passed"],
+                "started_at": now,
+                "finished_at": now,
+            },
         },
     )
 
@@ -137,10 +180,17 @@ def test_matching_decision_executes_action_and_creates_executor_observation() ->
         name="write_file",
         arguments={"path": "app.py", "content": "new"},
     )
-    tools = FakeToolRegistry([ToolResult(ok=True, output="written", metadata={"path": "app.py"})])
+    tools = FakeToolRegistry(
+        [
+            ToolResult(ok=True, output="written", metadata={"path": "app.py"}),
+            passed_verification_result(),
+        ]
+    )
     agent, memory = controller(
         [
-            ModelResponse(tool_calls=[decision("decision-1", "write_file"), write]),
+            ModelResponse(
+                tool_calls=[verification_plan(), decision("decision-1", "write_file"), write]
+            ),
             ModelResponse(content="Changed app.py."),
         ],
         tools,
@@ -148,8 +198,10 @@ def test_matching_decision_executes_action_and_creates_executor_observation() ->
 
     agent.run("change app.py", memory=memory)
 
-    assert tools.calls == [write]
-    observation = memory.observation_events[-1]
+    assert tools.calls[0] == write
+    observation = next(
+        event for event in memory.observation_events if event.tool_call_id == "write-1"
+    )
     assert observation.ok
     assert observation.tool_call_id == "write-1"
     assert observation.affected_paths == ["app.py"]
@@ -645,8 +697,15 @@ def test_task_decision_cannot_bypass_independent_read_only_approval(tmp_path: Pa
     agent = AgentController(
         model_client=FakeModelClient(
             [
-                ModelResponse(tool_calls=[decision("decision-1", "write_file"), write]),
+                ModelResponse(
+                    tool_calls=[
+                        verification_plan(),
+                        decision("decision-1", "write_file"),
+                        write,
+                    ]
+                ),
                 ModelResponse(content="The write was denied."),
+                ModelResponse(content="The requested write and verification were denied."),
             ]
         ),
         tool_registry=registry,
@@ -657,5 +716,8 @@ def test_task_decision_cannot_bypass_independent_read_only_approval(tmp_path: Pa
     assert not (tmp_path / "app.py").exists()
     assert memory.reasoning_events[-1].next_action
     assert memory.reasoning_events[-1].next_action.tool_name == "write_file"
-    assert not memory.observation_events[-1].ok
+    write_observation = next(
+        event for event in memory.observation_events if event.tool_call_id == "write-1"
+    )
+    assert not write_observation.ok
     assert memory.reflection_required

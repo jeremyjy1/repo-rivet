@@ -32,6 +32,9 @@ class FakeToolRegistry:
     def schemas(self) -> list[dict[str, Any]]:
         return []
 
+    def modifies_workspace_files(self, tool_name: str) -> bool:
+        return tool_name in {"edit_file", "write_file"}
+
     def execute(self, call: ToolCall) -> ToolResult:
         self.calls.append(call)
         return next(self._results)

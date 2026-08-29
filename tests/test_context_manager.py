@@ -39,13 +39,14 @@ def test_build_keeps_fixed_task_state_summary_and_recent_messages() -> None:
 
     assert messages[0] == {"role": "system", "content": SYSTEM_PROMPT}
     assert "preserve this original task exactly" in messages[1]["content"]
-    assert "Current structured state" in messages[-1]["content"]
-    assert f"src/app.py: {'a' * 64}" in messages[-1]["content"]
+    assert "Cache-epoch checkpoint" in messages[2]["content"]
+    assert "Structured state at epoch start" in messages[2]["content"]
+    assert f"src/app.py: {'a' * 64}" in messages[2]["content"]
     assert any("pytest still fails" in str(message.get("content")) for message in messages)
     assert any(message.get("content") == "recent decision" for message in messages)
 
 
-def test_build_keeps_stable_prefix_and_places_changing_state_after_history() -> None:
+def test_build_keeps_exact_prior_request_prefix_and_only_appends_new_turns() -> None:
     memory = make_memory()
     manager = ContextManager()
     first = manager.build(
@@ -54,6 +55,8 @@ def test_build_keeps_stable_prefix_and_places_changing_state_after_history() -> 
         remaining_steps=29,
         tools=[],
     )
+    checkpoint = memory.context_checkpoint
+    memory.messages.append(Message(role="assistant", content="first response"))
 
     memory.start_task(
         task="also add unit tests",
@@ -63,7 +66,6 @@ def test_build_keeps_stable_prefix_and_places_changing_state_after_history() -> 
         completion_rules=["verify after changes"],
         max_steps=30,
     )
-    memory.messages.append(Message(role="assistant", content="updated response"))
     second = manager.build(
         memory=memory,
         state_summary="second state",
@@ -71,25 +73,55 @@ def test_build_keeps_stable_prefix_and_places_changing_state_after_history() -> 
         tools=[],
     )
 
-    assert second[:2] == first[:2]
+    assert second[: len(first)] == first
+    assert memory.context_checkpoint == checkpoint
     assert "also add unit tests" not in second[1]["content"]
-    update_index = next(
-        index
-        for index, message in enumerate(second)
-        if message.get("content") == "also add unit tests"
+    assert [message.get("content") for message in second[-2:]] == [
+        "first response",
+        "also add unit tests",
+    ]
+    assert second[: len(first) + 1] == [
+        *first,
+        {"role": "assistant", "content": "first response"},
+    ]
+    assert "first state" in second[2]["content"]
+    assert "second state" not in str(second)
+
+
+def test_tool_turn_is_appended_after_exact_prior_request_without_reordering() -> None:
+    memory = make_memory()
+    manager = ContextManager()
+    first = manager.build(
+        memory=memory,
+        state_summary="first state",
+        remaining_steps=29,
+        tools=[],
     )
-    response_index = next(
-        index
-        for index, message in enumerate(second)
-        if message.get("content") == "updated response"
+    assistant = Message(
+        role="assistant",
+        tool_calls=[
+            {
+                "id": "call-1",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": '{"path":"app.py"}'},
+            }
+        ],
     )
-    state_index = next(
-        index
-        for index, message in enumerate(second)
-        if "Current structured state" in str(message.get("content"))
+    tool_result = Message(role="tool", tool_call_id="call-1", content="observed content")
+    memory.messages.extend([assistant, tool_result])
+
+    second = manager.build(
+        memory=memory,
+        state_summary="second state",
+        remaining_steps=28,
+        tools=[],
     )
-    assert 1 < update_index < response_index < state_index
-    assert "also add unit tests" in second[-2]["content"]
+
+    assert second[: len(first)] == first
+    assert second[len(first) :] == [
+        assistant.as_chat_message(),
+        tool_result.as_chat_message(),
+    ]
 
 
 def test_normal_pressure_does_not_compact_append_only_history() -> None:
@@ -137,8 +169,9 @@ def test_build_includes_only_bounded_recent_auditable_trace() -> None:
         for message in messages
         if "Recent auditable trace" in str(message.get("content"))
     )
-    assert "bounded decision 5" in structured
-    assert "bounded decision 0" not in structured
+    recent_trace = structured.partition("Recent auditable trace:")[2]
+    assert "bounded decision 5" in recent_trace
+    assert "bounded decision 0" not in recent_trace
 
 
 def test_build_truncates_large_tool_output_without_mutating_memory() -> None:
@@ -271,10 +304,63 @@ def test_fixed_context_larger_than_configured_window_is_rejected() -> None:
     assert memory.fixed is not None
     memory.fixed.original_task = "large fixed task " * 2_000
 
-    with pytest.raises(ValueError, match="exceed the safe prompt budget"):
+    with pytest.raises(ValueError, match="exceed the active prompt budget"):
         ContextManager().build(
             memory=memory,
             state_summary="state",
             remaining_steps=10,
             tools=[],
         )
+
+
+def test_large_model_window_still_compacts_at_active_prompt_cost_limit() -> None:
+    memory = make_memory(
+        config=MemoryConfig(
+            recent_message_limit=4,
+            max_context_tokens=1_048_576,
+            active_prompt_limit=8_000,
+        )
+    )
+    for index in range(30):
+        memory.messages.append(
+            Message(role="assistant", content=f"costly history {index} " + "x" * 1_000)
+        )
+
+    manager = ContextManager()
+    messages = manager.build(
+        memory=memory,
+        state_summary="latest state after cost compaction",
+        remaining_steps=5,
+        tools=[],
+    )
+
+    assert memory.compaction_count == 1
+    assert len(memory.messages) <= 4
+    assert memory.context_checkpoint is not None
+    assert "latest state after cost compaction" in memory.context_checkpoint
+    assert manager.last_request_tokens <= 8_000
+    assert messages[2]["content"] == memory.context_checkpoint
+
+
+def test_cache_checkpoint_bounds_long_structured_summary_entries() -> None:
+    memory = make_memory(
+        config=MemoryConfig(
+            max_context_tokens=1_048_576,
+            active_prompt_limit=16_000,
+        )
+    )
+    memory.summary.key_decisions = [f"decision {index}: " + "x" * 1_000 for index in range(100)]
+
+    manager = ContextManager()
+    manager.build(
+        memory=memory,
+        state_summary="state",
+        remaining_steps=5,
+        tools=[],
+    )
+
+    assert memory.context_checkpoint is not None
+    assert "80 earlier entries" in memory.context_checkpoint
+    assert "decision 99" in memory.context_checkpoint
+    assert "decision 0:" not in memory.context_checkpoint
+    assert manager.last_request_tokens <= 16_000

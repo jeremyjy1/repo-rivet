@@ -73,6 +73,7 @@ class TokenConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
+    active_prompt_limit: int = Field(default=65_536, ge=1_000)
     reserved_output_tokens: int = Field(default=4_096, ge=100)
     reserved_tool_result_tokens: int = Field(default=2_048, ge=0)
     safety_margin_ratio: float = Field(default=0.15, ge=0, lt=0.5)

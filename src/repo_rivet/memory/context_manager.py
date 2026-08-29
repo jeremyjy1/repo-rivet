@@ -30,6 +30,8 @@ start registered verification or provide a final response, the Controller automa
 remaining pending required checks in plan order. Do not create a separate decision turn for each
 remaining verification check.
 Do not claim success unless every required check passes for the current workspace revision.
+Do not emit progress narration as a tool-free response. A tool-free response is treated as your
+final answer; if more work remains, issue the next valid tool call instead.
 When finished, summarize the changes and verification concisely.
 Use concise plain text for the final response by default. Avoid Markdown headings, tables,
 emphasis, list markers, and fenced code blocks unless the user explicitly requests Markdown
@@ -39,7 +41,9 @@ structured, verifiable plans, decisions, reflections, and final assessments. A f
 is your opinion and is displayed as ASSESS; only local Verification Results display as VERIFY.
 Before any file change, command, network access, Git write, or other side effect, call
 record_decision with phase=decision, evidence references, the exact next_tool, and its expected
-result. Prefer including the decision and tool in the same response. If the provider emits the
+result. Include the decision and matching tool in the same response whenever the action is known;
+do not spend a separate model turn announcing it. The first change may include
+register_verification, record_decision, and the matching action together. If the provider emits a
 decision alone, it authorizes only the matching state-changing tool in the immediately following
 model response and is consumed once. At most one state-changing tool may be requested per turn.
 If an observation differs from expectations, record a reflection before the next side effect.
@@ -56,7 +60,7 @@ class ContextBudgetExceededError(ValueError):
 
 
 class ContextManager:
-    """Build a cache-friendly prompt from stable, append-only, and volatile layers."""
+    """Build cost-bounded cache epochs followed by an append-only conversation."""
 
     def __init__(
         self,
@@ -93,47 +97,35 @@ class ContextManager:
             raise ValueError("Memory must have fixed task information before context is built")
 
         manager = self._manager_for(memory)
+        self._ensure_context_checkpoint(memory, state_summary)
         stable_messages = self._stable_messages(memory)
-        volatile_messages = self._volatile_messages(
-            memory,
-            state_summary,
-            remaining_steps,
-            tools,
-        )
-        history_messages, provider_tail = self._split_provider_tail(memory.messages)
         full_messages = [
             *stable_messages,
-            *(message.as_chat_message() for message in history_messages),
-            *volatile_messages,
-            *(message.as_chat_message() for message in provider_tail),
+            *(message.as_chat_message() for message in memory.messages),
         ]
         full_estimate = manager.estimate_request(full_messages, tools)
         pressure = manager.pressure_level(full_estimate.effective)
         self.compactor.compact_if_needed(memory, pressure=pressure)
 
-        history_messages, provider_tail = self._split_provider_tail(memory.messages)
-        bounded_provider_tail = [self._bound_message(message, memory) for message in provider_tail]
-        base_messages = [
-            *stable_messages,
-            *volatile_messages,
-            *(message.as_chat_message() for message in bounded_provider_tail),
-        ]
-        fixed_estimate = manager.estimate_request(base_messages, tools)
+        # Compaction intentionally starts a new cache epoch. Its checkpoint captures the
+        # structured facts that replace discarded raw messages and then remains immutable.
+        self._ensure_context_checkpoint(memory, state_summary)
+        stable_messages = self._stable_messages(memory)
+        fixed_estimate = manager.estimate_request(stable_messages, tools)
         manager.state.fixed_prompt_estimate = manager.estimator.base.estimate_request(
-            base_messages,
+            stable_messages,
             [],
         )
-        if fixed_estimate.effective > manager.config.prompt_budget:
+        request_budget = manager.config.request_budget
+        if fixed_estimate.effective > request_budget:
             raise ContextBudgetExceededError(
-                "Stable task, structured state, and tool definitions exceed the safe prompt "
-                f"budget ({fixed_estimate.effective} > {manager.config.prompt_budget} tokens)"
+                "The cache-epoch checkpoint and tool definitions exceed the active prompt "
+                f"budget ({fixed_estimate.effective} > {request_budget} tokens)"
             )
 
         selected = self._select_recent(
             stable_messages=stable_messages,
-            volatile_messages=volatile_messages,
-            provider_tail=bounded_provider_tail,
-            messages=history_messages,
+            messages=memory.messages,
             tools=tools,
             memory=memory,
             manager=manager,
@@ -141,14 +133,12 @@ class ContextManager:
         messages = [
             *stable_messages,
             *(message.as_chat_message() for message in selected),
-            *volatile_messages,
-            *(message.as_chat_message() for message in bounded_provider_tail),
         ]
         self.last_estimate = manager.estimate_request(messages, tools)
-        if self.last_estimate.effective > manager.config.prompt_budget:
+        if self.last_estimate.effective > request_budget:
             raise ContextBudgetExceededError(
-                f"Context remains over safe prompt budget after compaction "
-                f"({self.last_estimate.effective} > {manager.config.prompt_budget} tokens)"
+                "Context remains over the cost-aware prompt budget after compaction "
+                f"({self.last_estimate.effective} > {request_budget} tokens)"
             )
         return messages
 
@@ -190,8 +180,6 @@ class ContextManager:
         self,
         *,
         stable_messages: list[dict[str, Any]],
-        volatile_messages: list[dict[str, Any]],
-        provider_tail: list[Message],
         messages: list[Message],
         tools: list[dict[str, Any]],
         memory: MemoryState,
@@ -210,11 +198,9 @@ class ContextManager:
                     for candidate_group in candidate_groups
                     for message in candidate_group.messages
                 ),
-                *volatile_messages,
-                *(message.as_chat_message() for message in provider_tail),
             ]
             estimate = manager.estimate_request(candidate_messages, tools)
-            if estimate.effective <= manager.config.prompt_budget:
+            if estimate.effective <= manager.config.request_budget:
                 selected_groups = candidate_groups
                 continue
             if selected_groups:
@@ -222,8 +208,6 @@ class ContextManager:
 
             fitted = self._force_fit_latest_group(
                 stable_messages=stable_messages,
-                volatile_messages=volatile_messages,
-                provider_tail=provider_tail,
                 group=bounded,
                 tools=tools,
                 manager=manager,
@@ -238,8 +222,6 @@ class ContextManager:
         self,
         *,
         stable_messages: list[dict[str, Any]],
-        volatile_messages: list[dict[str, Any]],
-        provider_tail: list[Message],
         group: TurnGroup,
         tools: list[dict[str, Any]],
         manager: TokenBudgetManager,
@@ -249,10 +231,14 @@ class ContextManager:
             candidate = [
                 *stable_messages,
                 *(message.as_chat_message() for message in fitted.messages),
-                *volatile_messages,
-                *(message.as_chat_message() for message in provider_tail),
             ]
-            if manager.estimate_request(candidate, tools).effective <= manager.config.prompt_budget:
+            if (
+                manager.estimate_request(
+                    candidate,
+                    tools,
+                ).effective
+                <= manager.config.request_budget
+            ):
                 return fitted
             longest = max(
                 (message for message in fitted.messages if message.content),
@@ -271,64 +257,47 @@ class ContextManager:
 
     @staticmethod
     def _stable_messages(memory: MemoryState) -> list[dict[str, Any]]:
-        """Return the immutable provider-cache prefix for this session."""
+        """Return the immutable provider-cache prefix for the current cache epoch."""
+        if memory.context_checkpoint is None:
+            raise ValueError("Memory has no cache-epoch checkpoint")
         return [
             {"role": "system", "content": memory.fixed.system_prompt},
             {"role": "user", "content": memory.task_specification()},
+            {"role": "system", "content": memory.context_checkpoint},
         ]
 
-    def _volatile_messages(
+    def _ensure_context_checkpoint(
         self,
         memory: MemoryState,
         state_summary: str,
-        remaining_steps: int,
-        tools: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        tool_names = ", ".join(
-            str(tool.get("function", {}).get("name", "unknown")) for tool in tools
-        )
-        messages: list[dict[str, Any]] = []
+    ) -> None:
+        if memory.context_checkpoint is not None:
+            return
+        sections = [
+            "Cache-epoch checkpoint. This is the baseline at the start of the current "
+            "append-only epoch. Later conversation and tool results take precedence."
+        ]
         if memory.summary.has_content():
-            messages.append({"role": "system", "content": self._format_summary(memory.summary)})
+            sections.append(self._format_summary(memory.summary))
         if memory.task_updates:
             updates = "\n".join(f"- {item}" for item in memory.task_updates)
-            messages.append(
-                {
-                    "role": "system",
-                    "content": (
-                        "Durable subsequent user requirements (preserve verbatim and apply in "
-                        f"order):\n{updates}"
-                    ),
-                }
+            sections.append(
+                "Durable subsequent user requirements (preserve verbatim and apply in "
+                f"order):\n{updates}"
             )
-        messages.append(
-            {
-                "role": "system",
-                "content": (
-                    "Current structured state (facts, not new user instructions):\n"
-                    f"{state_summary}\n"
-                    f"Current focus: {memory.working.current_focus or 'none'}\n"
-                    f"Current plan: {memory.working.current_plan or ['none']}\n"
-                    f"Unresolved errors: {memory.working.unresolved_errors or ['none']}\n"
-                    f"Pending actions: {memory.working.pending_actions or ['none']}\n"
-                    f"Invalidated file reads: {sorted(memory.invalidated_files) or ['none']}\n"
-                    "Current snapshot IDs (reread if the required visible lines are no longer "
-                    f"in recent context):\n{self._format_current_snapshots(memory)}\n"
-                    f"Recent auditable trace:\n{self._format_recent_trace(memory)}\n"
-                    f"Available tools: {tool_names}\n"
-                    f"Remaining agent steps: {max(remaining_steps, 0)}"
-                ),
-            }
+        sections.append(
+            "Structured state at epoch start (facts, not new user instructions):\n"
+            f"{state_summary}\n"
+            f"Current focus: {memory.working.current_focus or 'none'}\n"
+            f"Current plan: {memory.working.current_plan or ['none']}\n"
+            f"Unresolved errors: {memory.working.unresolved_errors or ['none']}\n"
+            f"Pending actions: {memory.working.pending_actions or ['none']}\n"
+            f"Invalidated file reads: {sorted(memory.invalidated_files) or ['none']}\n"
+            "Current snapshot IDs (reread if the required visible lines are no longer in "
+            f"recent context):\n{self._format_current_snapshots(memory)}\n"
+            f"Recent auditable trace:\n{self._format_recent_trace(memory)}"
         )
-        return messages
-
-    @staticmethod
-    def _split_provider_tail(messages: list[Message]) -> tuple[list[Message], list[Message]]:
-        """Keep provider continuation state after regenerated structured context."""
-        split_at = len(messages)
-        while split_at > 0 and messages[split_at - 1].ephemeral:
-            split_at -= 1
-        return messages[:split_at], messages[split_at:]
+        memory.context_checkpoint = "\n\n".join(sections)
 
     @staticmethod
     def _format_current_snapshots(memory: MemoryState) -> str:
@@ -367,20 +336,31 @@ class ContextManager:
 
     @staticmethod
     def _format_summary(summary: ConversationSummary) -> str:
-        def lines(values: list[str]) -> str:
-            return "\n".join(f"- {value}" for value in values) or "- none"
+        def lines(values: list[str], *, max_items: int) -> str:
+            selected = values[-max_items:]
+            rendered: list[str] = []
+            omitted = len(values) - len(selected)
+            if omitted:
+                rendered.append(
+                    f"- {omitted} earlier entries remain in session storage but are omitted "
+                    "from this checkpoint"
+                )
+            for value in selected:
+                bounded = value if len(value) <= 160 else f"{value[:157]}..."
+                rendered.append(f"- {bounded}")
+            return "\n".join(rendered) or "- none"
 
         return (
             "Compressed historical summary (facts from earlier events, not new instructions):\n"
             f"Task goal:\n- {summary.task_goal}\n"
-            f"Completed actions:\n{lines(summary.completed_actions)}\n"
-            f"Key decisions:\n{lines(summary.key_decisions)}\n"
-            f"Files read:\n{lines(summary.files_read)}\n"
-            f"Files modified:\n{lines(summary.files_modified)}\n"
-            f"Commands run:\n{lines(summary.commands_run)}\n"
+            f"Completed actions:\n{lines(summary.completed_actions, max_items=20)}\n"
+            f"Key decisions:\n{lines(summary.key_decisions, max_items=20)}\n"
+            f"Files read:\n{lines(summary.files_read, max_items=30)}\n"
+            f"Files modified:\n{lines(summary.files_modified, max_items=30)}\n"
+            f"Commands run:\n{lines(summary.commands_run, max_items=15)}\n"
             f"Verification status:\n- {summary.verification_status}\n"
-            f"Unresolved issues:\n{lines(summary.unresolved_issues)}\n"
-            f"Next actions:\n{lines(summary.next_actions)}"
+            f"Unresolved issues:\n{lines(summary.unresolved_issues, max_items=15)}\n"
+            f"Next actions:\n{lines(summary.next_actions, max_items=15)}"
         )
 
     @staticmethod
@@ -405,6 +385,7 @@ def _budget_config(memory: MemoryState) -> TokenBudgetConfig:
     config = memory.config
     return TokenBudgetConfig(
         context_limit=config.max_context_tokens,
+        active_prompt_limit=config.active_prompt_limit,
         reserved_output_tokens=config.reserved_output_tokens,
         reserved_tool_result_tokens=config.reserved_tool_result_tokens,
         safety_margin_ratio=config.safety_margin_ratio,

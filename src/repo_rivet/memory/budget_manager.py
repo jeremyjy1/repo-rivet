@@ -13,6 +13,7 @@ from repo_rivet.memory.token_estimator import CalibratedTokenEstimator, TokenEst
 @dataclass(frozen=True, slots=True)
 class TokenBudgetConfig:
     context_limit: int
+    active_prompt_limit: int = 65_536
     reserved_output_tokens: int = 4_096
     reserved_tool_result_tokens: int = 2_048
     safety_margin_ratio: float = 0.15
@@ -27,6 +28,11 @@ class TokenBudgetConfig:
         fixed_reserve = self.reserved_output_tokens + self.reserved_tool_result_tokens
         safety_margin = int(self.context_limit * self.safety_margin_ratio)
         return max(0, self.context_limit - fixed_reserve - safety_margin)
+
+    @property
+    def request_budget(self) -> int:
+        """Return the cost-aware request ceiling within the provider-safe budget."""
+        return min(self.prompt_budget, self.active_prompt_limit)
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,7 +111,11 @@ class TokenBudgetManager:
             return "overflow"
         if effective_tokens >= int(budget * self.config.hard_limit_ratio):
             return "aggressive"
-        if effective_tokens >= int(budget * self.config.soft_limit_ratio):
+        compact_at = min(
+            int(budget * self.config.soft_limit_ratio),
+            self.config.active_prompt_limit,
+        )
+        if effective_tokens >= compact_at:
             return "compact"
         return "normal"
 

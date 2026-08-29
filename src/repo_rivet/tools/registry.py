@@ -34,6 +34,13 @@ _STATE_CHANGING_CAPABILITIES = frozenset(
     }
 )
 
+_WORKSPACE_FILE_CHANGE_CAPABILITIES = frozenset(
+    {
+        Capability.FILESYSTEM_WRITE,
+        Capability.FILESYSTEM_DELETE,
+    }
+)
+
 
 class ToolRegistry:
     """Own the available tools and dispatch validated model calls."""
@@ -69,6 +76,11 @@ class ToolRegistry:
         """Return whether a registered tool declares any side-effect capability."""
         tool = self._tools.get(tool_name)
         return bool(tool and tool.capabilities & _STATE_CHANGING_CAPABILITIES)
+
+    def modifies_workspace_files(self, tool_name: str) -> bool:
+        """Return whether a tool declares workspace file mutation capabilities."""
+        tool = self._tools.get(tool_name)
+        return bool(tool and tool.capabilities & _WORKSPACE_FILE_CHANGE_CAPABILITIES)
 
     def execute(self, call: ToolCall) -> ToolResult:
         tool = self._tools.get(call.name)

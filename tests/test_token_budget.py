@@ -17,6 +17,26 @@ def test_prompt_budget_reserves_output_tool_result_and_safety_margin() -> None:
     )
 
     assert config.prompt_budget == 21_056
+    assert config.request_budget == 21_056
+
+
+def test_large_context_uses_independent_active_prompt_cost_limit() -> None:
+    config = TokenBudgetConfig(
+        context_limit=1_048_576,
+        active_prompt_limit=65_536,
+    )
+    manager = TokenBudgetManager(
+        estimator=ApproximateTokenEstimator(),
+        config=config,
+        calibration_store=None,
+        base_url="https://gateway.example/v1",
+        model="large-context-model",
+    )
+
+    assert config.prompt_budget > 800_000
+    assert config.request_budget == 65_536
+    assert manager.pressure_level(65_535) == "normal"
+    assert manager.pressure_level(65_536) == "compact"
 
 
 def test_calibrator_uses_defaults_small_sample_max_and_larger_sample_p90() -> None:

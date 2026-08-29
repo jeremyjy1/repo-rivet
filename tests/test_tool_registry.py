@@ -45,6 +45,15 @@ def test_registry_validates_tool_arguments(tmp_path: Path) -> None:
     assert "Invalid arguments" in (result.error or "")
 
 
+def test_registry_identifies_workspace_file_mutation_semantically(tmp_path: Path) -> None:
+    registry = create_default_registry(tmp_path)
+
+    assert registry.modifies_workspace_files("write_file")
+    assert registry.modifies_workspace_files("edit_file")
+    assert not registry.modifies_workspace_files("run_command")
+    assert not registry.modifies_workspace_files("read_file")
+
+
 def test_run_verification_rejects_model_supplied_command(tmp_path: Path) -> None:
     registry = create_default_registry(tmp_path)
 

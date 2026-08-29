@@ -730,6 +730,7 @@ def _build_approval_engine(
 def _memory_config(config: AppConfig) -> MemoryConfig:
     return MemoryConfig(
         max_context_tokens=config.api.context_window_tokens,
+        active_prompt_limit=config.token.active_prompt_limit,
         reserved_output_tokens=config.token.reserved_output_tokens,
         reserved_tool_result_tokens=config.token.reserved_tool_result_tokens,
         safety_margin_ratio=config.token.safety_margin_ratio,
@@ -744,6 +745,7 @@ def _memory_config(config: AppConfig) -> MemoryConfig:
 def _token_budget_config(memory_config: MemoryConfig) -> TokenBudgetConfig:
     return TokenBudgetConfig(
         context_limit=memory_config.max_context_tokens,
+        active_prompt_limit=memory_config.active_prompt_limit,
         reserved_output_tokens=memory_config.reserved_output_tokens,
         reserved_tool_result_tokens=memory_config.reserved_tool_result_tokens,
         safety_margin_ratio=memory_config.safety_margin_ratio,
@@ -761,6 +763,7 @@ def _print_runtime(console: Console, workspace: Path, runtime: Runtime) -> None:
             f"Workspace: {workspace.resolve()}\n"
             f"Model: {runtime.config.api.model}\n"
             f"Context window: {runtime.config.api.context_window_tokens} tokens\n"
+            f"Active prompt limit: {runtime.config.token.active_prompt_limit} tokens\n"
             f"Reserved output headroom: {runtime.config.token.reserved_output_tokens} tokens\n"
             f"Token estimator: {runtime.controller.context_manager.token_manager.name}\n"
             f"Approval mode: {runtime.registry.approval_engine.mode.value}\n"

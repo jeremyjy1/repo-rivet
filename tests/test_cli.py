@@ -289,6 +289,7 @@ def test_chat_manual_aggressive_compaction_preserves_tool_group_and_saves_state(
         session_id=store.session_id,
         config=MemoryConfig(recent_message_limit=10),
     )
+    memory.context_checkpoint = "checkpoint before manual compaction"
     for index in range(20):
         memory.messages.append(Message(role="assistant", content=f"old {index}"))
     memory.messages.extend(
@@ -321,6 +322,7 @@ def test_chat_manual_aggressive_compaction_preserves_tool_group_and_saves_state(
 
     assert exit_code == 0
     assert restored.compaction_count == 1
+    assert restored.context_checkpoint is None
     assert len(restored.messages) == 2
     assert restored.messages[0].tool_calls
     assert restored.messages[1].tool_call_id == "call-1"

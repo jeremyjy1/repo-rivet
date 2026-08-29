@@ -330,6 +330,7 @@ def test_resume_detects_external_file_change(tmp_path: Path) -> None:
         revision=0,
     )
     memory.summary.verification_status = "passed: pytest -q"
+    memory.context_checkpoint = "cached state before external change"
     file_path.write_text("changed externally", encoding="utf-8")
 
     changed = store.validate_workspace(memory, workspace)
@@ -339,6 +340,7 @@ def test_resume_detects_external_file_change(tmp_path: Path) -> None:
     assert memory.workspace_revision == 1
     assert memory.verification_results["tests"].status == VerificationStatus.STALE
     assert memory.summary.verification_status == "invalidated by external file changes"
+    assert memory.context_checkpoint is None
     assert any("External file change" in issue for issue in memory.working.unresolved_errors)
 
 

@@ -27,6 +27,7 @@ class MemoryConfig(BaseModel):
 
     recent_message_limit: int = Field(default=10, ge=4, le=30)
     max_context_tokens: int = Field(default=24_000, ge=1_000)
+    active_prompt_limit: int = Field(default=65_536, ge=1_000)
     reserved_output_tokens: int = Field(default=4_096, ge=100)
     reserved_tool_result_tokens: int = Field(default=2_048, ge=0)
     safety_margin_ratio: float = Field(default=0.15, ge=0, lt=0.5)
@@ -236,6 +237,7 @@ class MemoryState(BaseModel):
     config: MemoryConfig = Field(default_factory=MemoryConfig)
     fixed: FixedMemory | None = None
     task_updates: list[str] = Field(default_factory=list)
+    context_checkpoint: str | None = None
     messages: list[Message] = Field(default_factory=list)
     summary: ConversationSummary = Field(default_factory=ConversationSummary)
     working: WorkingMemory = Field(default_factory=WorkingMemory)
@@ -603,6 +605,7 @@ class MemoryState(BaseModel):
     def clear_recent_conversation(self) -> None:
         """Clear raw working messages while preserving fixed and structured memory."""
         self.messages.clear()
+        self.context_checkpoint = None
 
     def task_specification(self) -> str:
         """Render only session-stable task information for the prompt prefix."""

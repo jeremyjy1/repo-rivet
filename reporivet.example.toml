@@ -13,6 +13,8 @@ timeout_seconds = 60
 max_retries = 3
 
 [token]
+# Cost ceiling for one active cache epoch. The safe model budget still takes precedence.
+active_prompt_limit = 65536
 reserved_output_tokens = 4096
 reserved_tool_result_tokens = 2048
 safety_margin_ratio = 0.15

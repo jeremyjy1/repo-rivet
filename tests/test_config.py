@@ -25,6 +25,7 @@ timeout_seconds = 30
 max_retries = 2
 
 [token]
+active_prompt_limit = 16384
 reserved_output_tokens = 2048
 reserved_tool_result_tokens = 1024
 safety_margin_ratio = 0.10
@@ -46,6 +47,7 @@ max_context_overflow_retries = 1
     assert config.api.tokenizer_encoding == "cl100k_base"
     assert config.api.timeout_seconds == 30
     assert config.api.max_retries == 2
+    assert config.token.active_prompt_limit == 16384
     assert config.token.reserved_output_tokens == 2048
     assert config.token.reserved_tool_result_tokens == 1024
     assert config.token.safety_margin_ratio == 0.10

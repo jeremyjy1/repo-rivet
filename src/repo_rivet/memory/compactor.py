@@ -66,6 +66,7 @@ class ConversationCompactor:
             shrunken = self._shrink_current_tool_results(memory)
         if removed > 0 or shrunken > 0:
             memory.compaction_count += 1
+            memory.context_checkpoint = None
         return removed
 
     @staticmethod

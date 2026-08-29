@@ -7,7 +7,7 @@ RepoRivet 是一个本地优先的单智能体编程工具。它使用模型原�
 运行环境：Python 3.12、uv。
 
 1. 执行 uv sync。
-2. 复制 reporivet.example.toml 为 reporivet.toml，填写 OpenAI 兼容 API 的 key、base_url、model 和模型真实的 context_window_tokens。RepoRivet 不向模型发送输出长度限制；`token.reserved_output_tokens` 只用于上下文预算预留。tokenizer_encoding 可选：能够识别时使用模型 tokenizer，否则自动采用保守近似估算；真实配置已被 Git 忽略。
+2. 复制 reporivet.example.toml 为 reporivet.toml，填写 OpenAI 兼容 API 的 key、base_url、model 和模型真实的 context_window_tokens。RepoRivet 不向模型发送输出长度限制；`token.reserved_output_tokens` 只用于上下文预算预留。`token.active_prompt_limit` 是独立于模型窗口的单轮成本上限，默认 65536；达到上限后会压缩历史并开始新的缓存纪元。tokenizer_encoding 可选：能够识别时使用模型 tokenizer，否则自动采用保守近似估算；真实配置已被 Git 忽略。
 3. 在 `[approval]` 中选择审批模式（默认 `safe-auto`），然后运行：
    uv run reporivet run --approval-mode safe-auto --workspace ./examples/buggy_project "修复负数价格未被拒绝的问题，并运行测试"
 

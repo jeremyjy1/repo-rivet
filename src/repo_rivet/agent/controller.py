@@ -42,6 +42,8 @@ from repo_rivet.verification.models import (
 )
 from repo_rivet.verification.runtime import VerificationRuntime
 
+_MAX_VERIFICATION_PLAN_RECOVERY_ATTEMPTS = 3
+
 
 class EventSink(Protocol):
     """Minimal logging interface accepted by the controller."""
@@ -436,7 +438,10 @@ class AgentController:
             and bool(state.modified_files)
         )
         if awaiting_plan_recovery and not registration_calls:
-            error = "The single verification-plan recovery turn only allows register_verification."
+            error = (
+                "Verification-plan recovery requires register_verification before any other "
+                "action. Register the plan now; do not record a decision or repeat the edit yet."
+            )
             for call in calls:
                 self._log(
                     "tool_call",
@@ -450,22 +455,16 @@ class AgentController:
                     output="",
                     error=error,
                     error_code="verification_plan_missing",
-                    retryable=False,
+                    retryable=True,
                 )
                 if call.name in {"record_decision", "register_verification"}:
                     self._record_meta_result(call, result, state=state, memory=memory)
                 else:
                     self._record_blocked_action(call, result, state=state, memory=memory)
-            return self._finish(
-                state,
-                memory,
-                status="incomplete",
-                reason="no verification plan was registered in the recovery turn",
-                summary=(
-                    state.candidate_final_assessment.summary
-                    if state.candidate_final_assessment is not None
-                    else ""
-                ),
+            return self._request_verification_plan_recovery(
+                state=state,
+                memory=memory,
+                trigger="recovery turn did not call register_verification",
             )
         mutating_calls = [call for call in action_calls if self._is_state_changing(call.name)]
         pending_decision = state.pending_decision
@@ -500,6 +499,8 @@ class AgentController:
                 plan = self.verification_runtime.register_plan(registration_calls[0].arguments)
                 state.verification_plan = plan
                 state.verification_results = dict(memory.verification_results)
+                state.verification_plan_recovery_attempts = 0
+                memory.verification_plan_recovery_attempts = 0
                 state.status = AgentStatus.RUNNING
                 registered_plan_id = plan.plan_id
             except ValueError as error:
@@ -510,6 +511,7 @@ class AgentController:
             decision_for_validation = pending_decision
 
         validation_error = reasoning_error or registration_error
+        verification_plan_missing_for_file_change = False
         if mutating_calls and state.reflection_required:
             validation_error = (
                 "The previous action failed or was denied. Record a reflection in a separate "
@@ -525,6 +527,18 @@ class AgentController:
                 )
             except DecisionValidationError as error:
                 validation_error = str(error)
+        if (
+            validation_error is None
+            and state.verification_plan is None
+            and any(
+                self.tool_registry.modifies_workspace_files(call.name) for call in mutating_calls
+            )
+        ):
+            verification_plan_missing_for_file_change = True
+            validation_error = (
+                "A verification plan is required before the first workspace file change. "
+                "Call register_verification before, or in the same response as, the file tool."
+            )
         if validation_error is not None:
             state.record_protocol_failure(validation_error)
         else:
@@ -630,7 +644,11 @@ class AgentController:
                     ok=False,
                     output="",
                     error=validation_error,
-                    error_code="decision_validation_failed",
+                    error_code=(
+                        "verification_plan_missing"
+                        if verification_plan_missing_for_file_change
+                        else "decision_validation_failed"
+                    ),
                     retryable=True,
                 )
                 self._record_blocked_action(call, result, state=state, memory=memory)
@@ -692,16 +710,10 @@ class AgentController:
             if reason:
                 return self._finish(state, memory, status="stopped", reason=reason)
         if awaiting_plan_recovery and state.verification_plan is None:
-            return self._finish(
-                state,
-                memory,
-                status="incomplete",
-                reason="the verification plan supplied during recovery was invalid",
-                summary=(
-                    state.candidate_final_assessment.summary
-                    if state.candidate_final_assessment is not None
-                    else ""
-                ),
+            return self._request_verification_plan_recovery(
+                state=state,
+                memory=memory,
+                trigger="the supplied verification plan was invalid",
             )
         if passed_verification_check:
             report = self.verifier.completion_report(state)
@@ -921,29 +933,12 @@ class AgentController:
             return self._finish(state, memory, status="success", summary=summary)
 
         if state.verification_plan is None:
-            if state.verification_plan_recovery_attempts >= 1:
-                return self._finish(
-                    state,
-                    memory,
-                    status="incomplete",
-                    reason="no executable verification plan was registered after one recovery",
-                    summary=summary,
-                )
-            state.verification_plan_recovery_attempts += 1
-            state.status = AgentStatus.AWAITING_VERIFICATION_PLAN
-            memory.verification_plan_recovery_attempts = state.verification_plan_recovery_attempts
-            self._append_system_feedback(
-                state,
-                memory,
-                {
-                    "error": "verification_plan_missing",
-                    "modified_files": sorted(state.modified_files),
-                    "allowed_next_actions": ["register_verification"],
-                    "recovery_attempts_remaining": 0,
-                },
+            return self._request_verification_plan_recovery(
+                state=state,
+                memory=memory,
+                trigger="tool-free response received after unplanned file changes",
+                summary=summary,
             )
-            self._save_memory(memory, state, status=state.status.value)
-            return None
 
         runnable = report.runnable
         if not runnable:
@@ -983,6 +978,56 @@ class AgentController:
             },
         )
         state.status = AgentStatus.RUNNING
+        self._save_memory(memory, state, status=state.status.value)
+        return None
+
+    def _request_verification_plan_recovery(
+        self,
+        *,
+        state: SessionState,
+        memory: MemoryState,
+        trigger: str,
+        summary: str | None = None,
+    ) -> AgentResult | None:
+        """Request a bounded plan-only correction without stopping on the first mistake."""
+        if state.verification_plan_recovery_attempts >= (_MAX_VERIFICATION_PLAN_RECOVERY_ATTEMPTS):
+            fallback_summary = (
+                state.candidate_final_assessment.summary
+                if state.candidate_final_assessment is not None
+                else ""
+            )
+            return self._finish(
+                state,
+                memory,
+                status="incomplete",
+                reason=(
+                    "no executable verification plan was registered after "
+                    f"{_MAX_VERIFICATION_PLAN_RECOVERY_ATTEMPTS} recovery attempts"
+                ),
+                summary=summary if summary is not None else fallback_summary,
+            )
+
+        state.verification_plan_recovery_attempts += 1
+        memory.verification_plan_recovery_attempts = state.verification_plan_recovery_attempts
+        state.status = AgentStatus.AWAITING_VERIFICATION_PLAN
+        self._append_system_feedback(
+            state,
+            memory,
+            {
+                "error": "verification_plan_missing",
+                "trigger": trigger,
+                "modified_files": sorted(state.modified_files),
+                "allowed_next_actions": ["register_verification"],
+                "instruction": (
+                    "Your next response must call register_verification only. Do not emit "
+                    "progress text, record_decision, or another action in that response."
+                ),
+                "recovery_attempts_remaining": (
+                    _MAX_VERIFICATION_PLAN_RECOVERY_ATTEMPTS
+                    - state.verification_plan_recovery_attempts
+                ),
+            },
+        )
         self._save_memory(memory, state, status=state.status.value)
         return None
 
