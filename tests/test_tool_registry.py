@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from repo_rivet.safety.path_policy import WorkspacePathPolicy
-from repo_rivet.tools.base import ToolCall
+from repo_rivet.tools.base import DecisionPolicy, ToolCall
 from repo_rivet.tools.git import GitDiffTool
 from repo_rivet.tools.registry import create_default_registry
 
@@ -52,6 +52,14 @@ def test_registry_identifies_workspace_file_mutation_semantically(tmp_path: Path
     assert registry.modifies_workspace_files("edit_file")
     assert not registry.modifies_workspace_files("run_command")
     assert not registry.modifies_workspace_files("read_file")
+
+
+def test_registry_declares_semantic_decision_policies(tmp_path: Path) -> None:
+    registry = create_default_registry(tmp_path)
+
+    assert registry.decision_policy("edit_file") == DecisionPolicy.MUTATION
+    assert registry.decision_policy("run_command") == DecisionPolicy.COMMAND
+    assert registry.decision_policy("run_verification") == DecisionPolicy.REGISTERED_PLAN
 
 
 def test_run_verification_rejects_model_supplied_command(tmp_path: Path) -> None:

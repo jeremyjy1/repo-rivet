@@ -13,7 +13,7 @@ from pydantic import Field
 from repo_rivet.approval.models import Capability
 from repo_rivet.safety.command_policy import CommandPolicy
 from repo_rivet.safety.path_policy import WorkspacePathPolicy
-from repo_rivet.tools.base import BaseTool, ToolArguments, ToolResult
+from repo_rivet.tools.base import BaseTool, DecisionPolicy, ToolArguments, ToolResult
 from repo_rivet.verification.models import ProcessObservation
 
 MAX_OUTPUT_LINES = 200
@@ -41,6 +41,7 @@ class RunCommandTool(BaseTool[RunCommandArguments]):
     description = "Run one shell-free command in the workspace with a timeout."
     arguments_type = RunCommandArguments
     capabilities = frozenset({Capability.PROCESS_EXECUTE})
+    decision_policy = DecisionPolicy.COMMAND
 
     def __init__(self, path_policy: WorkspacePathPolicy, command_policy: CommandPolicy) -> None:
         self.path_policy = path_policy

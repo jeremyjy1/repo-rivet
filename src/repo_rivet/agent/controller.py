@@ -31,7 +31,7 @@ from repo_rivet.reasoning.models import ReasoningEvent, ReasoningPhase
 from repo_rivet.reasoning.validator import DecisionValidationError, validate_decision_for_actions
 from repo_rivet.safety.command_policy import CommandPolicy
 from repo_rivet.safety.path_policy import WorkspacePathPolicy
-from repo_rivet.tools.base import ToolCall, ToolResult
+from repo_rivet.tools.base import DecisionPolicy, ToolCall, ToolResult
 from repo_rivet.tools.registry import ToolRegistry
 from repo_rivet.verification.models import (
     FINAL_ASSESSMENT_SUMMARY_MAX_CHARS,
@@ -661,6 +661,20 @@ class AgentController:
                 tool=call.name,
                 argument_summary=self._action_summary(call),
             )
+            if self.tool_registry.decision_policy(call.name) == DecisionPolicy.REGISTERED_PLAN:
+                self._log(
+                    "plan_authorized_action",
+                    step=state.step_count,
+                    tool_call_id=call.id,
+                    tool=call.name,
+                    plan_id=(
+                        state.verification_plan.plan_id
+                        if state.verification_plan is not None
+                        else None
+                    ),
+                    check_id=call.arguments.get("check_id"),
+                    requested_by="model",
+                )
             result = self.tool_registry.execute(call)
             verification_result = (
                 self._verification_result(result) if call.name == "run_verification" else None
@@ -1054,6 +1068,10 @@ class AgentController:
                 tool=call.name,
                 argument_summary=check_id,
                 controller_scheduled=True,
+                authorization_source=DecisionPolicy.REGISTERED_PLAN.value,
+                plan_id=(
+                    state.verification_plan.plan_id if state.verification_plan is not None else None
+                ),
             )
             result = self.tool_registry.execute(call)
             if self._verification_result(result) is None:
@@ -1129,7 +1147,10 @@ class AgentController:
         config = self.reasoning_manager.config
         if not config.enabled:
             return False
-        if call.name == "run_command":
+        policy = self.tool_registry.decision_policy(call.name)
+        if policy == DecisionPolicy.REGISTERED_PLAN:
+            return False
+        if policy == DecisionPolicy.COMMAND:
             return config.require_for_commands
         return config.require_for_mutating_tools
 

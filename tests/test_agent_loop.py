@@ -328,7 +328,7 @@ def test_started_verification_runs_remaining_required_checks_without_model_round
     model = FakeModelClient(
         [
             ModelResponse(tool_calls=[plan, decision("d1", "write_file"), write]),
-            ModelResponse(tool_calls=[decision("d2", "run_verification"), compile_check]),
+            ModelResponse(tool_calls=[compile_check]),
             ModelResponse(content="Implemented and all registered checks passed."),
         ]
     )
@@ -340,10 +340,12 @@ def test_started_verification_runs_remaining_required_checks_without_model_round
         ]
     )
 
+    event_logger = RecordingSink()
     result = controller(
         model,
         tools,
         termination=TerminationPolicy(TerminationConfig(max_steps=3)),
+        event_logger=event_logger,
     ).run("implement and verify")
 
     assert result.status == "success"
@@ -358,6 +360,12 @@ def test_started_verification_runs_remaining_required_checks_without_model_round
         for message in model.requests[2]["messages"]
     )
     assert model.requests[2]["tools"] == []
+    assert any(
+        event_type == "plan_authorized_action"
+        and data.get("tool") == "run_verification"
+        and data.get("requested_by") == "model"
+        for event_type, data in event_logger.events
+    )
 
 
 def test_verification_pass_on_final_model_step_finishes_instead_of_stopping() -> None:
@@ -366,7 +374,7 @@ def test_verification_pass_on_final_model_step_finishes_instead_of_stopping() ->
     model = FakeModelClient(
         [
             ModelResponse(tool_calls=[verification_plan(), decision("d1", "write_file"), write]),
-            ModelResponse(tool_calls=[decision("d2", "run_verification"), run_check]),
+            ModelResponse(tool_calls=[run_check]),
         ]
     )
     tools = FakeToolRegistry(
@@ -399,7 +407,7 @@ def test_finalization_disables_tools_and_does_not_repeat_passed_check() -> None:
     model = FakeModelClient(
         [
             ModelResponse(tool_calls=[verification_plan(), decision("d1", "write_file"), write]),
-            ModelResponse(tool_calls=[decision("d2", "run_verification"), first_check]),
+            ModelResponse(tool_calls=[first_check]),
             ModelResponse(tool_calls=[repeated_check]),
         ]
     )
@@ -430,7 +438,7 @@ def test_finalization_discards_dsml_tool_markup_from_result_and_history() -> Non
     model = FakeModelClient(
         [
             ModelResponse(tool_calls=[verification_plan(), decision("d1", "write_file"), write]),
-            ModelResponse(tool_calls=[decision("d2", "run_verification"), run_check]),
+            ModelResponse(tool_calls=[run_check]),
             ModelResponse(content=leaked),
         ]
     )

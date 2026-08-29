@@ -10,7 +10,7 @@ from repo_rivet.editing.runtime import EditingRuntime
 from repo_rivet.editing.tools import EditFileTool
 from repo_rivet.safety.command_policy import CommandPolicy
 from repo_rivet.safety.path_policy import WorkspacePathPolicy
-from repo_rivet.tools.base import BaseTool, ToolCall, ToolResult
+from repo_rivet.tools.base import BaseTool, DecisionPolicy, ToolCall, ToolResult
 from repo_rivet.tools.filesystem import (
     ListFilesTool,
     ReadFileTool,
@@ -81,6 +81,11 @@ class ToolRegistry:
         """Return whether a tool declares workspace file mutation capabilities."""
         tool = self._tools.get(tool_name)
         return bool(tool and tool.capabilities & _WORKSPACE_FILE_CHANGE_CAPABILITIES)
+
+    def decision_policy(self, tool_name: str) -> DecisionPolicy:
+        """Return the declared source of auditable intent for a tool execution."""
+        tool = self._tools.get(tool_name)
+        return tool.decision_policy if tool is not None else DecisionPolicy.MUTATION
 
     def execute(self, call: ToolCall) -> ToolResult:
         tool = self._tools.get(call.name)

@@ -3,7 +3,7 @@
 from pydantic import Field
 
 from repo_rivet.approval.models import Capability
-from repo_rivet.tools.base import BaseTool, ToolArguments, ToolResult
+from repo_rivet.tools.base import BaseTool, DecisionPolicy, ToolArguments, ToolResult
 from repo_rivet.verification.models import VerificationCheck
 from repo_rivet.verification.runtime import VerificationRuntime
 
@@ -42,10 +42,13 @@ class RunVerificationTool(BaseTool[RunVerificationArguments]):
     name = "run_verification"
     description = (
         "Run one previously registered verification check by ID. The local controller "
-        "evaluates its declared success criteria; arbitrary commands cannot claim verification."
+        "evaluates its declared success criteria; arbitrary commands cannot claim verification. "
+        "The registered plan supplies the decision audit record, so do not call record_decision "
+        "for this tool."
     )
     arguments_type = RunVerificationArguments
     capabilities = frozenset({Capability.PROCESS_EXECUTE})
+    decision_policy = DecisionPolicy.REGISTERED_PLAN
 
     def __init__(self, runtime: VerificationRuntime) -> None:
         self.runtime = runtime

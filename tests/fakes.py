@@ -2,7 +2,7 @@ from collections.abc import Iterable
 from typing import Any
 
 from repo_rivet.llm.base import ModelRequestOptions, ModelResponse
-from repo_rivet.tools.base import ToolCall, ToolResult
+from repo_rivet.tools.base import DecisionPolicy, ToolCall, ToolResult
 
 
 class FakeModelClient:
@@ -34,6 +34,13 @@ class FakeToolRegistry:
 
     def modifies_workspace_files(self, tool_name: str) -> bool:
         return tool_name in {"edit_file", "write_file"}
+
+    def decision_policy(self, tool_name: str) -> DecisionPolicy:
+        if tool_name == "run_command":
+            return DecisionPolicy.COMMAND
+        if tool_name == "run_verification":
+            return DecisionPolicy.REGISTERED_PLAN
+        return DecisionPolicy.MUTATION
 
     def execute(self, call: ToolCall) -> ToolResult:
         self.calls.append(call)

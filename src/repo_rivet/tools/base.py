@@ -3,11 +3,20 @@
 import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any, ClassVar, cast
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from repo_rivet.approval.models import Capability
+
+
+class DecisionPolicy(StrEnum):
+    """How a state-changing tool obtains an auditable execution intent."""
+
+    MUTATION = "mutation"
+    COMMAND = "command"
+    REGISTERED_PLAN = "registered_plan"
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +69,7 @@ class BaseTool[ArgumentsT: ToolArguments](ABC):
     description: ClassVar[str]
     arguments_type: ClassVar[type[ToolArguments]]
     capabilities: ClassVar[frozenset[Capability]] = frozenset()
+    decision_policy: ClassVar[DecisionPolicy] = DecisionPolicy.MUTATION
 
     @property
     def schema(self) -> dict[str, Any]:
