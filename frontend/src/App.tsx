@@ -12,6 +12,7 @@ import {
   ListChecks,
   LoaderCircle,
   MessageSquareText,
+  Moon,
   Play,
   Plus,
   RefreshCw,
@@ -19,6 +20,7 @@ import {
   Settings2,
   ShieldAlert,
   Sparkles,
+  Sun,
   XCircle,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
@@ -33,6 +35,16 @@ type Bootstrap = {
 };
 type FileEntry = { name: string; path: string; kind: "file" | "directory"; size: number | null };
 type Skill = { id: string; name: string; description: string; version: string; source: string };
+type Theme = "dark" | "light";
+
+function initialTheme(): Theme {
+  const stored = localStorage.getItem("reporivet-theme");
+  const theme = stored === "dark" || stored === "light"
+    ? stored
+    : window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+  document.documentElement.dataset.theme = theme;
+  return theme;
+}
 
 const eventLabels: Record<string, string> = {
   "tool.requested": "Tool requested",
@@ -91,6 +103,7 @@ function App() {
   const [mode, setMode] = useState<"execute" | "planning">("execute");
   const [approvalMode, setApprovalMode] = useState("safe-auto");
   const [autoPlan, setAutoPlan] = useState<"off" | "adaptive" | "always">("adaptive");
+  const [theme, setTheme] = useState<Theme>(initialTheme);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
 
@@ -123,6 +136,11 @@ function App() {
   }, [refreshSession]);
 
   useEffect(() => void initialize(), [initialize]);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    localStorage.setItem("reporivet-theme", theme);
+  }, [theme]);
 
   useEffect(() => {
     if (session?.workflow_mode === "planning" || session?.workflow_mode === "plan_ready") {
@@ -179,7 +197,16 @@ function App() {
       <header className="topbar">
         <div className="brand"><span className="brand-mark"><GitBranch size={18} /></span><strong>RepoRivet</strong><span className="local-pill">LOCAL</span></div>
         <div className="workspace"><Folder size={15} /> <span>{boot.workspace}</span></div>
-        <div className="model-pill"><Sparkles size={14} /> {boot.settings.model}</div>
+        <div className="topbar-actions">
+          <div className="model-pill"><Sparkles size={14} /> <span>{boot.settings.model}</span></div>
+          <button
+            className="theme-toggle"
+            aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} theme`}
+            aria-pressed={theme === "light"}
+            title={`Switch to ${theme === "dark" ? "light" : "dark"} theme`}
+            onClick={() => setTheme((current) => current === "dark" ? "light" : "dark")}
+          >{theme === "dark" ? <Sun size={16} /> : <Moon size={16} />}</button>
+        </div>
       </header>
 
       <aside className="sidebar">
@@ -203,19 +230,34 @@ function App() {
           <div><Bot size={18} /><strong>{session?.name || "No session selected"}</strong>{session && <span className="revision">rev {session.workspace_revision}</span>}</div>
           <div className="run-actions">
             <button className={`mode-button ${mode === "planning" ? "plan" : ""}`} disabled={session?.workflow_mode === "plan_ready"} title={session?.workflow_mode === "plan_ready" ? "Review the plan in the Plan panel before execution" : "Switch the workflow for the next request"} onClick={() => setMode(mode === "execute" ? "planning" : "execute")}>{mode === "planning" ? <ListChecks size={15} /> : <Hammer size={15} />}{session?.workflow_mode === "plan_ready" ? "Plan ready" : mode === "planning" ? "Plan" : "Execute"}</button>
-            {isRunning && <button className="danger-button" onClick={() => invoke(() => api(`/api/v1/sessions/${session!.session_id}/stop`, { method: "POST", body: "{}" }))}><CircleStop size={15} /> Stop</button>}
           </div>
         </div>
         {error && <div className="error-banner"><ShieldAlert size={16} />{error}<button onClick={() => setError("")}>×</button></div>}
-        <Timeline session={session} isRunning={isRunning} pendingApprovalId={approval?.request_id || null} onRefresh={refreshSession} />
-        <Composer disabled={!session || isRunning} mode={mode} onSubmit={submit} />
+        <Timeline session={session} isRunning={isRunning} pendingApprovalId={approval?.request_id || null} invoke={invoke} onRefresh={refreshSession} />
+        <Composer
+          disabled={!session}
+          isRunning={isRunning}
+          mode={mode}
+          setMode={setMode}
+          planReady={session?.workflow_mode === "plan_ready"}
+          autoPlan={autoPlan}
+          setAutoPlan={setAutoPlan}
+          approvalMode={approvalMode}
+          setApprovalMode={(value) => {
+            setApprovalMode(value);
+            if (session) void invoke(() => api(`/api/v1/sessions/${session.session_id}/approval-mode`, { method: "PUT", body: JSON.stringify({ mode: value }) }));
+          }}
+          skills={skills}
+          selectedSkill={selectedSkill}
+          setSelectedSkill={setSelectedSkill}
+          settings={boot.settings}
+          onStop={() => invoke(() => api(`/api/v1/sessions/${session!.session_id}/stop`, { method: "POST", body: "{}" }))}
+          onSubmit={submit}
+        />
       </main>
 
       <aside className="inspector">
-        <Inspector session={session} fileView={fileView} diffView={diffView} refreshDiff={() => invoke(async () => setDiffView((await api<{ diff: string }>("/api/v1/workspace/diff")).diff))} settings={boot.settings} skills={skills} selectedSkill={selectedSkill} setSelectedSkill={setSelectedSkill} mode={mode} setMode={setMode} autoPlan={autoPlan} setAutoPlan={setAutoPlan} approvalMode={approvalMode} setApprovalMode={(value: string) => {
-          setApprovalMode(value);
-          if (session) void invoke(() => api(`/api/v1/sessions/${session.session_id}/approval-mode`, { method: "PUT", body: JSON.stringify({ mode: value }) }));
-        }} invoke={invoke} refresh={() => refreshSession(session?.session_id)} />
+        <Inspector session={session} fileView={fileView} diffView={diffView} refreshDiff={() => invoke(async () => setDiffView((await api<{ diff: string }>("/api/v1/workspace/diff")).diff))} mode={mode} invoke={invoke} refresh={() => refreshSession(session?.session_id)} />
       </aside>
       {approval && <ApprovalDialog approval={approval} onDecision={(action, guidance) => invoke(async () => {
         await api(`/api/v1/sessions/${session!.session_id}/approvals/decision`, { method: "POST", body: JSON.stringify({ request_id: approval.request_id, state_version: approval.state_version, action, guidance }) });
@@ -225,10 +267,11 @@ function App() {
   );
 }
 
-const Timeline = memo(function Timeline({ session, isRunning, pendingApprovalId, onRefresh }: {
+const Timeline = memo(function Timeline({ session, isRunning, pendingApprovalId, invoke, onRefresh }: {
   session: SessionDetail | null;
   isRunning: boolean;
   pendingApprovalId: string | null;
+  invoke: (work: () => Promise<unknown>) => Promise<void>;
   onRefresh: (sessionId?: string | null) => Promise<void>;
 }) {
   const timelineRef = useRef<HTMLDivElement>(null);
@@ -357,7 +400,7 @@ const Timeline = memo(function Timeline({ session, isRunning, pendingApprovalId,
       cancelAnimationFrame(frame);
       cancelAnimationFrame(finalFrame);
     };
-  }, [events.length, messages.length, isRunning, pendingApprovalId, session?.run?.result, scrollToBottom]);
+  }, [events.length, messages.length, isRunning, pendingApprovalId, session?.plan?.status, session?.run?.result, scrollToBottom]);
 
   return <div className="timeline" ref={timelineRef} onScroll={(event) => {
     const target = event.currentTarget;
@@ -384,7 +427,8 @@ const Timeline = memo(function Timeline({ session, isRunning, pendingApprovalId,
     {fallbackMessages.slice(messageStart).map((message, index) => <MessageBlock message={message} key={`m-${messageStart + index}`} />)}
     {visibleEvents.map((event) => <EventCard event={event} pendingApprovalId={pendingApprovalId} key={event.event_id} />)}
     {isRunning && <div className="generating"><LoaderCircle className="spin" size={17} /><span>{pendingApprovalId ? "Waiting for your approval" : workingLabel}</span><i /><i /><i /></div>}
-    {session?.run?.result && <ResultCard result={session.run.result} />}
+    {!isRunning && session?.plan && (session.plan.status === "ready" || session.plan.status === "stale") && <PlanResultCard session={session} invoke={invoke} refresh={() => onRefresh(session.session_id)} />}
+    {session?.run?.result && !(session.run.result.status === "plan_ready" && session.plan && (session.plan.status === "ready" || session.plan.status === "stale")) && <ResultCard result={session.run.result} />}
     </div>
   </div>;
 });
@@ -396,27 +440,53 @@ const MessageBlock = memo(function MessageBlock({ message }: { message: SessionD
   </article>;
 }, (previous, next) => previous.message.role === next.message.role && previous.message.content === next.message.content && previous.message.step === next.message.step);
 
-const Composer = memo(function Composer({ disabled, mode, onSubmit }: {
+const Composer = memo(function Composer({ disabled, isRunning, mode, setMode, planReady, autoPlan, setAutoPlan, approvalMode, setApprovalMode, skills, selectedSkill, setSelectedSkill, settings, onStop, onSubmit }: {
   disabled: boolean;
+  isRunning: boolean;
   mode: "execute" | "planning";
+  setMode: (mode: "execute" | "planning") => void;
+  planReady: boolean;
+  autoPlan: "off" | "adaptive" | "always";
+  setAutoPlan: (mode: "off" | "adaptive" | "always") => void;
+  approvalMode: string;
+  setApprovalMode: (mode: string) => void;
+  skills: Skill[];
+  selectedSkill: string;
+  setSelectedSkill: (skill: string) => void;
+  settings: Bootstrap["settings"];
+  onStop: () => Promise<void> | void;
   onSubmit: (task: string) => Promise<void> | void;
 }) {
   const [value, setValue] = useState("");
   const send = async () => {
     const task = value.trim();
-    if (!task || disabled) return;
+    if (!task || disabled || isRunning) return;
     setValue("");
     await onSubmit(task);
   };
   return <div className="composer-wrap">
-    <textarea value={value} disabled={disabled} onChange={(event) => setValue(event.target.value)} onKeyDown={(event) => {
-      if (event.key === "Enter" && !event.shiftKey) {
-        event.preventDefault();
-        void send();
-      }
-    }} placeholder={mode === "planning" ? "Ask RepoRivet to inspect and prepare a plan…" : "Describe what you want to change…"} />
-    <button className="send-button" disabled={disabled || !value.trim()} onClick={() => void send()}><Send size={18} /></button>
-    <div className="composer-meta"><span>Enter to send · Shift+Enter for newline</span><span>{value.length.toLocaleString()} chars</span></div>
+    <div className="composer-shell">
+      <div className="composer-input">
+        <textarea value={value} disabled={disabled || isRunning} onChange={(event) => setValue(event.target.value)} onKeyDown={(event) => {
+          if (event.key === "Enter" && !event.shiftKey) {
+            event.preventDefault();
+            void send();
+          }
+        }} placeholder={mode === "planning" ? "Ask RepoRivet to inspect and prepare a plan…" : "Describe what you want to change…"} />
+        <button className={`send-button ${isRunning ? "stop" : ""}`} aria-label={isRunning ? "Stop current run" : "Send prompt"} title={isRunning ? "Stop current run" : "Send prompt"} disabled={disabled || (!isRunning && !value.trim())} onClick={() => void (isRunning ? onStop() : send())}>{isRunning ? <CircleStop size={18} /> : <Send size={18} />}</button>
+        <div className="composer-meta"><span>Enter to send · Shift+Enter for newline</span><span>{value.length.toLocaleString()} chars</span></div>
+      </div>
+      <div className="composer-toolbar">
+        <div className="composer-controls">
+          <span className="composer-settings-icon" title="Request settings"><Settings2 size={13} /></span>
+          <label className={`composer-control ${mode === "planning" ? "plan" : ""}`} title="Workflow mode">{mode === "planning" ? <ListChecks size={13} /> : <Hammer size={13} />}<select aria-label="Workflow mode" value={mode} disabled={planReady} onChange={(event) => setMode(event.target.value as "execute" | "planning")}><option value="execute">Execute</option><option value="planning">{planReady ? "Plan ready" : "Plan"}</option></select></label>
+          <label className="composer-control" title="Automatic planning"><RefreshCw size={13} /><select aria-label="Automatic planning" value={autoPlan} onChange={(event) => setAutoPlan(event.target.value as "off" | "adaptive" | "always")}><option value="adaptive">Adaptive plan</option><option value="always">Plan first</option><option value="off">No auto plan</option></select></label>
+          <label className="composer-control" title="Approval mode"><ShieldAlert size={13} /><select aria-label="Approval mode" value={approvalMode} onChange={(event) => setApprovalMode(event.target.value)}><option value="safe-auto">Safe auto</option><option value="llm-auto">LLM auto</option><option value="always-ask">Always ask</option><option value="allow-all">Allow all</option></select></label>
+          <label className="composer-control" title="Global Skill"><Sparkles size={13} /><select aria-label="Global Skill" value={selectedSkill} onChange={(event) => setSelectedSkill(event.target.value)}><option value="">No skill</option>{skills.filter((skill) => skill.source === "global").map((skill) => <option key={skill.id} value={skill.id}>{skill.name}</option>)}</select></label>
+        </div>
+        <div className="composer-model" title={`${settings.base_url} · ${settings.context_limit.toLocaleString()} token context`}><Bot size={13} /><span>{settings.model}</span><i>·</i><span>{settings.context_limit.toLocaleString()}</span></div>
+      </div>
+    </div>
   </div>;
 });
 
@@ -655,16 +725,56 @@ const ResultCard = memo(function ResultCard({ result }: { result: Record<string,
   return <article className={`result-card ${result.status}`}><div className="result-title">{successful ? <CheckCircle2 /> : <ShieldAlert />}<strong>{result.status}</strong></div><ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml>{String(message || "Run finished")}</ReactMarkdown>{result.modified_files?.length > 0 && <small>Modified: {result.modified_files.join(", ")}</small>}</article>;
 });
 
-function Inspector({ session, fileView, diffView, refreshDiff, settings, skills, selectedSkill, setSelectedSkill, mode, setMode, autoPlan, setAutoPlan, approvalMode, setApprovalMode, invoke, refresh }: any) {
-  const [tab, setTab] = useState<"plan" | "file" | "diff" | "settings">("plan");
+const PlanResultCard = memo(function PlanResultCard({ session, invoke, refresh }: {
+  session: SessionDetail;
+  invoke: (work: () => Promise<unknown>) => Promise<void>;
+  refresh: () => Promise<void>;
+}) {
+  const plan = session.plan!;
+  const [submitting, setSubmitting] = useState(false);
+  const stale = plan.status === "stale";
+  const execute = async () => {
+    if (stale || submitting) return;
+    setSubmitting(true);
+    try {
+      await invoke(async () => {
+        await api(`/api/v1/sessions/${session.session_id}/plan/execute`, { method: "POST", body: "{}" });
+        await refresh();
+      });
+    } finally {
+      setSubmitting(false);
+    }
+  };
+  return <article className={`conversation-plan ${stale ? "stale" : ""}`}>
+    <div className="conversation-plan-header">
+      <span><ListChecks size={18} /></span>
+      <div><small>{stale ? "PLAN NEEDS REVIEW" : "PLAN READY"}</small><h2>{String(plan.goal)}</h2></div>
+      <b>rev {plan.workspace_revision}</b>
+    </div>
+    <ol className="conversation-plan-steps">
+      {(plan.steps || []).map((step: any, index: number) => <li key={step.step_id}>
+        <b>{index + 1}</b>
+        <div><strong>{step.title}</strong><small>{humanize(step.operation)} · {step.risk} risk{step.target_files?.length ? ` · ${step.target_files.join(", ")}` : ""}</small></div>
+      </li>)}
+    </ol>
+    {plan.verification?.length > 0 && <div className="conversation-plan-verification"><strong>Verification</strong><span>{plan.verification.map((check: any) => check.title || check.check_id).join(" · ")}</span></div>}
+    {plan.affected_files?.length > 0 && <div className="conversation-plan-files"><strong>Affected files</strong><span>{plan.affected_files.join(", ")}</span></div>}
+    <div className="conversation-plan-actions">
+      <p>{stale ? "The workspace changed after this plan was created. Revise it from the Plan panel before execution." : "Executing the plan still uses the configured approval policy for edits and commands."}</p>
+      <button className="primary" disabled={stale || submitting} onClick={() => void execute()}>{submitting ? <LoaderCircle className="spin" size={15} /> : <Play size={15} />}{submitting ? "Starting…" : "Execute plan"}</button>
+    </div>
+  </article>;
+});
+
+function Inspector({ session, fileView, diffView, refreshDiff, mode, invoke, refresh }: any) {
+  const [tab, setTab] = useState<"plan" | "file" | "diff">("plan");
   const plan = session?.plan;
-  return <><div className="tabs"><button className={tab === "plan" ? "active" : ""} onClick={() => setTab("plan")}>Plan</button><button className={tab === "file" ? "active" : ""} onClick={() => setTab("file")}>File</button><button className={tab === "diff" ? "active" : ""} onClick={() => { setTab("diff"); void refreshDiff(); }}>Diff</button><button className={tab === "settings" ? "active" : ""} onClick={() => setTab("settings")}><Settings2 size={14} /> Settings</button></div>
+  return <><div className="tabs"><button className={tab === "plan" ? "active" : ""} onClick={() => setTab("plan")}>Plan</button><button className={tab === "file" ? "active" : ""} onClick={() => setTab("file")}>File</button><button className={tab === "diff" ? "active" : ""} onClick={() => { setTab("diff"); void refreshDiff(); }}>Diff</button></div>
     <div className="inspector-content">
       {tab === "plan" && <>{!plan ? <div className="muted-card"><ListChecks size={20} /><p>{mode === "planning" ? "Plan Mode is active. Submit a task to begin read-only inspection." : "No plan artifact for this session."}</p></div> : <div className="plan-card"><div className="plan-status"><strong>{plan.goal}</strong><span>{plan.status}</span></div>{plan.steps?.map((step: any, index: number) => <div className={`plan-step ${step.status}`} key={step.step_id}><b>{index + 1}</b><div><strong>{step.title}</strong><small>{step.operation} · {step.risk}</small></div></div>)}{plan.status === "ready" || plan.status === "stale" ? <PlanControls sessionId={session.session_id} invoke={invoke} refresh={refresh} /> : null}</div>}
         <h3>Verification</h3>{Object.entries(session?.verification || {}).length === 0 ? <p className="subtle">No verification results yet.</p> : Object.entries(session.verification).map(([id, value]: any) => <div className="verification" key={id}><CheckCircle2 size={15} /><span><strong>{id}</strong><small>{value.status}</small></span></div>)}</>}
       {tab === "file" && (!fileView ? <div className="muted-card"><Files size={20} /><p>Select a workspace file to inspect its current snapshot.</p></div> : <><div className="file-title"><FileCode2 size={15} /><strong>{fileView.path}</strong><span>{fileView.snapshot_tag}</span></div><pre className="code-view">{fileView.content.split("\n").map((line: string, index: number) => <div key={index}><i>{fileView.start_line + index}</i><code>{line || " "}</code></div>)}</pre></>)}
       {tab === "diff" && <>{!diffView.trim() ? <div className="muted-card"><GitBranch size={20} /><p>The workspace has no tracked changes.</p></div> : <pre className="diff-view">{diffView}</pre>}</>}
-      {tab === "settings" && <div className="settings"><label>Workflow mode<select value={mode} disabled={session?.workflow_mode === "plan_ready"} onChange={(event) => setMode(event.target.value)}><option value="execute">Execute</option><option value="planning">Plan · read-only</option></select></label>{mode === "planning" && <p className="mode-notice"><ListChecks size={15} />{session?.workflow_mode === "plan_ready" ? " A plan is ready for review. Use the Plan panel to execute, revise, inspect further, or cancel it." : " Plan Mode only exposes inspection and planning tools. Plan approval does not approve later edits or commands."}</p>}<label>Automatic planning<select value={autoPlan} onChange={(event) => setAutoPlan(event.target.value)}><option value="adaptive">Adaptive</option><option value="always">Always plan first</option><option value="off">Off</option></select></label><p className="settings-note">Adaptive planning keeps simple work direct and switches complex or uncertain work into read-only Plan Mode for review.</p><label>Approval mode<select value={approvalMode} onChange={(event) => setApprovalMode(event.target.value)}><option value="safe-auto">Safe auto</option><option value="llm-auto">LLM auto</option><option value="always-ask">Always ask</option><option value="allow-all">Allow all</option></select></label><label>Global Skill<select value={selectedSkill} onChange={(event) => setSelectedSkill(event.target.value)}><option value="">None selected</option>{skills.filter((skill: Skill) => skill.source === "global").map((skill: Skill) => <option key={skill.id} value={skill.id}>{skill.name} · {skill.version}</option>)}</select></label><dl><dt>Model</dt><dd>{settings.model}</dd><dt>Context</dt><dd>{settings.context_limit.toLocaleString()} tokens</dd><dt>Gateway</dt><dd>{settings.base_url}</dd></dl><p className="settings-note">Model credentials and context limits remain file-configured and are never exposed to browser JavaScript.</p></div>}
     </div></>;
 }
 
@@ -692,19 +802,23 @@ function ApprovalDialog({ approval, onDecision }: { approval: Approval; onDecisi
   const targets = [...approval.writes, ...approval.deletes, ...approval.reads];
   return <div className="modal-backdrop"><div className="approval-modal">
     <div className="approval-header"><span><ShieldAlert /></span><div><small>APPROVAL REQUIRED</small><h2>{humanize(approval.tool)}</h2></div><b className={`risk ${approval.risk}`}>{approval.risk} risk</b></div>
-    <div className="approval-summary">
-      <div><span>Operation</span><strong>{humanize(approval.operation)}</strong></div>
-      <div><span>Target</span><strong title={targets.join(", ")}>{targets.join(", ") || "Workspace"}</strong></div>
-      <div><span>Known effects</span><strong title={approval.effects.join(", ")}>{approval.effects.map(humanize).join(", ") || "None declared"}</strong></div>
-    </div>
+    <div className="approval-scroll">
+      <div className="approval-summary">
+        <div><span>Operation</span><strong>{humanize(approval.operation)}</strong></div>
+        <div><span>Target</span><strong title={targets.join(", ")}>{targets.join(", ") || "Workspace"}</strong></div>
+        <div><span>Known effects</span><strong title={approval.effects.join(", ")}>{approval.effects.map(humanize).join(", ") || "None declared"}</strong></div>
+      </div>
 
-    {approval.details.length > 0 && <section className="approval-section"><h3>Requested action</h3><dl className="approval-details">{approval.details.map((detail) => <div key={`${detail.label}-${detail.value}`}><dt>{detail.label}</dt><dd>{detail.value}</dd></div>)}</dl></section>}
-    {approval.operations.length > 0 && <section className="approval-section"><h3>Edit operations</h3><ol className="operation-list">{approval.operations.map((operation, index) => <li key={`${index}-${operation}`}><b>{index + 1}</b><span>{operation}</span></li>)}</ol></section>}
-    {approval.preview && <section className="approval-section"><h3>{approval.preview.title}</h3><ApprovalPreview preview={approval.preview} /></section>}
-    {approval.reasons.length > 0 && <section className="approval-section risk-reasons"><h3>Why approval is needed</h3>{approval.reasons.map((reason) => <p key={reason}>• {reason}</p>)}</section>}
-    {approval.review && <section className="approval-section review-card"><div><strong>LLM review</strong><span>{approval.review.recommendation} · {approval.review.risk} risk · {approval.review.relevance}</span></div><p>{approval.review.reason}</p>{approval.review.question && <p className="review-question">{approval.review.question}</p>}</section>}
-    <label className="guidance">Optional direction if denied<textarea value={guidance} onChange={(event) => setGuidance(event.target.value)} placeholder="Tell the agent what to do instead…" /></label>
-    <div className="approval-actions"><button className="primary" onClick={() => onDecision("allow_once")}><CheckCircle2 size={15} /> Allow once</button><button disabled={!approval.allow_matching_repeats} title={approval.allow_matching_repeats ? "Allow this exact request for the rest of the session" : "Repeating grants are unavailable for high-risk requests"} onClick={() => onDecision("allow_session")}><RefreshCw size={15} /> Allow matching repeats</button><button className="deny" onClick={() => onDecision("deny", guidance || undefined)}><XCircle size={15} /> Deny and continue</button><button className="stop" onClick={() => onDecision("stop")}><CircleStop size={15} /> Stop run</button></div>
+      {approval.details.length > 0 && <section className="approval-section"><h3>Requested action</h3><dl className="approval-details">{approval.details.map((detail) => <div key={`${detail.label}-${detail.value}`}><dt>{detail.label}</dt><dd>{detail.value}</dd></div>)}</dl></section>}
+      {approval.operations.length > 0 && <section className="approval-section"><h3>Edit operations</h3><ol className="operation-list">{approval.operations.map((operation, index) => <li key={`${index}-${operation}`}><b>{index + 1}</b><span>{operation}</span></li>)}</ol></section>}
+      {approval.preview && <section className="approval-section"><h3>{approval.preview.title}</h3><ApprovalPreview preview={approval.preview} /></section>}
+      {approval.reasons.length > 0 && <section className="approval-section risk-reasons"><h3>Why approval is needed</h3>{approval.reasons.map((reason) => <p key={reason}>• {reason}</p>)}</section>}
+      {approval.review && <section className="approval-section review-card"><div><strong>LLM review</strong><span>{approval.review.recommendation} · {approval.review.risk} risk · {approval.review.relevance}</span></div><p>{approval.review.reason}</p>{approval.review.question && <p className="review-question">{approval.review.question}</p>}</section>}
+    </div>
+    <div className="approval-footer">
+      <label className="guidance">Optional direction if denied<textarea value={guidance} onChange={(event) => setGuidance(event.target.value)} placeholder="Tell the agent what to do instead…" /></label>
+      <div className="approval-actions"><button className="primary" onClick={() => onDecision("allow_once")}><CheckCircle2 size={15} /> Allow once</button><button disabled={!approval.allow_matching_repeats} title={approval.allow_matching_repeats ? "Allow this exact request for the rest of the session" : "Repeating grants are unavailable for high-risk requests"} onClick={() => onDecision("allow_session")}><RefreshCw size={15} /> Allow matching repeats</button><button className="deny" onClick={() => onDecision("deny", guidance || undefined)}><XCircle size={15} /> Deny and continue</button><button className="stop" onClick={() => onDecision("stop")}><CircleStop size={15} /> Stop run</button></div>
+    </div>
   </div></div>;
 }
 
