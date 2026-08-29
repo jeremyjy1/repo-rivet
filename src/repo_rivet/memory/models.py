@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from repo_rivet.approval.models import ApprovalMode, OperationClass
 from repo_rivet.memory.token_estimator import ApproximateTokenEstimator
+from repo_rivet.planning.models import PlanArtifact, WorkflowMode
 from repo_rivet.reasoning.models import ObservationEvent, ReasoningEvent
 from repo_rivet.tools.base import ToolCall, ToolResult
 from repo_rivet.verification.models import (
@@ -264,12 +265,15 @@ class MemoryState(BaseModel):
     denied_request_fingerprints: set[str] = Field(default_factory=set)
     approval_denial_guidance: dict[str, str] = Field(default_factory=dict)
     approval_mode_override: ApprovalMode | None = None
+    workflow_mode: WorkflowMode = WorkflowMode.EXECUTE
+    plan_artifact: PlanArtifact | None = None
+    plan_update_reason: str | None = Field(default=None, max_length=1_000)
     reasoning_events: list[ReasoningEvent] = Field(default_factory=list)
     observation_events: list[ObservationEvent] = Field(default_factory=list)
     reflection_required: bool = False
-    last_agent_outcome: Literal["success", "incomplete", "blocked", "stopped", "error"] | None = (
-        None
-    )
+    last_agent_outcome: (
+        Literal["success", "plan_ready", "incomplete", "blocked", "stopped", "error"] | None
+    ) = None
     status: str = "ready"
 
     @model_validator(mode="before")
@@ -332,6 +336,9 @@ class MemoryState(BaseModel):
         self.reflection_required = False
         self.working.recent_modified_files.clear()
         self.working.last_verification_result = None
+        self.plan_artifact = None
+        self.plan_update_reason = None
+        self.workflow_mode = WorkflowMode.EXECUTE
         self.last_agent_outcome = None
 
     def repair_invalid_assistant_messages(self) -> int:

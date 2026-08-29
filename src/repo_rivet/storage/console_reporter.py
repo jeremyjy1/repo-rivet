@@ -24,13 +24,11 @@ _SOURCE_LABELS = {
     "llm_reviewer": "LLM reviewer",
     "non_interactive_policy": "non-interactive policy",
     "prior_denial": "prior denial",
-    "read_only_mode": "read-only mode",
     "safe_rule": "safe rule",
     "session_grant": "exact session grant",
 }
 _QUIET_ALLOW_SOURCES = {
     "allow_all_mode",
-    "read_only_mode",
     "safe_rule",
     "session_grant",
 }
@@ -42,6 +40,7 @@ _APPROVAL_FAILURE_CODES = {
 _TOOL_PROGRESS_LABELS = {
     "edit_file": "applying edits",
     "git_diff": "inspecting Git changes",
+    "git_status": "inspecting Git status",
     "list_files": "listing workspace files",
     "read_file": "reading file",
     "run_command": "running command",
@@ -94,6 +93,8 @@ class ConsoleEventReporter:
             self._observation(data)
         elif event_type == "verification_result":
             self._verification(data)
+        elif event_type in {"plan_step_started", "plan_step_finished"}:
+            self._plan_step(data)
         elif event_type == "tool_result":
             self._tool_result(data)
 
@@ -166,6 +167,20 @@ class ConsoleEventReporter:
         detail = self._join(f"{check_id} {status}", reason)
         style = "bold green" if status == "passed" else "bold red"
         self._print_trace_label("VERIFY", detail, style=style)
+
+    def _plan_step(self, data: dict[str, Any]) -> None:
+        index = self._safe(data.get("step_index", "?"), limit=10)
+        total = self._safe(data.get("step_count", "?"), limit=10)
+        title = self._safe(data.get("title", "plan step"), limit=160)
+        status = self._safe(data.get("status", "unknown"), limit=30)
+        error = self._safe(data.get("error", ""), limit=160) or None
+        detail = self._join(title, status, error)
+        style = "bold red" if status == "failed" else "bold cyan"
+        if status == "blocked":
+            style = "bold yellow"
+        if status == "completed":
+            style = "bold green"
+        self._print_trace_label(f"PLAN {index}/{total}", detail, style=style)
 
     def _approval_decided(self, data: dict[str, Any]) -> None:
         action = self._safe(data.get("action", "unknown")).lower()

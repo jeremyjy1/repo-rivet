@@ -25,6 +25,7 @@ _PATH_KEYS: dict[str, tuple[str, ...]] = {
     "run_command": ("cwd",),
     "run_verification": ("cwd",),
     "git_diff": ("path",),
+    "git_status": ("path",),
 }
 _CONTENT_KEYS = frozenset({"content", "stdin"})
 _SECRET_ARGUMENT_PATTERN = re.compile(

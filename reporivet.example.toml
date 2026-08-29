@@ -35,7 +35,7 @@ require_for_commands = true
 max_reflection_only_turns = 2
 
 [approval]
-# allow-all, llm-auto, safe-auto, always-ask, or read-only
+# allow-all, llm-auto, safe-auto, or always-ask
 mode = "safe-auto"
 non_interactive = "deny"
 approval_timeout_seconds = 120

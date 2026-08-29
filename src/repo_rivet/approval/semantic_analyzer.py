@@ -145,7 +145,13 @@ class ApprovalFactAnalyzer:
         write_paths: list[str] = []
         effects: set[str] = set()
         constraints = {"typed_tool"}
-        if request.tool_name in {"list_files", "search_text", "read_file", "git_diff"}:
+        if request.tool_name in {
+            "list_files",
+            "search_text",
+            "read_file",
+            "git_diff",
+            "git_status",
+        }:
             operation = OperationClass.READ
             read_paths = paths
             effects.add("filesystem_read")

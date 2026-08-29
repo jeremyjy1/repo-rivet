@@ -78,12 +78,12 @@ class TerminalHumanApprover:
         llm_review: LLMReviewResult | None = None,
     ) -> ApprovalDecision:
         self.console.print(self._build_panel(request, llm_review=llm_review))
-        prompt = "Select approval option [1-5]"
+        prompt = "Select approval option [1-4]"
         while True:
             try:
                 choice = self._read_choice(prompt)
             except (EOFError, KeyboardInterrupt):
-                choice = "5"
+                choice = "4"
             if choice is None:
                 return ApprovalDecision(
                     action=ApprovalAction.DENY,
@@ -96,14 +96,14 @@ class TerminalHumanApprover:
             decision = self._decision_for_choice(request, choice)
             if decision is not None:
                 if decision.action == ApprovalAction.DENY and not decision.abort_agent:
-                    guidance = self._read_guidance()
-                    if guidance:
+                    guidance = self._read_denial_reason()
+                    if guidance is not None:
                         decision = decision.model_copy(update={"guidance": guidance})
                 return decision
-            self.console.print("Enter a number from 1 to 5.", style="yellow")
+            self.console.print("Enter a number from 1 to 4.", style="yellow")
 
-    def _read_guidance(self) -> str | None:
-        prompt = "Direction for the agent (optional; press Enter to skip)"
+    def _read_denial_reason(self) -> str | None:
+        prompt = "Reason for denial or direction for the agent (optional; press Enter to skip)"
         try:
             value = self._read_choice(prompt)
         except (EOFError, KeyboardInterrupt):
@@ -165,11 +165,10 @@ class TerminalHumanApprover:
         options = Table.grid(padding=(0, 2))
         options.add_column(style="bold cyan", justify="right")
         options.add_column()
-        options.add_row("1", "Approve once")
-        options.add_row("2", "Approve this exact request for the session")
-        options.add_row("3", "Deny once, with optional direction")
-        options.add_row("4", "Deny this exact request for the session, with optional direction")
-        options.add_row("5", "Abort agent")
+        options.add_row("1", "Allow once")
+        options.add_row("2", "Allow matching repeats for this session")
+        options.add_row("3", "Deny and continue")
+        options.add_row("4", "Stop current run and save session")
         sections.extend((Text("\nOptions", style="bold"), options))
         title = (
             "Edit Approval Required" if request.tool_name == "edit_file" else "Approval Required"
@@ -239,21 +238,25 @@ class TerminalHumanApprover:
         choice: str,
     ) -> ApprovalDecision | None:
         choices = {
-            "1": (ApprovalAction.ALLOW, ApprovalScope.ONCE, False, "approved by user"),
+            "1": (ApprovalAction.ALLOW, ApprovalScope.ONCE, False, "allowed once by user"),
             "2": (
                 ApprovalAction.ALLOW,
                 ApprovalScope.SESSION_EXACT,
                 False,
-                "approved exact request for this session",
+                "allowed matching requests for this session",
             ),
-            "3": (ApprovalAction.DENY, ApprovalScope.ONCE, False, "denied by user"),
+            "3": (
+                ApprovalAction.DENY,
+                ApprovalScope.ONCE,
+                False,
+                "request denied by user; continue current run",
+            ),
             "4": (
                 ApprovalAction.DENY,
-                ApprovalScope.SESSION_EXACT,
-                False,
-                "denied exact request for this session",
+                ApprovalScope.ONCE,
+                True,
+                "current run stopped by user; session will be saved",
             ),
-            "5": (ApprovalAction.DENY, ApprovalScope.ONCE, True, "agent aborted by user"),
         }
         selected = choices.get(choice)
         if selected is None:
@@ -304,7 +307,7 @@ def _request_rows(request: ApprovalRequest) -> list[tuple[str, str]]:
     if isinstance(path, str):
         path_label = (
             "Directory"
-            if request.tool_name in {"git_diff", "list_files", "search_text"}
+            if request.tool_name in {"git_diff", "git_status", "list_files", "search_text"}
             else "File"
         )
         rows.append((path_label, _display_value(path)))

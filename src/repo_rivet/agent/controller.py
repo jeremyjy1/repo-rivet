@@ -26,6 +26,9 @@ from repo_rivet.llm.parser import ResponseParseError
 from repo_rivet.llm.protocol import contains_embedded_tool_protocol
 from repo_rivet.memory.models import MemoryState, Message
 from repo_rivet.memory.store import MemoryStore
+from repo_rivet.planning.errors import PlanModeViolation
+from repo_rivet.planning.models import PlanStatus, WorkflowMode
+from repo_rivet.planning.runtime import PLANNING_TOOL_NAMES, PlanRuntime
 from repo_rivet.reasoning.manager import ReasoningManager
 from repo_rivet.reasoning.models import ReasoningEvent, ReasoningPhase
 from repo_rivet.reasoning.validator import DecisionValidationError, validate_decision_for_actions
@@ -57,7 +60,7 @@ class EventSink(Protocol):
 class AgentResult:
     """Final outcome returned to the CLI for every terminal path."""
 
-    status: Literal["success", "incomplete", "blocked", "stopped", "error"]
+    status: Literal["success", "plan_ready", "incomplete", "blocked", "stopped", "error"]
     summary: str
     reason: str | None
     modified_files: tuple[str, ...]
@@ -96,12 +99,19 @@ class AgentController:
             if isinstance(runtime, VerificationRuntime)
             else VerificationRuntime(WorkspacePathPolicy(workspace), CommandPolicy())
         )
+        plan_runtime = getattr(tool_registry, "plan_runtime", None)
+        self.plan_runtime = (
+            plan_runtime
+            if isinstance(plan_runtime, PlanRuntime)
+            else PlanRuntime(WorkspacePathPolicy(workspace))
+        )
 
     def run(
         self,
         task: str,
         *,
         memory: MemoryState | None = None,
+        workflow_mode: WorkflowMode | None = None,
     ) -> AgentResult:
         """Run until verified success, a deterministic stop, or a model API error."""
         if not task.strip():
@@ -109,9 +119,11 @@ class AgentController:
 
         workspace = getattr(self.tool_registry, "workspace", None) or Path.cwd().resolve()
         memory = memory or MemoryState(session_id=f"memory-{uuid4().hex[:8]}")
+        memory.begin_task_scope()
+        if workflow_mode is not None:
+            memory.workflow_mode = workflow_mode
         repaired_interrupted_calls = self._repair_interrupted_history(memory)
         repaired_empty_assistant_messages = memory.repair_invalid_assistant_messages()
-        memory.begin_task_scope()
         memory.start_task(
             task=task,
             workspace=str(workspace),
@@ -135,6 +147,15 @@ class AgentController:
             approval_engine.sync_memory_rule()
         state = SessionState(
             task=task.strip(),
+            status=(
+                AgentStatus.PLANNING
+                if memory.workflow_mode == WorkflowMode.PLANNING
+                else AgentStatus.EXECUTING
+                if memory.plan_artifact is not None
+                and memory.plan_artifact.status == PlanStatus.EXECUTING
+                else AgentStatus.RUNNING
+            ),
+            workflow_mode=memory.workflow_mode,
             tool_call_count=memory.tool_event_step,
             initial_tool_call_count=memory.tool_event_step,
             modified_files=set(memory.modified_files),
@@ -148,6 +169,70 @@ class AgentController:
             force_thinking_disabled=self._history_requires_non_thinking(memory),
         )
         self.verification_runtime.bind(memory)
+        self.plan_runtime.bind(memory)
+        if (
+            state.workflow_mode == WorkflowMode.EXECUTE
+            and memory.plan_artifact is not None
+            and memory.plan_artifact.status == PlanStatus.EXECUTING
+        ):
+            stale_reasons = self.plan_runtime.stale_reasons()
+            if stale_reasons:
+                memory.plan_artifact.status = PlanStatus.STALE
+                memory.workflow_mode = WorkflowMode.PLAN_READY
+                state.workflow_mode = WorkflowMode.PLAN_READY
+                return self._finish(
+                    state,
+                    memory,
+                    status="blocked",
+                    reason="approved plan became stale before execution: "
+                    + "; ".join(stale_reasons),
+                )
+        if state.workflow_mode == WorkflowMode.PLANNING:
+            existing_plan = memory.plan_artifact
+            plan_tool = (
+                "update_plan"
+                if existing_plan is not None
+                and existing_plan.status not in {PlanStatus.CANCELLED, PlanStatus.COMPLETED}
+                else "submit_plan"
+            )
+            self._append_system_feedback(
+                state,
+                memory,
+                {
+                    "workflow_mode": "planning",
+                    "current_plan": (
+                        memory.plan_artifact.model_dump(mode="json")
+                        if memory.plan_artifact is not None
+                        else None
+                    ),
+                    "instruction": (
+                        "Inspect the workspace using planning tools only. Submit a structured "
+                        f"Plan Artifact with {plan_tool} when it is ready for user review. "
+                        "When updating, retain the exact IDs and specifications of completed "
+                        "steps that remain valid; the Controller carries their progress forward. "
+                        "Do not reintroduce work already completed outside the remaining plan. "
+                        "A tool-free response does not finish planning."
+                    ),
+                },
+            )
+        elif (
+            state.workflow_mode == WorkflowMode.EXECUTE
+            and memory.plan_artifact is not None
+            and memory.plan_artifact.status == PlanStatus.EXECUTING
+        ):
+            self._append_system_feedback(
+                state,
+                memory,
+                {
+                    "workflow_mode": "execute_approved_plan",
+                    "plan": memory.plan_artifact.model_dump(mode="json"),
+                    "instruction": (
+                        "Execute only the current plan step. Read-only inspection is allowed "
+                        "for recovery. Use update_plan and return to user review before changing "
+                        "scope. Plan approval does not grant tool approval."
+                    ),
+                },
+            )
         self._log("session_start", task=state.task)
         if repaired_legacy_reflection:
             self._log(
@@ -191,7 +276,9 @@ class AgentController:
                         state=state,
                         memory=memory,
                         tool_schemas=(
-                            [] if state.status == AgentStatus.FINALIZING else self._tool_schemas()
+                            []
+                            if state.status == AgentStatus.FINALIZING
+                            else self._tool_schemas(state.workflow_mode)
                         ),
                     )
                 except ResponseParseError as error:
@@ -381,6 +468,42 @@ class AgentController:
                     state.pending_decision = None
                     memory.working.pending_actions.clear()
                 if response.content and response.content.strip():
+                    if state.workflow_mode == WorkflowMode.PLANNING:
+                        self._append_system_feedback(
+                            state,
+                            memory,
+                            {
+                                "error": "plan_artifact_required",
+                                "instruction": (
+                                    "Planning is not complete until submit_plan or update_plan "
+                                    "produces a locally validated Plan Artifact. Continue "
+                                    "inspection or submit the structured plan now."
+                                ),
+                            },
+                        )
+                        self._save_memory(memory, state, status=state.status.value)
+                        continue
+                    if (
+                        memory.plan_artifact is not None
+                        and memory.plan_artifact.status == PlanStatus.EXECUTING
+                    ):
+                        current = memory.plan_artifact.current_step
+                        self._append_system_feedback(
+                            state,
+                            memory,
+                            {
+                                "error": "plan_execution_incomplete",
+                                "current_step": (
+                                    current.model_dump(mode="json") if current is not None else None
+                                ),
+                                "instruction": (
+                                    "The approved plan still has incomplete steps. Execute the "
+                                    "current step or call update_plan if evidence changed."
+                                ),
+                            },
+                        )
+                        self._save_memory(memory, state, status=state.status.value)
+                        continue
                     terminal_result = self._handle_final_response(
                         response.content.strip(),
                         state=state,
@@ -427,10 +550,45 @@ class AgentController:
         state: SessionState,
         memory: MemoryState,
     ) -> AgentResult | None:
+        if state.workflow_mode == WorkflowMode.PLANNING:
+            forbidden_calls: list[tuple[ToolCall, PlanModeViolation]] = []
+            for call in calls:
+                try:
+                    self.plan_runtime.ensure_tool_allowed(call.name)
+                except PlanModeViolation as error:
+                    forbidden_calls.append((call, error))
+            for call, error in forbidden_calls:
+                self._log(
+                    "tool_call",
+                    step=state.step_count,
+                    tool_call_id=call.id,
+                    name=call.name,
+                    arguments=call.arguments,
+                )
+                self._record_blocked_action(
+                    call,
+                    ToolResult(
+                        ok=False,
+                        output="",
+                        error=str(error),
+                        error_code="plan_mode_violation",
+                        retryable=True,
+                    ),
+                    state=state,
+                    memory=memory,
+                )
+            calls = [call for call in calls if call.name in PLANNING_TOOL_NAMES]
+            if not calls:
+                return None
+
         reasoning_calls = [call for call in calls if call.name == "record_decision"]
         registration_calls = [call for call in calls if call.name == "register_verification"]
+        plan_calls = [call for call in calls if call.name in {"submit_plan", "update_plan"}]
         action_calls = [
-            call for call in calls if call.name not in {"record_decision", "register_verification"}
+            call
+            for call in calls
+            if call.name
+            not in {"record_decision", "register_verification", "submit_plan", "update_plan"}
         ]
         awaiting_plan_recovery = (
             state.verification_plan_recovery_attempts >= 1
@@ -475,6 +633,8 @@ class AgentController:
         reasoning_error: str | None = None
         registration_error: str | None = None
         registered_plan_id: str | None = None
+        plan_artifact_id: str | None = None
+        plan_error: str | None = None
         passed_verification_check = False
 
         if len(reasoning_calls) > 1:
@@ -506,12 +666,53 @@ class AgentController:
             except ValueError as error:
                 registration_error = str(error)
 
+        if len(plan_calls) > 1:
+            plan_error = "Only one plan submission or update is allowed per model turn."
+        elif plan_calls:
+            plan_call = plan_calls[0]
+            if action_calls:
+                plan_error = (
+                    "submit_plan or update_plan must be the only non-reasoning operation "
+                    "in its turn."
+                )
+            elif plan_call.name == "submit_plan" and state.workflow_mode != WorkflowMode.PLANNING:
+                plan_error = "submit_plan is only available in Plan Mode."
+            elif plan_call.name == "update_plan" and memory.plan_artifact is None:
+                plan_error = "update_plan requires an existing plan artifact."
+            else:
+                try:
+                    artifact = self.plan_runtime.submit(
+                        plan_call.arguments,
+                        update_reason=(
+                            str(plan_call.arguments.get("reason", "")).strip() or None
+                            if plan_call.name == "update_plan"
+                            else None
+                        ),
+                    )
+                    plan_artifact_id = artifact.plan_id
+                except ValueError as error:
+                    plan_error = str(error)
+
         decision_for_validation = reasoning_event
         if reasoning_event is None and mutating_calls:
             decision_for_validation = pending_decision
 
         validation_error = reasoning_error or registration_error
+        plan_step_validation_error = False
         verification_plan_missing_for_file_change = False
+        if plan_calls and action_calls:
+            validation_error = plan_error
+        if (
+            validation_error is None
+            and memory.plan_artifact is not None
+            and memory.plan_artifact.status == PlanStatus.EXECUTING
+        ):
+            for call in mutating_calls:
+                plan_error = self.plan_runtime.validate_action(call)
+                if plan_error is not None:
+                    plan_step_validation_error = True
+                    validation_error = plan_error
+                    break
         if mutating_calls and state.reflection_required:
             validation_error = (
                 "The previous action failed or was denied. Record a reflection in a separate "
@@ -639,13 +840,57 @@ class AgentController:
                 self._record_meta_result(call, result, state=state, memory=memory)
                 continue
 
+            if call.name in {"submit_plan", "update_plan"}:
+                if plan_artifact_id is not None and call == plan_calls[0]:
+                    artifact = memory.plan_artifact
+                    result = ToolResult(
+                        ok=True,
+                        output=(
+                            f"Plan {plan_artifact_id} revision "
+                            f"{artifact.artifact_revision if artifact is not None else 1} "
+                            "is ready for user review."
+                        ),
+                        metadata={
+                            "plan_id": plan_artifact_id,
+                            "artifact_revision": (
+                                artifact.artifact_revision if artifact is not None else 1
+                            ),
+                        },
+                    )
+                    self._log(
+                        "plan_ready",
+                        plan_id=plan_artifact_id,
+                        artifact_revision=(
+                            artifact.artifact_revision if artifact is not None else 1
+                        ),
+                        workspace_revision=(
+                            artifact.workspace_revision if artifact is not None else None
+                        ),
+                        update_reason=memory.plan_update_reason,
+                        artifact=(
+                            artifact.model_dump(mode="json") if artifact is not None else None
+                        ),
+                    )
+                else:
+                    result = ToolResult(
+                        ok=False,
+                        output="",
+                        error=plan_error or "Invalid plan request.",
+                        error_code="plan_invalid",
+                        retryable=True,
+                    )
+                self._record_meta_result(call, result, state=state, memory=memory)
+                continue
+
             if validation_error is not None:
                 result = ToolResult(
                     ok=False,
                     output="",
                     error=validation_error,
                     error_code=(
-                        "verification_plan_missing"
+                        "plan_step_violation"
+                        if plan_step_validation_error
+                        else "verification_plan_missing"
                         if verification_plan_missing_for_file_change
                         else "decision_validation_failed"
                     ),
@@ -675,6 +920,15 @@ class AgentController:
                     check_id=call.arguments.get("check_id"),
                     requested_by="model",
                 )
+            if (
+                memory.plan_artifact is not None
+                and memory.plan_artifact.status == PlanStatus.EXECUTING
+                and self._is_state_changing(call.name)
+            ):
+                plan_step = memory.plan_artifact.current_step
+                self.plan_runtime.start_action()
+                if plan_step is not None:
+                    self._log_plan_step("plan_step_started", memory, plan_step)
             result = self.tool_registry.execute(call)
             verification_result = (
                 self._verification_result(result) if call.name == "run_verification" else None
@@ -728,6 +982,15 @@ class AgentController:
                 state=state,
                 memory=memory,
                 trigger="the supplied verification plan was invalid",
+            )
+        if plan_artifact_id is not None:
+            state.workflow_mode = WorkflowMode.PLAN_READY
+            state.status = AgentStatus.PLAN_READY
+            return self._finish(
+                state,
+                memory,
+                status="plan_ready",
+                summary="Plan artifact is ready for user review.",
             )
         if passed_verification_check:
             report = self.verifier.completion_report(state)
@@ -844,6 +1107,19 @@ class AgentController:
             output_ref=output_ref,
         )
         result = self.reasoning_manager.result_with_evidence(result, observation)
+        if (
+            memory.plan_artifact is not None
+            and memory.plan_artifact.status == PlanStatus.EXECUTING
+            and self._is_state_changing(call.name)
+        ):
+            plan_step = memory.plan_artifact.current_step
+            self.plan_runtime.observe_action(
+                call,
+                result,
+                evidence_ref=observation.event_id,
+            )
+            if plan_step is not None:
+                self._log_plan_step("plan_step_finished", memory, plan_step)
         if not result.ok:
             state.reflection_required = True
             memory.reflection_required = True
@@ -1073,6 +1349,29 @@ class AgentController:
                     state.verification_plan.plan_id if state.verification_plan is not None else None
                 ),
             )
+            if (
+                memory.plan_artifact is not None
+                and memory.plan_artifact.status == PlanStatus.EXECUTING
+            ):
+                plan_error = self.plan_runtime.validate_action(call)
+                if plan_error is not None:
+                    self._append_system_feedback(
+                        state,
+                        memory,
+                        {
+                            "error": "plan_step_violation",
+                            "detail": plan_error,
+                            "instruction": (
+                                "Follow the current approved plan step or update the plan."
+                            ),
+                        },
+                    )
+                    self._save_memory(memory, state, status=state.status.value)
+                    break
+                plan_step = memory.plan_artifact.current_step
+                self.plan_runtime.start_action()
+                if plan_step is not None:
+                    self._log_plan_step("plan_step_started", memory, plan_step)
             result = self.tool_registry.execute(call)
             if self._verification_result(result) is None:
                 now = datetime.now(UTC)
@@ -1127,8 +1426,25 @@ class AgentController:
         state.messages.append(message)
         memory.messages.append(Message.from_chat_message(message, step=state.tool_call_count))
 
-    def _tool_schemas(self) -> list[dict[str, Any]]:
+    def _tool_schemas(self, workflow_mode: WorkflowMode) -> list[dict[str, Any]]:
         schemas = self.tool_registry.schemas()
+        if workflow_mode == WorkflowMode.PLANNING:
+            schemas = [
+                schema
+                for schema in schemas
+                if schema.get("function", {}).get("name") in PLANNING_TOOL_NAMES
+            ]
+        elif workflow_mode == WorkflowMode.EXECUTE:
+            has_plan = (
+                self.plan_runtime.memory is not None
+                and self.plan_runtime.memory.plan_artifact is not None
+            )
+            schemas = [
+                schema
+                for schema in schemas
+                if schema.get("function", {}).get("name") != "submit_plan"
+                and (schema.get("function", {}).get("name") != "update_plan" or has_plan)
+            ]
         if self.reasoning_manager.config.enabled:
             return schemas
         return [
@@ -1309,13 +1625,14 @@ class AgentController:
         state: SessionState,
         memory: MemoryState,
         *,
-        status: Literal["success", "incomplete", "blocked", "stopped", "error"],
+        status: Literal["success", "plan_ready", "incomplete", "blocked", "stopped", "error"],
         reason: str | None = None,
         summary: str = "",
     ) -> AgentResult:
         result = self._result(state, status=status, reason=reason, summary=summary)
         state.status = {
             "success": AgentStatus.COMPLETED,
+            "plan_ready": AgentStatus.PLAN_READY,
             "incomplete": AgentStatus.INCOMPLETE,
             "blocked": AgentStatus.BLOCKED,
             "stopped": AgentStatus.STOPPED,
@@ -1348,6 +1665,7 @@ class AgentController:
         memory.verification_results = dict(state.verification_results)
         memory.verification_plan_recovery_attempts = state.verification_plan_recovery_attempts
         memory.candidate_final_assessment = state.candidate_final_assessment
+        memory.workflow_mode = state.workflow_mode
         memory.status = status
         if self.memory_store is not None:
             self.memory_store.save_state(
@@ -1361,11 +1679,28 @@ class AgentController:
         if self.event_logger is not None:
             self.event_logger.log(event_type, **data)
 
+    def _log_plan_step(self, event_type: str, memory: MemoryState, step: Any) -> None:
+        artifact = memory.plan_artifact
+        if artifact is None:
+            return
+        self._log(
+            event_type,
+            plan_id=artifact.plan_id,
+            artifact_revision=artifact.artifact_revision,
+            step_id=step.step_id,
+            step_index=artifact.steps.index(step) + 1,
+            step_count=len(artifact.steps),
+            title=step.title,
+            operation=step.operation.value,
+            status=step.status.value,
+            error=step.last_error,
+        )
+
     @staticmethod
     def _result(
         state: SessionState,
         *,
-        status: Literal["success", "incomplete", "blocked", "stopped", "error"],
+        status: Literal["success", "plan_ready", "incomplete", "blocked", "stopped", "error"],
         reason: str | None = None,
         summary: str = "",
     ) -> AgentResult:

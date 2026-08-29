@@ -7,6 +7,7 @@ from enum import StrEnum
 from typing import Any
 
 from repo_rivet.llm.base import ModelResponse
+from repo_rivet.planning.models import WorkflowMode
 from repo_rivet.reasoning.models import ReasoningEvent
 from repo_rivet.tools.base import ToolCall, ToolResult
 from repo_rivet.verification.models import (
@@ -20,6 +21,9 @@ _FILE_MODIFICATION_TOOLS = frozenset({"edit_file", "write_file"})
 
 
 class AgentStatus(StrEnum):
+    PLANNING = "planning"
+    PLAN_READY = "plan_ready"
+    EXECUTING = "executing"
     RUNNING = "running"
     VERIFYING = "verifying"
     FINALIZING = "finalizing"
@@ -37,6 +41,7 @@ class SessionState:
 
     task: str
     status: AgentStatus = AgentStatus.RUNNING
+    workflow_mode: WorkflowMode = WorkflowMode.EXECUTE
     messages: list[dict[str, Any]] = field(default_factory=list)
     step_count: int = 0
     tool_call_count: int = 0
@@ -196,6 +201,7 @@ class SessionState:
         )
         return (
             f"Agent status: {self.status.value}.\n"
+            f"Workflow mode: {self.workflow_mode.value}.\n"
             f"Model steps: {self.step_count}. Tool calls: {self.tool_call_count}.\n"
             f"Modified files: {modified}.\n"
             f"Workspace revision: {self.workspace_revision}.\n"

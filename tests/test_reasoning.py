@@ -678,10 +678,10 @@ def test_failed_action_requires_reflection_before_another_mutation() -> None:
     assert not memory.reflection_required
 
 
-def test_task_decision_cannot_bypass_independent_read_only_approval(tmp_path: Path) -> None:
+def test_task_decision_cannot_bypass_independent_human_approval(tmp_path: Path) -> None:
     memory = MemoryState(session_id="reasoning-approval")
     approval = ApprovalEngine(
-        mode=ApprovalMode.READ_ONLY,
+        mode=ApprovalMode.ALWAYS_ASK,
         normalizer=RequestNormalizer(tmp_path),
         risk_analyzer=RiskAnalyzer(),
         hard_policy=HardSafetyPolicy(),

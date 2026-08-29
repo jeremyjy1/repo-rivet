@@ -9,20 +9,24 @@ from repo_rivet.cli import _chat_loop, _print_result, build_parser, cli
 from repo_rivet.memory.context_manager import SYSTEM_PROMPT
 from repo_rivet.memory.models import MemoryConfig, MemoryState, Message
 from repo_rivet.memory.store import MemoryStore
+from repo_rivet.planning.models import WorkflowMode
 from repo_rivet.verification.models import VerificationOutcome
 
 
 class FakeConversationAgent:
     def __init__(self) -> None:
         self.requests: list[tuple[str, list[dict[str, object]]]] = []
+        self.workflow_modes: list[WorkflowMode | None] = []
 
     def run(
         self,
         task: str,
         *,
         memory: MemoryState | None = None,
+        workflow_mode: WorkflowMode | None = None,
     ) -> AgentResult:
         assert memory is not None
+        self.workflow_modes.append(workflow_mode)
         self.requests.append(
             (task, [message.model_dump(mode="json") for message in memory.messages])
         )
@@ -52,6 +56,27 @@ class FakeApprovalEngine:
 
     def set_mode(self, mode: ApprovalMode) -> None:
         self.mode = mode
+
+
+class FakePlanRuntime:
+    def __init__(self) -> None:
+        self.memory: MemoryState | None = None
+        self.approved = False
+        self.cancelled = False
+
+    def bind(self, memory: MemoryState) -> None:
+        self.memory = memory
+
+    def approve(self) -> object:
+        assert self.memory is not None
+        self.approved = True
+        self.memory.workflow_mode = WorkflowMode.EXECUTE
+        return object()
+
+    def cancel(self) -> None:
+        assert self.memory is not None
+        self.cancelled = True
+        self.memory.workflow_mode = WorkflowMode.EXECUTE
 
 
 def test_result_summary_is_rendered_as_literal_plain_terminal_text() -> None:
@@ -159,12 +184,13 @@ def test_parser_accepts_approval_mode_override(tmp_path: Path) -> None:
     assert arguments.approval_mode == "always-ask"
 
 
-def test_parser_accepts_read_only_approval_mode(tmp_path: Path) -> None:
+def test_parser_exposes_plan_workflow(tmp_path: Path) -> None:
     arguments = build_parser().parse_args(
-        ["chat", "--workspace", str(tmp_path), "--approval-mode", "read-only"]
+        ["plan", "--workspace", str(tmp_path), "inspect", "the", "change"]
     )
 
-    assert arguments.approval_mode == "read-only"
+    assert arguments.command == "plan"
+    assert arguments.task == ["inspect", "the", "change"]
 
 
 def test_parser_accepts_structured_reasoning_display_mode(tmp_path: Path) -> None:
@@ -256,7 +282,7 @@ def test_chat_can_show_and_switch_approval_mode() -> None:
     inputs = iter(
         [
             "/approval",
-            "/approval read-only",
+            "/approval always-ask",
             "/approval unsupported",
             "/exit",
         ]
@@ -274,11 +300,92 @@ def test_chat_can_show_and_switch_approval_mode() -> None:
 
     output = buffer.getvalue()
     assert exit_code == 0
-    assert approval.mode == ApprovalMode.READ_ONLY
+    assert approval.mode == ApprovalMode.ALWAYS_ASK
     assert "Current approval mode: safe-auto" in output
-    assert "Approval mode changed: safe-auto → read-only" in output
+    assert "Approval mode changed: safe-auto → always-ask" in output
     assert "Unknown approval mode: unsupported" in output
     assert agent.requests == []
+
+
+def test_chat_plan_command_enters_controller_planning_workflow() -> None:
+    agent = FakeConversationAgent()
+    plan_runtime = FakePlanRuntime()
+    inputs = iter([":plan inspect app.py", "/exit"])
+    console = Console(file=StringIO(), force_terminal=False, color_system=None)
+
+    exit_code = _chat_loop(
+        agent,
+        MemoryState(session_id="chat-plan"),
+        console,
+        lambda _: next(inputs),
+        plan_runtime=plan_runtime,
+    )
+
+    assert exit_code == 0
+    assert agent.requests[0][0] == "inspect app.py"
+    assert agent.workflow_modes == [WorkflowMode.PLANNING]
+
+
+def test_approval_plan_shortcut_enters_planning_workflow() -> None:
+    agent = FakeConversationAgent()
+    plan_runtime = FakePlanRuntime()
+    inputs = iter(["/approval plan inspect app.py", "/exit"])
+    buffer = StringIO()
+    console = Console(file=buffer, force_terminal=False, color_system=None)
+
+    exit_code = _chat_loop(
+        agent,
+        MemoryState(session_id="approval-plan-shortcut"),
+        console,
+        lambda _: next(inputs),
+        plan_runtime=plan_runtime,
+    )
+
+    assert exit_code == 0
+    assert agent.requests[0][0] == "inspect app.py"
+    assert agent.workflow_modes == [WorkflowMode.PLANNING]
+    assert "Plan Mode is a planning workflow" in buffer.getvalue()
+
+
+def test_chat_execute_command_approves_plan_without_approving_tools() -> None:
+    agent = FakeConversationAgent()
+    plan_runtime = FakePlanRuntime()
+    memory = MemoryState(
+        session_id="chat-execute",
+        workflow_mode=WorkflowMode.PLAN_READY,
+    )
+    inputs = iter([":execute", "/exit"])
+    console = Console(file=StringIO(), force_terminal=False, color_system=None)
+
+    exit_code = _chat_loop(
+        agent,
+        memory,
+        console,
+        lambda _: next(inputs),
+        plan_runtime=plan_runtime,
+    )
+
+    assert exit_code == 0
+    assert plan_runtime.approved
+    assert agent.requests[0][0] == "Execute the user-approved plan."
+    assert agent.workflow_modes == [WorkflowMode.EXECUTE]
+
+
+def test_chat_requires_explicit_review_action_for_ready_plan() -> None:
+    agent = FakeConversationAgent()
+    memory = MemoryState(
+        session_id="chat-plan-ready",
+        workflow_mode=WorkflowMode.PLAN_READY,
+    )
+    inputs = iter(["make changes", "/exit"])
+    buffer = StringIO()
+    console = Console(file=buffer, force_terminal=False, color_system=None)
+
+    exit_code = _chat_loop(agent, memory, console, lambda _: next(inputs))
+
+    assert exit_code == 0
+    assert agent.requests == []
+    assert "plan is waiting for review" in buffer.getvalue()
 
 
 def test_chat_manual_aggressive_compaction_preserves_tool_group_and_saves_state(

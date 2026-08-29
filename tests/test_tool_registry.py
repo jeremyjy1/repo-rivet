@@ -2,7 +2,7 @@ from pathlib import Path
 
 from repo_rivet.safety.path_policy import WorkspacePathPolicy
 from repo_rivet.tools.base import DecisionPolicy, ToolCall
-from repo_rivet.tools.git import GitDiffTool
+from repo_rivet.tools.git import GitDiffTool, GitStatusTool
 from repo_rivet.tools.registry import create_default_registry
 
 
@@ -12,6 +12,8 @@ def test_default_registry_exposes_workspace_and_decision_tools(tmp_path: Path) -
     assert registry.names == (
         "record_decision",
         "register_verification",
+        "submit_plan",
+        "update_plan",
         "list_files",
         "search_text",
         "read_file",
@@ -19,6 +21,7 @@ def test_default_registry_exposes_workspace_and_decision_tools(tmp_path: Path) -
         "edit_file",
         "run_command",
         "run_verification",
+        "git_status",
         "git_diff",
     )
     assert [schema["function"]["name"] for schema in registry.schemas()] == list(registry.names)
@@ -82,3 +85,10 @@ def test_git_diff_reports_non_repository_as_failure(tmp_path: Path) -> None:
 
     assert not result.ok
     assert "git diff failed" in (result.error or "")
+
+
+def test_git_status_reports_non_repository_as_failure(tmp_path: Path) -> None:
+    result = GitStatusTool(WorkspacePathPolicy(tmp_path)).execute({"path": "."})
+
+    assert not result.ok
+    assert "git status failed" in (result.error or "")

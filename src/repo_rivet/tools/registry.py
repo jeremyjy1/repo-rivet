@@ -8,6 +8,7 @@ from repo_rivet.approval.engine import ApprovalEngine
 from repo_rivet.approval.models import ApprovalAction, Capability
 from repo_rivet.editing.runtime import EditingRuntime
 from repo_rivet.editing.tools import EditFileTool
+from repo_rivet.planning.runtime import PlanRuntime
 from repo_rivet.safety.command_policy import CommandPolicy
 from repo_rivet.safety.path_policy import WorkspacePathPolicy
 from repo_rivet.tools.base import BaseTool, DecisionPolicy, ToolCall, ToolResult
@@ -17,8 +18,9 @@ from repo_rivet.tools.filesystem import (
     SearchTextTool,
     WriteFileTool,
 )
-from repo_rivet.tools.git import GitDiffTool
+from repo_rivet.tools.git import GitDiffTool, GitStatusTool
 from repo_rivet.tools.meta import RecordDecisionTool
+from repo_rivet.tools.planning import SubmitPlanTool, UpdatePlanTool
 from repo_rivet.tools.shell import RunCommandTool
 from repo_rivet.tools.verification import RegisterVerificationTool, RunVerificationTool
 from repo_rivet.verification.runtime import VerificationRuntime
@@ -52,11 +54,13 @@ class ToolRegistry:
         workspace: Path | None = None,
         approval_engine: ApprovalEngine | None = None,
         verification_runtime: VerificationRuntime | None = None,
+        plan_runtime: PlanRuntime | None = None,
     ) -> None:
         self._tools: dict[str, BaseTool[Any]] = {}
         self.workspace = workspace
         self.approval_engine = approval_engine
         self.verification_runtime = verification_runtime
+        self.plan_runtime = plan_runtime
         for tool in tools:
             self.register(tool)
 
@@ -173,6 +177,7 @@ def create_default_registry(
     path_policy = WorkspacePathPolicy(workspace)
     command_policy = CommandPolicy()
     verification_runtime = VerificationRuntime(path_policy, command_policy)
+    plan_runtime = PlanRuntime(path_policy)
     editing_runtime = EditingRuntime(
         path_policy,
         snapshot_dir=snapshot_dir,
@@ -183,6 +188,8 @@ def create_default_registry(
         [
             RecordDecisionTool(),
             RegisterVerificationTool(),
+            SubmitPlanTool(),
+            UpdatePlanTool(),
             ListFilesTool(path_policy),
             SearchTextTool(path_policy, editing_runtime),
             ReadFileTool(path_policy, editing_runtime),
@@ -190,9 +197,11 @@ def create_default_registry(
             EditFileTool(editing_runtime),
             RunCommandTool(path_policy, command_policy),
             RunVerificationTool(verification_runtime),
+            GitStatusTool(path_policy),
             GitDiffTool(path_policy),
         ],
         workspace=path_policy.workspace,
         approval_engine=approval_engine,
         verification_runtime=verification_runtime,
+        plan_runtime=plan_runtime,
     )

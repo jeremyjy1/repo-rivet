@@ -8,6 +8,9 @@ from pydantic import BaseModel, ConfigDict, Field
 
 class SessionStatus(StrEnum):
     CREATED = "created"
+    PLANNING = "planning"
+    PLAN_READY = "plan_ready"
+    EXECUTING = "executing"
     RUNNING = "running"
     VERIFYING = "verifying"
     FINALIZING = "finalizing"

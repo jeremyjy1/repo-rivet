@@ -167,6 +167,23 @@ def test_safe_auto_allows_normal_read_and_denies_sensitive_read(tmp_path: Path) 
     assert human.requests == []
 
 
+def test_safe_auto_treats_git_status_as_typed_read(tmp_path: Path) -> None:
+    human = FakeHumanApprover()
+    engine, _ = create_engine(tmp_path, mode=ApprovalMode.SAFE_AUTO, human=human)
+
+    outcome = engine.authorize(
+        tool_name="git_status",
+        arguments={"path": "."},
+        capabilities={Capability.FILESYSTEM_READ},
+        session_id=engine.session_id,
+    )
+
+    assert outcome.decision.action == ApprovalAction.ALLOW
+    assert outcome.decision.source == "safe_rule"
+    assert outcome.request.facts.operation_class == OperationClass.READ
+    assert human.requests == []
+
+
 def test_edit_approval_contains_preflight_diff_and_version_fingerprint(tmp_path: Path) -> None:
     path = tmp_path / "main.py"
     path.write_text("value = 1\n", encoding="utf-8")
@@ -299,6 +316,24 @@ def test_always_ask_prompts_even_for_list_files(tmp_path: Path) -> None:
 
     assert result.ok
     assert [request.tool_name for request in human.requests] == ["list_files"]
+
+
+def test_always_ask_honors_explicit_matching_repeat_allowance(tmp_path: Path) -> None:
+    human = FakeHumanApprover(scope=ApprovalScope.SESSION_EXACT)
+    engine, _ = create_engine(tmp_path, mode=ApprovalMode.ALWAYS_ASK, human=human)
+    request = {
+        "tool_name": "write_file",
+        "arguments": {"path": "file.txt", "content": "value"},
+        "capabilities": {Capability.FILESYSTEM_WRITE},
+        "session_id": engine.session_id,
+    }
+
+    first = engine.authorize(**request)
+    repeated = engine.authorize(**request)
+
+    assert first.decision.source == "human"
+    assert repeated.decision.source == "session_grant"
+    assert len(human.requests) == 1
 
 
 def test_verification_approval_reviews_the_registered_concrete_command(tmp_path: Path) -> None:
@@ -928,94 +963,6 @@ def test_session_grant_matches_only_exact_normalized_request(tmp_path: Path) -> 
     assert len(memory.approval_session_grants) == 2
 
 
-def test_read_only_mode_allows_typed_reads_and_denies_writes_and_commands(
-    tmp_path: Path,
-) -> None:
-    (tmp_path / "main.py").write_text("value = 1\n", encoding="utf-8")
-    engine, _ = create_engine(tmp_path, mode=ApprovalMode.READ_ONLY)
-    registry = create_default_registry(tmp_path, approval_engine=engine)
-
-    read = registry.execute(ToolCall(id="read-1", name="read_file", arguments={"path": "main.py"}))
-    write = registry.execute(
-        ToolCall(
-            id="write-1",
-            name="write_file",
-            arguments={"path": "new.py", "content": "value = 2\n"},
-        )
-    )
-    command = registry.execute(
-        ToolCall(id="command-1", name="run_command", arguments={"command": "pwd"})
-    )
-
-    assert read.ok
-    assert not write.ok
-    assert write.error_code == "approval_denied"
-    assert write.metadata and write.metadata["approval_source"] == "read_only_mode"
-    assert not command.ok
-    assert command.metadata and command.metadata["approval_source"] == "read_only_mode"
-    assert not (tmp_path / "new.py").exists()
-
-
-def test_read_only_mode_cannot_be_bypassed_by_prior_session_grant(tmp_path: Path) -> None:
-    human = FakeHumanApprover(scope=ApprovalScope.SESSION_EXACT)
-    engine, memory = create_engine(tmp_path, mode=ApprovalMode.SAFE_AUTO, human=human)
-    request = {
-        "tool_name": "write_file",
-        "arguments": {"path": "file.txt", "content": "value"},
-        "capabilities": {Capability.FILESYSTEM_WRITE},
-        "session_id": engine.session_id,
-    }
-    granted = engine.authorize(**request)
-
-    engine.set_mode(ApprovalMode.READ_ONLY)
-    denied = engine.authorize(**request)
-
-    assert granted.decision.scope == ApprovalScope.SESSION_EXACT
-    assert denied.decision.action == ApprovalAction.DENY
-    assert denied.decision.source == "read_only_mode"
-    assert memory.approval_mode_override == ApprovalMode.READ_ONLY
-
-
-def test_switch_to_read_only_invalidates_pending_write_approval(tmp_path: Path) -> None:
-    engine, _ = create_engine(tmp_path, mode=ApprovalMode.ALLOW_ALL)
-    approved = engine.authorize(
-        tool_name="write_file",
-        arguments={"path": "file.txt", "content": "value"},
-        capabilities={Capability.FILESYSTEM_WRITE},
-        session_id=engine.session_id,
-    )
-
-    engine.set_mode(ApprovalMode.READ_ONLY)
-    revalidated = engine.revalidate(approved)
-
-    assert revalidated is not None
-    assert revalidated.action == ApprovalAction.DENY
-    assert revalidated.source == "read_only_mode"
-
-
-def test_mode_switch_updates_fixed_model_safety_rule(tmp_path: Path) -> None:
-    engine, memory = create_engine(tmp_path, mode=ApprovalMode.SAFE_AUTO)
-    memory.start_task(
-        task="inspect project",
-        workspace=str(tmp_path),
-        system_prompt="system",
-        safety_rules=["stay in workspace"],
-        completion_rules=["report result"],
-        max_steps=10,
-    )
-
-    engine.set_mode(ApprovalMode.READ_ONLY)
-
-    assert memory.fixed is not None
-    approval_rules = [
-        rule for rule in memory.fixed.safety_rules if rule.startswith("Current approval mode:")
-    ]
-    assert approval_rules == [
-        "Current approval mode: read-only. Only typed, workspace-confined file inspection "
-        "tools are permitted; do not request writes or commands."
-    ]
-
-
 def test_symlink_change_invalidates_approval_before_execution(tmp_path: Path) -> None:
     target = tmp_path / "target"
     target.mkdir()
@@ -1094,10 +1041,11 @@ def test_terminal_approval_uses_numbered_options_and_reprompts_invalid_choice(
     output = buffer.getvalue()
     assert decision.action == ApprovalAction.ALLOW
     assert decision.scope == ApprovalScope.SESSION_EXACT
-    assert "1  Approve once" in output
-    assert "2  Approve this exact request for the session" in output
-    assert "5  Abort agent" in output
-    assert "Enter a number from 1 to 5" in output
+    assert "1  Allow once" in output
+    assert "2  Allow matching repeats for this session" in output
+    assert "3  Deny and continue" in output
+    assert "4  Stop current run and save session" in output
+    assert "Enter a number from 1 to 4" in output
     assert "Requested action" in output
     assert "File" in output and "file.txt" in output
     assert "Content" in output and "5 characters" in output
@@ -1162,7 +1110,7 @@ def test_terminal_approval_explains_structured_llm_review(tmp_path: Path) -> Non
     assert "confidence" not in output.lower()
 
 
-def test_terminal_option_five_marks_agent_abort(tmp_path: Path) -> None:
+def test_terminal_option_four_stops_current_run(tmp_path: Path) -> None:
     engine, _ = create_engine(tmp_path, mode=ApprovalMode.ALLOW_ALL)
     request = engine.authorize(
         tool_name="write_file",
@@ -1172,10 +1120,11 @@ def test_terminal_option_five_marks_agent_abort(tmp_path: Path) -> None:
     ).request
     console = Console(file=StringIO(), force_terminal=False, color_system=None)
 
-    decision = TerminalHumanApprover(console, reader=lambda _: "5").ask(request)
+    decision = TerminalHumanApprover(console, reader=lambda _: "4").ask(request)
 
     assert decision.action == ApprovalAction.DENY
     assert decision.abort_agent
+    assert "session will be saved" in decision.reason
 
 
 def test_terminal_denial_can_include_direction_for_agent(tmp_path: Path) -> None:
@@ -1195,7 +1144,27 @@ def test_terminal_denial_can_include_direction_for_agent(tmp_path: Path) -> None
     assert decision.action == ApprovalAction.DENY
     assert decision.scope == ApprovalScope.ONCE
     assert decision.guidance == "先读取现有文件，只修改目标函数"
-    assert "Deny once, with optional direction" in buffer.getvalue()
+    assert "Deny and continue" in buffer.getvalue()
+
+
+def test_terminal_denial_reason_is_optional(tmp_path: Path) -> None:
+    engine, _ = create_engine(tmp_path, mode=ApprovalMode.ALLOW_ALL)
+    request = engine.authorize(
+        tool_name="write_file",
+        arguments={"path": "file.txt", "content": "value"},
+        capabilities={Capability.FILESYSTEM_WRITE},
+        session_id=engine.session_id,
+    ).request
+    answers = iter(["3", ""])
+
+    decision = TerminalHumanApprover(
+        Console(file=StringIO(), force_terminal=False, color_system=None),
+        reader=lambda _: next(answers),
+    ).ask(request)
+
+    assert decision.action == ApprovalAction.DENY
+    assert not decision.abort_agent
+    assert decision.guidance is None
 
 
 def test_guided_denial_is_returned_to_model_and_reused_for_exact_retry(tmp_path: Path) -> None:

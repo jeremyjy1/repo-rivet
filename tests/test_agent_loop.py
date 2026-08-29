@@ -463,7 +463,7 @@ def test_finalization_discards_dsml_tool_markup_from_result_and_history() -> Non
     validate_tool_call_protocol([message.as_chat_message() for message in memory.messages])
 
 
-def test_controller_persists_verifying_and_failed_scheduled_check_before_abort() -> None:
+def test_controller_saves_paused_session_when_approval_stops_run(tmp_path: Path) -> None:
     write = call("1", "write_file", {"path": "app.py", "content": "new"})
     memory = MemoryState(session_id="verification-abort")
 
@@ -493,13 +493,19 @@ def test_controller_persists_verifying_and_failed_scheduled_check_before_abort()
             ModelResponse(content="Ready for verification."),
         ]
     )
+    store = MemoryStore(tmp_path / "session")
 
-    result = controller(model, tools).run("fix", memory=memory)
+    result = AgentController(
+        model_client=model,
+        tool_registry=cast(ToolRegistry, tools),
+        memory_store=store,
+    ).run("fix", memory=memory)
 
     assert result.status == "stopped"
     assert tools.status_at_verification == "verifying"
     assert memory.verification_results["tests"].status.value == "error"
-    assert memory.status == "stopped"
+    assert memory.status == "paused"
+    assert store.load_state().status == "paused"
 
 
 def test_file_change_without_verification_plan_is_blocked_before_execution() -> None:

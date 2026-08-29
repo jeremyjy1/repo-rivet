@@ -10,6 +10,45 @@ class GitDiffArguments(ToolArguments):
     path: str = "."
 
 
+class GitStatusArguments(ToolArguments):
+    path: str = "."
+
+
+class GitStatusTool(BaseTool[GitStatusArguments]):
+    name = "git_status"
+    description = "Show concise Git workspace status for a confined workspace path."
+    arguments_type = GitStatusArguments
+    capabilities = frozenset({Capability.FILESYSTEM_READ})
+
+    def __init__(self, path_policy: WorkspacePathPolicy) -> None:
+        self.path_policy = path_policy
+
+    def run(self, arguments: GitStatusArguments) -> ToolResult:
+        resolved_path = self.path_policy.resolve(arguments.path)
+        relative_path = resolved_path.relative_to(self.path_policy.workspace)
+        pathspec = relative_path.as_posix() or "."
+        result = run_process(
+            ("git", "status", "--short", "--untracked-files=all", "--", pathspec),
+            cwd=self.path_policy.workspace,
+            timeout_seconds=30,
+        )
+        if not result.ok:
+            return result
+        if result.metadata and result.metadata.get("exit_code") != 0:
+            return ToolResult(
+                ok=False,
+                output=result.output,
+                error=f"git status failed with exit code {result.metadata['exit_code']}",
+                metadata=result.metadata,
+            )
+        return ToolResult(
+            ok=True,
+            output=result.output or "Workspace is clean.",
+            metadata={"path": pathspec, "process": result.metadata},
+            raw_output=result.raw_output or result.output,
+        )
+
+
 class GitDiffTool(BaseTool[GitDiffArguments]):
     name = "git_diff"
     description = "Show unstaged and staged Git changes for a workspace path."

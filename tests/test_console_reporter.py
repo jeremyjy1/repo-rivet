@@ -80,6 +80,7 @@ def test_console_reporter_shows_transient_status_while_model_generates(
         ("run_command", "Running command"),
         ("run_verification", "Running verification"),
         ("git_diff", "Inspecting Git changes"),
+        ("git_status", "Inspecting Git status"),
         ("future_tool", "Running tool"),
     ],
 )
@@ -166,6 +167,36 @@ def test_console_reporter_compacts_tool_and_material_approval_events() -> None:
     assert "echo" not in output
     assert "call-1234567890" not in output
     assert "bounded test command" not in output
+
+
+def test_console_reporter_shows_controller_owned_plan_progress() -> None:
+    buffer = StringIO()
+    reporter = ConsoleEventReporter(
+        Console(file=buffer, force_terminal=False, color_system=None, width=240)
+    )
+
+    reporter.log(
+        "plan_step_started",
+        plan_id="plan-hidden",
+        step_index=1,
+        step_count=2,
+        title="Update collision handling",
+        status="running",
+    )
+    reporter.log(
+        "plan_step_finished",
+        plan_id="plan-hidden",
+        step_index=1,
+        step_count=2,
+        title="Update collision handling",
+        status="completed",
+    )
+
+    assert buffer.getvalue().splitlines() == [
+        "[PLAN 1/2] Update collision handling · running",
+        "[PLAN 1/2] Update collision handling · completed",
+    ]
+    assert "plan-hidden" not in buffer.getvalue()
 
 
 def test_console_reporter_shows_denial_once_without_exposing_inline_secret() -> None:

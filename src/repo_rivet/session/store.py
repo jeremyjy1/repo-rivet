@@ -29,6 +29,8 @@ from repo_rivet.session.models import ActiveSessionPointer, SessionMetadata, Ses
 from repo_rivet.storage.atomic_write import atomic_write_json
 
 _ACTIVE_SESSION_STATUSES = {
+    SessionStatus.PLANNING,
+    SessionStatus.EXECUTING,
     SessionStatus.RUNNING,
     SessionStatus.VERIFYING,
     SessionStatus.FINALIZING,

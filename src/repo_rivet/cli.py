@@ -37,6 +37,7 @@ from repo_rivet.memory.models import MemoryConfig, MemoryState
 from repo_rivet.memory.store import MemoryStore
 from repo_rivet.memory.token_calibrator import TokenCalibrationStore
 from repo_rivet.memory.token_estimator import create_token_estimator
+from repo_rivet.planning.models import PlanArtifact, PlanStatus, WorkflowMode
 from repo_rivet.reasoning.manager import ReasoningManager
 from repo_rivet.reasoning.models import ReasoningDisplayMode
 from repo_rivet.safety.path_policy import PathPolicyError
@@ -62,6 +63,7 @@ class ConversationAgent(Protocol):
         task: str,
         *,
         memory: MemoryState | None = None,
+        workflow_mode: WorkflowMode | None = None,
     ) -> AgentResult:
         """Run one task with optional prior conversation."""
         ...
@@ -72,6 +74,20 @@ class ApprovalModeManager(Protocol):
 
     def set_mode(self, mode: ApprovalMode) -> None:
         """Apply and persist an approval-mode switch."""
+        ...
+
+
+class PlanWorkflowManager(Protocol):
+    def bind(self, memory: MemoryState) -> None:
+        """Bind plan operations to the active session."""
+        ...
+
+    def approve(self) -> PlanArtifact:
+        """Validate and enter execution for the current plan."""
+        ...
+
+    def cancel(self) -> None:
+        """Cancel the current plan without executing it."""
         ...
 
 
@@ -110,6 +126,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional first request before the interactive prompt",
     )
     _add_runtime_arguments(chat_parser)
+
+    plan_parser = subparsers.add_parser(
+        "plan",
+        help="Inspect the workspace and produce a reviewable plan before execution",
+    )
+    plan_parser.add_argument("task", nargs="+", help="Task to investigate and plan")
+    _add_runtime_arguments(plan_parser)
 
     session_parser = subparsers.add_parser("session", help="Manage local conversations")
     session_commands = session_parser.add_subparsers(dest="session_command", required=True)
@@ -212,6 +235,9 @@ def cli(
             reader,
             approval_prompt_reader=prompt_reader,
         )
+    if arguments.command == "plan":
+        reader = prompt_reader or (lambda prompt: Prompt.ask(prompt, console=output))
+        return _run_plan(arguments, output, reader, approval_prompt_reader=prompt_reader)
     if arguments.command == "session":
         return _session_command(arguments, output, prompt_reader=prompt_reader)
     output.print("[red]Unknown command.[/red]")
@@ -245,6 +271,102 @@ def _run_agent(arguments: argparse.Namespace, console: Console) -> int:
         runtime.close()
 
 
+def _run_plan(
+    arguments: argparse.Namespace,
+    console: Console,
+    prompt_reader: PromptReader,
+    *,
+    approval_prompt_reader: PromptReader | None = None,
+) -> int:
+    task = " ".join(arguments.task).strip()
+    if not task:
+        console.print("[bold red]Task error:[/bold red] Task must not be empty")
+        return 2
+    try:
+        runtime = _build_runtime(
+            arguments,
+            console,
+            approval_prompt_reader=approval_prompt_reader,
+        )
+    except (ConfigurationError, PathPolicyError, SessionError, OSError, ValueError) as error:
+        console.print(f"[bold red]Configuration error:[/bold red] {error}")
+        return 2
+
+    _print_runtime(console, arguments.workspace, runtime)
+    plan_runtime = runtime.registry.plan_runtime
+    assert plan_runtime is not None
+    plan_runtime.bind(runtime.memory)
+    try:
+        request = task
+        while True:
+            result = runtime.controller.run(
+                request,
+                memory=runtime.memory,
+                workflow_mode=WorkflowMode.PLANNING,
+            )
+            _print_result(console, result)
+            if result.status != "plan_ready" or runtime.memory.plan_artifact is None:
+                return 1
+            _print_plan_artifact(console, runtime.memory.plan_artifact)
+            choice = (
+                prompt_reader(
+                    "Plan review: [e] Execute  [r] Revise  [i] Continue inspection  [q] Cancel"
+                )
+                .strip()
+                .lower()
+            )
+            if choice == "e":
+                try:
+                    plan_runtime.approve()
+                except ValueError as error:
+                    runtime.store.save_state(runtime.memory, status=SessionStatus.PLAN_READY.value)
+                    console.print(f"[bold yellow]Plan stale:[/bold yellow] {error}")
+                    return 1
+                runtime.store.log(
+                    "plan_approved",
+                    plan_id=runtime.memory.plan_artifact.plan_id,
+                    artifact_revision=runtime.memory.plan_artifact.artifact_revision,
+                    workspace_revision=runtime.memory.plan_artifact.workspace_revision,
+                )
+                runtime.store.save_state(runtime.memory, status=SessionStatus.EXECUTING.value)
+                executed = runtime.controller.run(
+                    "Execute the user-approved plan.",
+                    memory=runtime.memory,
+                    workflow_mode=WorkflowMode.EXECUTE,
+                )
+                _print_result(console, executed)
+                return 0 if executed.status == "success" else 1
+            if choice == "r":
+                runtime.memory.workflow_mode = WorkflowMode.PLANNING
+                request = prompt_reader("Describe the required plan revision").strip()
+                if not request:
+                    console.print("Revision request cannot be empty.")
+                    continue
+                continue
+            if choice == "i":
+                runtime.memory.workflow_mode = WorkflowMode.PLANNING
+                request = prompt_reader("What should RepoRivet inspect next?").strip()
+                if not request:
+                    request = "Continue inspecting unresolved plan assumptions."
+                continue
+            if choice == "q":
+                cancelled_plan = runtime.memory.plan_artifact
+                plan_runtime.cancel()
+                runtime.store.log(
+                    "plan_cancelled",
+                    plan_id=cancelled_plan.plan_id if cancelled_plan is not None else None,
+                    artifact_revision=(
+                        cancelled_plan.artifact_revision if cancelled_plan is not None else None
+                    ),
+                )
+                runtime.store.save_state(runtime.memory, status=SessionStatus.PAUSED.value)
+                console.print("Plan cancelled. Session saved.")
+                return 0
+            console.print("Choose e, r, i, or q.")
+    finally:
+        runtime.close()
+
+
 def _chat_agent(
     arguments: argparse.Namespace,
     console: Console,
@@ -274,10 +396,12 @@ def _chat_agent(
             initial_task=initial_task or None,
             memory_store=runtime.store,
             approval_engine=runtime.registry.approval_engine,
+            plan_runtime=runtime.registry.plan_runtime,
             show_history_on_start=runtime.loaded_existing_session,
         )
-        runtime.memory.status = SessionStatus.PAUSED.value
-        runtime.store.save_state(runtime.memory, status=SessionStatus.PAUSED.value)
+        idle_status = _idle_session_status(runtime.memory)
+        runtime.memory.status = idle_status.value
+        runtime.store.save_state(runtime.memory, status=idle_status.value)
         return exit_code
     except OSError as error:
         runtime.memory.status = SessionStatus.FAILED.value
@@ -508,6 +632,13 @@ def _print_session_details(
     modified = ", ".join(sorted(memory.modified_files)) or "none"
     details.append(f"Modified:  {_terminal_text(modified)}\n")
     details.append(f"Verification: {_terminal_text(memory.summary.verification_status)}")
+    if memory.plan_artifact is not None:
+        details.append(f"\nPlan:      {memory.plan_artifact.status.value}")
+        details.append(
+            f"\nPlan step: {_terminal_text(memory.plan_artifact.current_step.step_id)}"
+            if memory.plan_artifact.current_step is not None
+            else "\nPlan step: complete"
+        )
     if memory.reasoning_events:
         decision = memory.reasoning_events[-1]
         details.append(f"\nLast {decision.phase.value}: {_terminal_text(decision.summary)}")
@@ -654,7 +785,7 @@ def _build_runtime(
 
 
 def _argument_task_preview(arguments: argparse.Namespace) -> str:
-    if arguments.command == "run":
+    if arguments.command in {"run", "plan"}:
         return " ".join(arguments.task).strip()
     if arguments.command == "chat":
         return " ".join(arguments.initial_task).strip()
@@ -785,8 +916,11 @@ def _chat_loop(
     initial_task: str | None = None,
     memory_store: MemoryStore | None = None,
     approval_engine: ApprovalModeManager | None = None,
+    plan_runtime: PlanWorkflowManager | None = None,
     show_history_on_start: bool = False,
 ) -> int:
+    if plan_runtime is not None:
+        plan_runtime.bind(memory)
     if show_history_on_start:
         _print_chat_history(memory, console, heading=True)
 
@@ -807,7 +941,88 @@ def _chat_loop(
         request = user_input.strip()
         if not request:
             continue
-        if request.startswith("/"):
+        approval_plan_prefix = "/approval plan"
+        if request.lower() == approval_plan_prefix or request.lower().startswith(
+            approval_plan_prefix + " "
+        ):
+            console.print(
+                "Plan Mode is a planning workflow, not an approval policy. Entering Plan Mode."
+            )
+            request = ":plan" + request[len(approval_plan_prefix) :]
+        if request.startswith(":"):
+            normalized = request.lower()
+            if normalized == ":execute":
+                if plan_runtime is None:
+                    console.print("Plan controls are unavailable in this runtime.")
+                    continue
+                try:
+                    approved_plan = plan_runtime.approve()
+                except ValueError as error:
+                    console.print(f"[bold yellow]Cannot execute plan:[/bold yellow] {error}")
+                    if memory_store is not None:
+                        memory_store.save_state(
+                            memory,
+                            status=SessionStatus.PLAN_READY.value,
+                        )
+                    continue
+                if memory_store is not None:
+                    memory_store.log(
+                        "plan_approved",
+                        plan_id=approved_plan.plan_id,
+                        artifact_revision=approved_plan.artifact_revision,
+                        workspace_revision=approved_plan.workspace_revision,
+                    )
+                result = agent.run(
+                    "Execute the user-approved plan.",
+                    memory=memory,
+                    workflow_mode=WorkflowMode.EXECUTE,
+                )
+                _print_result(console, result)
+                if memory_store is not None:
+                    memory_store.save_state(
+                        memory,
+                        status=_idle_session_status(memory).value,
+                    )
+                continue
+            if normalized == ":cancel":
+                if plan_runtime is None:
+                    console.print("Plan controls are unavailable in this runtime.")
+                    continue
+                cancelled_plan = memory.plan_artifact
+                plan_runtime.cancel()
+                console.print("Plan cancelled. Session saved.")
+                if memory_store is not None:
+                    memory_store.log(
+                        "plan_cancelled",
+                        plan_id=(cancelled_plan.plan_id if cancelled_plan is not None else None),
+                        artifact_revision=(
+                            cancelled_plan.artifact_revision if cancelled_plan is not None else None
+                        ),
+                    )
+                    memory_store.save_state(memory, status=SessionStatus.PAUSED.value)
+                continue
+            planning_prefixes = {
+                ":plan": "Enter the task to plan",
+                ":revise": "Describe the required plan revision",
+                ":inspect": "What should RepoRivet inspect next?",
+            }
+            command_name, _, inline_request = request.partition(" ")
+            command_key = command_name.lower()
+            if command_key in planning_prefixes:
+                if command_key == ":revise" and memory.plan_artifact is None:
+                    console.print("No plan is available to revise. Use :plan first.")
+                    continue
+                memory.workflow_mode = WorkflowMode.PLANNING
+                request = inline_request.strip()
+                if not request:
+                    request = prompt_reader(planning_prefixes[command_key]).strip()
+                if not request:
+                    console.print("Planning request cannot be empty.")
+                    continue
+            else:
+                console.print(f"Unknown command: {request}. Type /help for commands.")
+                continue
+        elif request.startswith("/"):
             should_exit, memory_changed = _handle_chat_command(
                 request,
                 memory,
@@ -820,11 +1035,24 @@ def _chat_loop(
                 return 0
             continue
 
-        result = agent.run(request, memory=memory)
+        if memory.workflow_mode == WorkflowMode.PLAN_READY:
+            console.print(
+                "A plan is waiting for review. Use :execute, :revise, :inspect, or :cancel."
+            )
+            continue
+
+        result = agent.run(
+            request,
+            memory=memory,
+            workflow_mode=memory.workflow_mode,
+        )
         _print_result(console, result)
+        if result.status == "plan_ready" and memory.plan_artifact is not None:
+            _print_plan_artifact(console, memory.plan_artifact)
         if memory_store is not None:
-            memory.status = SessionStatus.PAUSED.value
-            memory_store.save_state(memory, status=SessionStatus.PAUSED.value)
+            idle_status = _idle_session_status(memory)
+            memory.status = idle_status.value
+            memory_store.save_state(memory, status=idle_status.value)
 
 
 def _handle_chat_command(
@@ -847,6 +1075,12 @@ def _handle_chat_command(
             "/compact aggressive  Keep a smaller recent window\n"
             "/approval  Show the current approval mode\n"
             "/approval <mode>  Switch approval mode immediately\n"
+            "/approval plan  Enter Plan Mode (workflow shortcut)\n"
+            ":plan     Enter enforced read-only planning workflow\n"
+            ":execute  Validate and execute the reviewed plan\n"
+            ":revise   Revise the current plan using more evidence\n"
+            ":inspect  Continue read-only plan inspection\n"
+            ":cancel   Cancel the current plan\n"
             "/exit     End interactive mode"
         )
         return False, False
@@ -891,7 +1125,8 @@ def _handle_chat_command(
         console.print(
             f"Current approval mode: [bold]{approval_engine.mode.value}[/bold]\n"
             f"Available modes: {modes}\n"
-            "Usage: /approval <mode>"
+            "Usage: /approval <mode>\n"
+            "Plan Mode is a separate workflow; use :plan or /approval plan."
         )
         return False, False
     if normalized.startswith("/approval "):
@@ -958,6 +1193,7 @@ def _print_history_entry(console: Console, label: str, content: str) -> None:
 def _print_result(console: Console, result: AgentResult) -> None:
     color = {
         "success": "green",
+        "plan_ready": "cyan",
         "incomplete": "yellow",
         "blocked": "yellow",
         "stopped": "yellow",
@@ -978,6 +1214,65 @@ def _print_result(console: Console, result: AgentResult) -> None:
     content.append("\n\n")
     content.append(escape_terminal_controls(result.summary))
     console.print(Panel(content, title="Result"))
+
+
+def _print_plan_artifact(console: Console, plan: PlanArtifact) -> None:
+    details = Text()
+    details.append(f"Goal: {_terminal_text(plan.goal)}\n", style="bold")
+    details.append(f"Status: {plan.status.value}\n")
+    details.append(f"Revision: {plan.artifact_revision}\n")
+    details.append(f"Workspace revision: {plan.workspace_revision}\n")
+    affected = ", ".join(plan.affected_files) or "none"
+    details.append(f"Affected files: {_terminal_text(affected)}\n")
+    details.append(f"Bound file snapshots: {len(plan.snapshots)}")
+    console.print(Panel(details, title="Plan Ready"))
+
+    steps = Table(title="Plan steps", show_lines=True)
+    steps.add_column("Step", no_wrap=True)
+    steps.add_column("Status", no_wrap=True)
+    steps.add_column("Operation", no_wrap=True)
+    steps.add_column("Intent")
+    steps.add_column("Targets / verification")
+    steps.add_column("Risk", no_wrap=True)
+    for index, step in enumerate(plan.steps, start=1):
+        targets = step.target_files or step.verification_ids or ["-"]
+        steps.add_row(
+            f"{index}. {step.title}",
+            step.status.value,
+            step.operation.value,
+            _terminal_text(step.intent),
+            _terminal_text(", ".join(targets)),
+            step.risk,
+        )
+    console.print(steps)
+
+    verification = Table(title="Verification", show_header=True)
+    verification.add_column("Check")
+    verification.add_column("Success criteria")
+    for check in plan.verification:
+        verification.add_row(
+            _terminal_text(f"{check.check_id}: {check.title}"),
+            _terminal_text(check.success_criteria),
+        )
+    console.print(verification)
+
+    if plan.constraints:
+        console.print("Constraints: " + _terminal_text("; ".join(plan.constraints)))
+    if plan.assumptions:
+        console.print("Assumptions: " + _terminal_text("; ".join(plan.assumptions)))
+    if plan.risks:
+        console.print("Risks: " + _terminal_text("; ".join(plan.risks)))
+
+
+def _idle_session_status(memory: MemoryState) -> SessionStatus:
+    plan = memory.plan_artifact
+    if memory.workflow_mode == WorkflowMode.PLAN_READY or (
+        plan is not None and plan.status in {PlanStatus.READY, PlanStatus.STALE}
+    ):
+        return SessionStatus.PLAN_READY
+    if plan is not None and plan.status == PlanStatus.EXECUTING:
+        return SessionStatus.EXECUTING
+    return SessionStatus.PAUSED
 
 
 def main() -> None:
