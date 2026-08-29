@@ -2,7 +2,7 @@
 schema_version: 1
 id: skill-authoring
 name: RepoRivet Skill Authoring
-version: 1.1.1
+version: 1.1.2
 summary: Create or convert a single-file RepoRivet Skill with semantically consistent capabilities and requirements.
 category: workflow
 activation:
@@ -11,7 +11,7 @@ activation:
 triggers:
   task_types: [design-skill, convert-skill, author-skill]
   file_globs: ["**/SKILL.md"]
-  keywords: [create skill, convert skill, skill authoring]
+  keywords: [create skill, convert skill, skill authoring, 创建 skill, 生成 skill, 转换 skill, 编写 skill]
 compatible_modes: [plan, execute]
 requested_tools:
   - list_files

@@ -840,6 +840,44 @@ def test_repeated_reasoning_length_exhaustion_disables_thinking_and_restarts_fro
     assert "Thinking is disabled" in final_messages[-1]["content"]
 
 
+def test_provider_thinking_recovery_restarts_context_for_following_tool_turns() -> None:
+    read = call("recovered-read", "read_file", {"path": "app.py"})
+    model = FakeModelClient(
+        [
+            ModelResponse(
+                content="Inspect the file directly.",
+                tool_calls=[read],
+                provider_thinking_disabled=True,
+                reasoning_context_restart_required=True,
+            ),
+            ModelResponse(content="Inspection completed."),
+        ]
+    )
+    memory = MemoryState(session_id="same-run-thinking-recovery")
+
+    result = controller(
+        model,
+        FakeToolRegistry([ToolResult(ok=True, output="file contents")]),
+    ).run("inspect", memory=memory)
+
+    assert result.status == "success"
+    assert memory.provider_requires_reasoning_content is True
+    assert len(model.requests) == 2
+    assert model.requests[0]["options"] is None
+    assert model.requests[1]["options"] is None
+    checkpoint = next(
+        message
+        for message in model.requests[1]["messages"]
+        if message.get("role") == "system"
+        and "Provider protocol checkpoint" in str(message.get("content"))
+    )
+    assert '"tool":"read_file"' in checkpoint["content"]
+    assert "file contents" in checkpoint["content"]
+    assert model.requests[1]["messages"][-1]["role"] == "system"
+    assert not any(message.get("role") == "tool" for message in model.requests[1]["messages"])
+    validate_tool_call_protocol(model.requests[1]["messages"])
+
+
 def test_completed_task_scope_does_not_leak_files_or_verification_to_next_task() -> None:
     memory = MemoryState(session_id="new-task-scope")
     memory.modified_files.add("old.cpp")
@@ -855,7 +893,7 @@ def test_completed_task_scope_does_not_leak_files_or_verification_to_next_task()
     assert result.verification_status.value == "not_applicable"
 
 
-def test_missing_durable_reasoning_for_tool_history_disables_thinking_on_resume() -> None:
+def test_missing_durable_reasoning_for_tool_history_restarts_thinking_context() -> None:
     memory = MemoryState(
         session_id="reasoning-resume",
         provider_requires_reasoning_content=True,
@@ -874,18 +912,22 @@ def test_missing_durable_reasoning_for_tool_history_disables_thinking_on_resume(
             Message(role="tool", tool_call_id="old-call", content="{}"),
         ],
     )
-    model = FakeModelClient(
-        [
-            ModelResponse(content="unfinished recovery", finish_reason="length"),
-            ModelResponse(content="Resumed safely."),
-        ]
-    )
+    model = FakeModelClient([ModelResponse(content="Resumed safely.")])
 
     result = controller(model, FakeToolRegistry([])).run("continue", memory=memory)
 
     assert result.status == "success"
-    assert model.requests[0]["options"].thinking_enabled is False
-    assert model.requests[1]["options"].thinking_enabled is False
+    assert model.requests[0]["options"] is None
+    assert not any(message.get("role") == "tool" for message in model.requests[0]["messages"])
+    checkpoint = next(
+        message
+        for message in model.requests[0]["messages"]
+        if message.get("role") == "system"
+        and "Provider protocol checkpoint" in str(message.get("content"))
+    )
+    assert '"tool":"read_file"' in checkpoint["content"]
+    assert model.requests[0]["messages"][-1]["role"] == "user"
+    validate_tool_call_protocol(model.requests[0]["messages"])
 
 
 def test_agent_stops_repeated_identical_tool_calls() -> None:

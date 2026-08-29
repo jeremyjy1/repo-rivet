@@ -50,6 +50,9 @@ def test_packaged_system_skills_are_valid_guidance_without_unenforced_contracts(
 
     onboarding = skills["repository-onboarding"].manifest
     assert onboarding.triggers.project_markers == []
+    assert "理解项目" in onboarding.triggers.keywords
+    assert "创建 skill" in skills["skill-authoring"].manifest.triggers.keywords
+    assert "测试失败" in skills["test-failure-fix"].manifest.triggers.keywords
     assert onboarding.requested_tools <= {
         "git_diff",
         "git_status",

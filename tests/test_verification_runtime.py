@@ -78,6 +78,30 @@ def test_build_passes_from_registered_criteria_and_artifact(
     assert result.metadata["verification_result"]["status"] == "passed"
 
 
+def test_registered_command_match_requires_exact_argv_and_working_directory(
+    tmp_path: Path,
+) -> None:
+    value = runtime(tmp_path)
+    register(value, kind="build")
+    (tmp_path / "nested").mkdir()
+
+    assert value.command_matches(
+        "check",
+        command="g++ quick_sort.cpp",
+        cwd=".",
+    )
+    assert not value.command_matches(
+        "check",
+        command="g++ -O2 quick_sort.cpp",
+        cwd=".",
+    )
+    assert not value.command_matches(
+        "check",
+        command="g++ quick_sort.cpp",
+        cwd="nested",
+    )
+
+
 def test_build_fails_when_exit_is_zero_but_artifact_is_missing(
     tmp_path: Path,
     monkeypatch,

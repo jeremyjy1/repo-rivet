@@ -29,6 +29,8 @@ class ModelResponse:
     finish_reason: str | None = None
     input_tokens: int | None = None
     output_tokens: int | None = None
+    provider_thinking_disabled: bool = False
+    reasoning_context_restart_required: bool = False
 
     def as_assistant_message(self) -> dict[str, Any]:
         """Serialize the normalized response into conversation history."""

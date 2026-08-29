@@ -162,6 +162,11 @@ class PlanRuntime:
             PlanOperation.COMMAND: {"run_command"},
             PlanOperation.VERIFY: {"run_verification"},
         }[step.operation]
+        if step.operation == PlanOperation.COMMAND and len(step.verification_ids) == 1:
+            # A deterministic registered check is a stronger execution of a command-shaped
+            # plan step. Requiring run_command here would conflict with the Controller rule
+            # that build and test claims must flow through run_verification.
+            expected_tools.add("run_verification")
         if call.name not in expected_tools:
             return (
                 f"Current plan step {step.step_id} requires {step.operation.value}; "
@@ -204,7 +209,15 @@ class PlanRuntime:
                 and result_path in step.target_files
             )
         elif step.operation == PlanOperation.COMMAND:
-            passed = passed and metadata.get("exit_code") == 0
+            if call.name == "run_verification":
+                verification = metadata.get("verification_result")
+                passed = (
+                    passed
+                    and isinstance(verification, dict)
+                    and verification.get("status") == "passed"
+                )
+            else:
+                passed = passed and metadata.get("exit_code") == 0
         elif step.operation == PlanOperation.VERIFY:
             verification = metadata.get("verification_result")
             passed = (
@@ -222,6 +235,14 @@ class PlanRuntime:
                 snapshot_id = metadata.get("new_snapshot_id") or metadata.get("snapshot_id")
                 if isinstance(path, str) and isinstance(snapshot_id, str):
                     artifact.execution_snapshots[path] = snapshot_id
+            if call.name == "run_verification":
+                check_id = call.arguments.get("check_id")
+                if isinstance(check_id, str):
+                    self._complete_consecutive_verified_steps(
+                        artifact,
+                        check_id=check_id,
+                        evidence_ref=evidence_ref,
+                    )
         else:
             step.status = (
                 PlanStepStatus.BLOCKED
@@ -236,6 +257,26 @@ class PlanRuntime:
             step.last_error = result.error or "tool result did not satisfy the step"
         if all(item.status == PlanStepStatus.COMPLETED for item in artifact.steps):
             artifact.status = PlanStatus.COMPLETED
+
+    @staticmethod
+    def _complete_consecutive_verified_steps(
+        artifact: PlanArtifact,
+        *,
+        check_id: str,
+        evidence_ref: str | None,
+    ) -> None:
+        """Advance redundant verify steps already satisfied by the executed typed check."""
+        while True:
+            step = artifact.current_step
+            if (
+                step is None
+                or step.operation != PlanOperation.VERIFY
+                or step.verification_ids != [check_id]
+            ):
+                return
+            step.status = PlanStepStatus.COMPLETED
+            step.last_observation_ref = evidence_ref
+            step.last_error = None
 
     def _validate_evidence(self, draft: PlanDraft) -> None:
         memory = self._memory()

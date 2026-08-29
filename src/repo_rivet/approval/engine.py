@@ -238,6 +238,15 @@ class ApprovalEngine:
             )
         if self.mode == ApprovalMode.SAFE_AUTO:
             return self.human_approver.ask(request)
+        llm_auto_template = self.approval_templates.match_llm_auto(request)
+        if llm_auto_template is not None:
+            return self._decision(
+                request,
+                action=ApprovalAction.ALLOW,
+                source=f"llm_auto_template:{llm_auto_template.name}",
+                reason=llm_auto_template.reason,
+                constraints=llm_auto_template.constraints,
+            )
         return self._review_with_llm_or_human(request)
 
     def _review_with_llm_or_human(self, request: ApprovalRequest) -> ApprovalDecision:
@@ -251,14 +260,30 @@ class ApprovalEngine:
             risk=request.assessment.level.name.lower(),
         )
         review_started = time.monotonic()
+        failure: dict[str, Any] | None = None
         try:
             review = self.llm_reviewer.review(request)
-        except Exception:
+        except Exception as error:
             review = None
+            failure = {
+                "error_type": type(error).__name__,
+                "stage": "review",
+            }
+        if review is None and failure is None:
+            value = getattr(self.llm_reviewer, "last_failure", None)
+            failure = (
+                dict(value)
+                if isinstance(value, dict)
+                else {
+                    "error_type": "UnavailableReview",
+                    "stage": "review",
+                }
+            )
         self._log_review(
             request,
             review,
             duration_seconds=time.monotonic() - review_started,
+            failure=failure,
         )
         if review is not None and self._accept_llm_approval(request, review):
             return self._decision(
@@ -407,6 +432,7 @@ class ApprovalEngine:
         review: LLMReviewResult | None,
         *,
         duration_seconds: float,
+        failure: dict[str, Any] | None = None,
     ) -> None:
         if review is None:
             self._log(
@@ -415,6 +441,7 @@ class ApprovalEngine:
                 tool=request.tool_name,
                 fingerprint=request.fingerprint,
                 duration_seconds=duration_seconds,
+                **(failure or {}),
             )
             return
         self._log(

@@ -14,7 +14,7 @@ def test_termination_limits_are_positive() -> None:
     [
         ("step_count", 3, "agent step checkpoint"),
         ("consecutive_failures", 2, "consecutive tool failures"),
-        ("consecutive_protocol_failures", 2, "decision protocol failures"),
+        ("consecutive_protocol_failures", 2, "action protocol failures"),
         ("repeated_tool_calls", 2, "repeated identical tool call"),
         ("empty_model_responses", 2, "empty model responses"),
         ("consecutive_length_responses", 2, "length-limited model responses"),

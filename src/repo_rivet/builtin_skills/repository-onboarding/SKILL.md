@@ -2,7 +2,7 @@
 schema_version: 1
 id: repository-onboarding
 name: Repository Onboarding
-version: 1.1.0
+version: 1.1.1
 summary: Inspect an unfamiliar repository and produce a bounded, evidence-based architecture overview.
 category: workflow
 activation:
@@ -10,7 +10,7 @@ activation:
   automatic: true
 triggers:
   task_types: [onboard, architecture-review]
-  keywords: [repository overview, architecture overview, understand repository, project structure]
+  keywords: [repository overview, architecture overview, understand repository, project structure, 项目概览, 架构概览, 理解项目, 项目结构]
 compatible_modes: [plan, execute]
 requested_tools:
   - list_files

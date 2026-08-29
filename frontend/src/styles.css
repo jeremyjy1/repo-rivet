@@ -135,6 +135,8 @@ button:focus-visible, textarea:focus-visible, select:focus-visible { outline: 2p
 .conversation-plan-steps { display: flex; flex-direction: column; gap: 7px; margin: 0; padding: 14px 16px; list-style: none; }
 .conversation-plan-steps li { display: grid; grid-template-columns: 25px minmax(0, 1fr); gap: 9px; align-items: start; }
 .conversation-plan-steps li > b { display: grid; place-items: center; width: 23px; height: 23px; color: #9ba6b5; background: #242b34; border-radius: 50%; font-size: 9px; }
+.conversation-plan-steps li.completed > b { color: #07120c; background: var(--accent); }
+.conversation-plan-steps li > b svg, .plan-step > b svg { display: block; }
 .conversation-plan-steps strong, .conversation-plan-steps small { display: block; overflow-wrap: anywhere; }.conversation-plan-steps strong { font-size: 11px; }.conversation-plan-steps small { margin-top: 3px; color: var(--muted); font: 9px/1.5 "JetBrains Mono", monospace; }
 .conversation-plan-verification, .conversation-plan-files { display: grid; grid-template-columns: 90px minmax(0, 1fr); gap: 9px; margin: 0 16px 9px; padding: 8px 10px; background: #101612; border: 1px solid #263c30; border-radius: 7px; font-size: 10px; }.conversation-plan-verification strong, .conversation-plan-files strong { color: #91a19a; }.conversation-plan-verification span, .conversation-plan-files span { overflow-wrap: anywhere; color: #c8d0cb; font-family: "JetBrains Mono", monospace; }
 .conversation-plan-actions { display: flex; gap: 14px; align-items: center; justify-content: space-between; margin-top: 14px; padding: 12px 16px; background: #101612; border-top: 1px solid #294536; }.conversation-plan.stale .conversation-plan-actions { background: #1b1711; border-top-color: #544427; }.conversation-plan-actions p { max-width: 620px; margin: 0; color: var(--muted); font-size: 10px; line-height: 1.5; }.conversation-plan-actions button { display: flex; flex: none; align-items: center; gap: 6px; padding: 8px 12px; color: #07120c; background: var(--accent); border: 1px solid var(--accent); border-radius: 7px; font-size: 11px; font-weight: 600; cursor: pointer; }.conversation-plan-actions button:disabled { opacity: .45; cursor: not-allowed; }
@@ -234,6 +236,7 @@ button:focus-visible, textarea:focus-visible, select:focus-visible { outline: 2p
 :root[data-theme="light"] .conversation-plan-header > span { background: #dcefe4; }
 :root[data-theme="light"] .conversation-plan.stale .conversation-plan-header > span { background: #f7e4bd; }
 :root[data-theme="light"] .conversation-plan-steps li > b { color: #536173; background: #e5eaf0; }
+:root[data-theme="light"] .conversation-plan-steps li.completed > b { color: var(--accent); background: #dcefe4; }
 :root[data-theme="light"] .conversation-plan-verification, :root[data-theme="light"] .conversation-plan-files, :root[data-theme="light"] .conversation-plan-actions { color: #364352; background: #f7fbf8; border-color: #c8e0d1; }
 :root[data-theme="light"] .conversation-plan-verification span, :root[data-theme="light"] .conversation-plan-files span { color: #445163; }
 :root[data-theme="light"] .conversation-plan.stale .conversation-plan-actions { background: #fffaf1; border-color: #dfc48f; }
@@ -251,7 +254,7 @@ button:focus-visible, textarea:focus-visible, select:focus-visible { outline: 2p
 :root[data-theme="light"] .muted-card { border-color: #cbd3de; }
 :root[data-theme="light"] .plan-step { background: #f7f8fa; border-color: #d8dee7; }
 :root[data-theme="light"] .plan-step > b { color: #526071; background: #e4e9ef; }
-:root[data-theme="light"] .plan-step.completed > b { color: white; }
+:root[data-theme="light"] .plan-step.completed > b { color: var(--accent); background: #dcefe4; }
 :root[data-theme="light"] .plan-instruction { background: #f5f7fa; border-color: #d4dbe4; }
 :root[data-theme="light"] .plan-instruction textarea, :root[data-theme="light"] .guidance textarea { color: #202631; background: #ffffff; border-color: #cbd3de; }
 :root[data-theme="light"] .plan-instruction button { color: #445163; background: #ffffff; border-color: #cbd3de; }

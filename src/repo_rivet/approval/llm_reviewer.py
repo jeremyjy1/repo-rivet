@@ -87,10 +87,11 @@ class OpenAIApprovalReviewer:
         api_config: ApiConfig,
         *,
         model: str | None = None,
-        timeout_seconds: float = 10,
+        timeout_seconds: float = 30,
         client: Any | None = None,
     ) -> None:
         self.model = model or api_config.model
+        self.last_failure: dict[str, Any] | None = None
         self._client = client or OpenAI(
             api_key=api_config.api_key.get_secret_value(),
             base_url=str(api_config.base_url),
@@ -99,27 +100,45 @@ class OpenAIApprovalReviewer:
         )
 
     def review(self, request: ApprovalRequest) -> LLMReviewResult | None:
+        self.last_failure = None
         payload = build_review_payload(request)
+        api_request: dict[str, Any] = {
+            "model": self.model,
+            "messages": cast(
+                Any,
+                [
+                    {"role": "system", "content": _SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": "Review this execution request.\n"
+                        + json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                    },
+                ],
+            ),
+            "extra_body": {"thinking": {"type": "disabled"}},
+        }
         try:
-            response = self._client.chat.completions.create(
-                model=self.model,
-                messages=cast(
-                    Any,
-                    [
-                        {"role": "system", "content": _SYSTEM_PROMPT},
-                        {
-                            "role": "user",
-                            "content": "Review this execution request.\n"
-                            + json.dumps(payload, ensure_ascii=False, sort_keys=True),
-                        },
-                    ],
-                ),
-            )
+            try:
+                response = self._client.chat.completions.create(**api_request)
+            except Exception as error:
+                if not _thinking_option_is_unsupported(error):
+                    raise
+                api_request.pop("extra_body")
+                response = self._client.chat.completions.create(**api_request)
             content = response.choices[0].message.content
             if not isinstance(content, str):
+                self.last_failure = {
+                    "error_type": "InvalidReviewerResponse",
+                    "stage": "response_content",
+                }
                 return None
-            return LLMReviewResult.model_validate_json(_strip_json_fence(content))
-        except Exception:
+            try:
+                return LLMReviewResult.model_validate_json(_strip_json_fence(content))
+            except Exception as error:
+                self.last_failure = _failure_details(error, stage="response_validation")
+                return None
+        except Exception as error:
+            self.last_failure = _failure_details(error, stage="request")
             return None
 
 
@@ -130,3 +149,29 @@ def _strip_json_fence(content: str) -> str:
         if len(lines) >= 3:
             return "\n".join(lines[1:-1])
     return text
+
+
+def _thinking_option_is_unsupported(error: Exception) -> bool:
+    if getattr(error, "status_code", None) not in {400, 422}:
+        return False
+    message = str(error).casefold()
+    body = getattr(error, "body", None)
+    if body is not None:
+        message += " " + str(body).casefold()
+    return "thinking" in message and any(
+        marker in message for marker in ("unknown", "unsupported", "unrecognized", "invalid")
+    )
+
+
+def _failure_details(error: Exception, *, stage: str) -> dict[str, Any]:
+    details: dict[str, Any] = {
+        "error_type": type(error).__name__,
+        "stage": stage,
+    }
+    status_code = getattr(error, "status_code", None)
+    if isinstance(status_code, int):
+        details["status_code"] = status_code
+    error_code = getattr(error, "code", None)
+    if isinstance(error_code, str) and error_code:
+        details["error_code"] = error_code
+    return details

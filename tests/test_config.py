@@ -75,10 +75,21 @@ context_window_tokens = 32768
 
 [planning]
 auto_plan = "always"
+
+[planning.llm]
+enabled = true
+model = "plan-classifier"
+timeout_seconds = 7
+confidence_threshold = 0.80
 """,
     )
 
-    assert load_config(config_path).planning.auto_plan.value == "always"
+    config = load_config(config_path)
+    assert config.planning.auto_plan.value == "always"
+    assert config.planning.llm.enabled
+    assert config.planning.llm.model == "plan-classifier"
+    assert config.planning.llm.timeout_seconds == 7
+    assert config.planning.llm.confidence_threshold == 0.80
 
 
 def test_load_config_accepts_approval_settings(tmp_path: Path) -> None:
@@ -118,6 +129,7 @@ max_summary_chars = 600
     assert not config.approval.remember_session_approvals
     assert config.approval.llm.model == "review-model"
     assert config.approval.llm.max_auto_approve_risk == "low"
+    assert config.approval.llm.timeout_seconds == 30
     assert not config.approval.safety.deny_secret_access
     assert config.reasoning.display.value == "trace"
     assert config.reasoning.recent_event_limit == 12

@@ -51,6 +51,8 @@ _TOOL_PROGRESS_LABELS = {
 _STATUS_STOP_EVENTS = {
     "approved_tool_executed",
     "approval_awaiting_human",
+    "auto_plan_review_failed",
+    "auto_plan_reviewed",
     "llm_approval_review_failed",
     "llm_approval_reviewed",
     "model_call_finished",
@@ -80,6 +82,8 @@ class ConsoleEventReporter:
 
         if event_type == "model_call":
             self._start_model_status()
+        elif event_type == "auto_plan_review_started":
+            self._start_status("[cyan]Evaluating whether Plan Mode is needed…[/cyan]")
         elif event_type == "llm_approval_review_started":
             tool = self._safe(data.get("tool", "tool"), limit=80)
             self._start_status(f"[cyan]Approval model is reviewing {tool}…[/cyan]")

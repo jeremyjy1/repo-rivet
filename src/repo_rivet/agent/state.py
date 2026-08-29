@@ -69,6 +69,7 @@ class SessionState:
     consecutive_length_responses: int = 0
     provider_reasoning_detected: bool = False
     force_thinking_disabled: bool = False
+    sanitize_unreplayable_provider_history: bool = False
     consecutive_protocol_failures: int = 0
     last_tool_signature: str | None = None
     recent_errors: list[str] = field(default_factory=list)

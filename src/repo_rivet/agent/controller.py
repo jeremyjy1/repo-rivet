@@ -1,6 +1,7 @@
 """Explicit single-agent model/tool/verification loop."""
 
 import json
+import time
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -23,11 +24,21 @@ from repo_rivet.llm.base import (
 )
 from repo_rivet.llm.openai_compatible import ModelRequestError
 from repo_rivet.llm.parser import ResponseParseError
-from repo_rivet.llm.protocol import contains_embedded_tool_protocol
+from repo_rivet.llm.protocol import (
+    checkpoint_unreplayable_tool_turns,
+    contains_embedded_tool_protocol,
+)
 from repo_rivet.memory.models import MemoryState, Message
 from repo_rivet.memory.store import MemoryStore
+from repo_rivet.planning.classifier import PlanClassifier, summarize_workspace
 from repo_rivet.planning.errors import PlanModeViolation
-from repo_rivet.planning.models import PlanStatus, PlanStepStatus, WorkflowMode
+from repo_rivet.planning.models import (
+    PlanOperation,
+    PlanStatus,
+    PlanStep,
+    PlanStepStatus,
+    WorkflowMode,
+)
 from repo_rivet.planning.policy import AutoPlanMode, AutoPlanPolicy
 from repo_rivet.planning.runtime import PLANNING_TOOL_NAMES, PlanRuntime
 from repo_rivet.reasoning.manager import ReasoningManager
@@ -92,6 +103,7 @@ class AgentController:
         reasoning_manager: ReasoningManager | None = None,
         skill_runtime: SkillRuntime | None = None,
         auto_plan_policy: AutoPlanPolicy | None = None,
+        plan_classifier: PlanClassifier | None = None,
     ) -> None:
         self.model_client = model_client
         self.tool_registry = tool_registry
@@ -103,6 +115,7 @@ class AgentController:
         self.reasoning_manager = reasoning_manager or ReasoningManager()
         self.skill_runtime = skill_runtime
         self.auto_plan_policy = auto_plan_policy or AutoPlanPolicy()
+        self.plan_classifier = plan_classifier
         self.skill_requirements = SkillRequirementEvaluator()
         runtime = getattr(tool_registry, "verification_runtime", None)
         workspace = getattr(tool_registry, "workspace", None) or Path.cwd().resolve()
@@ -134,11 +147,62 @@ class AgentController:
         memory.begin_task_scope()
         if workflow_mode is not None:
             memory.workflow_mode = workflow_mode
-        auto_plan_reason = (
-            self.auto_plan_policy.preflight_reason(task)
-            if memory.workflow_mode == WorkflowMode.EXECUTE and self._can_start_new_plan(memory)
-            else None
+        auto_plan_eligible = (
+            memory.workflow_mode == WorkflowMode.EXECUTE and self._can_start_new_plan(memory)
         )
+        auto_plan_reason = (
+            self.auto_plan_policy.preflight_reason(task) if auto_plan_eligible else None
+        )
+        auto_plan_source = "controller"
+        if (
+            auto_plan_reason is None
+            and auto_plan_eligible
+            and self.auto_plan_policy.mode == AutoPlanMode.ADAPTIVE
+            and self.plan_classifier is not None
+        ):
+            workspace_summary = summarize_workspace(Path(workspace))
+            self._log(
+                "auto_plan_review_started",
+                workspace_empty=workspace_summary.empty,
+                sampled_files=workspace_summary.sampled_files,
+                sampled_directories=workspace_summary.sampled_directories,
+            )
+            review_started = time.monotonic()
+            try:
+                classification = self.plan_classifier.classify(task, workspace_summary)
+            except Exception as error:
+                classification = None
+                failure = type(error).__name__
+            else:
+                failure = "invalid_or_unavailable_response" if classification is None else None
+            duration = round(time.monotonic() - review_started, 3)
+            if classification is None:
+                self._log(
+                    "auto_plan_review_failed",
+                    duration_seconds=duration,
+                    reason=failure,
+                    fallback="model_may_request_plan",
+                )
+            else:
+                applied = (
+                    classification.decision == "plan"
+                    and classification.confidence
+                    >= self.auto_plan_policy.classifier_confidence_threshold
+                )
+                self._log(
+                    "auto_plan_reviewed",
+                    decision=classification.decision,
+                    reason=classification.reason,
+                    confidence=classification.confidence,
+                    confidence_threshold=(self.auto_plan_policy.classifier_confidence_threshold),
+                    applied=applied,
+                    duration_seconds=duration,
+                    input_tokens=classification.input_tokens,
+                    output_tokens=classification.output_tokens,
+                )
+                if applied:
+                    auto_plan_reason = classification.reason
+                    auto_plan_source = "llm_classifier"
         remaining_plan_steps = 0
         if (
             memory.workflow_mode == WorkflowMode.EXECUTE
@@ -199,7 +263,9 @@ class AgentController:
             candidate_final_assessment=memory.candidate_final_assessment,
             reflection_required=memory.reflection_required or bool(memory.invalidated_files),
             provider_reasoning_detected=memory.provider_requires_reasoning_content,
-            force_thinking_disabled=self._history_requires_non_thinking(memory),
+            sanitize_unreplayable_provider_history=(
+                self._history_requires_reasoning_checkpoint(memory)
+            ),
         )
         self.verification_runtime.bind(memory)
         self.plan_runtime.bind(memory)
@@ -316,7 +382,7 @@ class AgentController:
         if auto_plan_started:
             self._log(
                 "auto_plan_started",
-                source="controller",
+                source=auto_plan_source,
                 reason=auto_plan_reason,
             )
         if repaired_legacy_reflection:
@@ -490,6 +556,12 @@ class AgentController:
                 if response.reasoning_content is not None:
                     state.provider_reasoning_detected = True
                     memory.provider_requires_reasoning_content = True
+                if response.reasoning_context_restart_required:
+                    # Keep the full local audit history, but do not replay this tool turn
+                    # verbatim after thinking is re-enabled: it has no provider reasoning
+                    # state. Later requests replace it with a factual protocol checkpoint.
+                    state.sanitize_unreplayable_provider_history = True
+                    memory.provider_requires_reasoning_content = True
                 length_limited = response.finish_reason == "length" and not response.tool_calls
                 assistant_message = response.as_assistant_message()
                 memory.total_input_tokens += (
@@ -521,6 +593,10 @@ class AgentController:
                     finish_reason=response.finish_reason,
                     content_length=len(response.content or ""),
                     tools=[call.name for call in response.tool_calls],
+                    provider_thinking_disabled=response.provider_thinking_disabled,
+                    reasoning_context_restart_required=(
+                        response.reasoning_context_restart_required
+                    ),
                 )
                 if state.status == AgentStatus.FINALIZING:
                     for call in response.tool_calls:
@@ -870,6 +946,8 @@ class AgentController:
                     self._record_blocked_action(call, result, state=state, memory=memory)
             return self._retry_verification_plan_revision(state=state, memory=memory)
 
+        calls = [self._normalize_registered_plan_action(call, state=state) for call in calls]
+
         if self.skill_runtime is not None and self.skill_runtime.active is not None:
             requested = self.skill_runtime.active.manifest.requested_tools
             forbidden_by_skill = [
@@ -1110,6 +1188,14 @@ class AgentController:
         if reasoning_event is None and mutating_calls:
             decision_for_validation = pending_decision
 
+        requires_decision = any(self._requires_decision(call) for call in mutating_calls)
+        if mutating_calls and not requires_decision:
+            # A typed registered verification plan is a stronger audit record than a
+            # provider-authored decision. An exact run_command may also have been
+            # canonicalized to run_verification after the model recorded its intent, so a
+            # now-stale advisory tool name must not reject the safer normalized action.
+            decision_for_validation = None
+
         validation_error = reasoning_error or registration_error
         plan_step_validation_error = False
         verification_plan_missing_for_file_change = False
@@ -1147,7 +1233,7 @@ class AgentController:
                     decision_for_validation,
                     action_calls,
                     mutating_calls=mutating_calls,
-                    require_decision=any(self._requires_decision(call) for call in mutating_calls),
+                    require_decision=requires_decision,
                 )
             except DecisionValidationError as error:
                 validation_error = str(error)
@@ -1417,6 +1503,47 @@ class AgentController:
                 state.skill_completion_recovery_attempts = 0
                 memory.skill_completion_recovery_attempts = 0
                 self._save_memory(memory, state, status=state.status.value)
+        if plan_step_validation_error:
+            step = memory.plan_artifact.current_step if memory.plan_artifact is not None else None
+            allowed_side_effects = self._plan_step_side_effect_tools(step)
+            self._append_system_feedback(
+                state,
+                memory,
+                {
+                    "error": "plan_step_violation",
+                    "current_step": (
+                        {
+                            "step_id": step.step_id,
+                            "title": step.title,
+                            "operation": step.operation.value,
+                            "target_files": step.target_files,
+                            "verification_ids": step.verification_ids,
+                        }
+                        if step is not None
+                        else None
+                    ),
+                    "allowed_side_effect_tools": sorted(allowed_side_effects),
+                    "instruction": (
+                        "The rejected action was not executed. Do not repeat it. Use read-only "
+                        "inspection if more evidence is needed, then call one allowed tool for "
+                        "the current step; call update_plan alone if the approved scope must "
+                        "change."
+                    ),
+                },
+            )
+            self._save_memory(memory, state, status=state.status.value)
+        if successful_action or plan_step_validation_error:
+            terminal_result, controller_checks_ran = self._advance_registered_plan_steps(
+                state=state,
+                memory=memory,
+            )
+            if terminal_result is not None:
+                return terminal_result
+            if controller_checks_ran:
+                # The approved plan made deterministic progress. A rejected stale tool from
+                # the previous step must not count toward the protocol-failure stop condition.
+                state.consecutive_protocol_failures = 0
+                passed_verification_check = True
         if validation_error is not None:
             terminal_result = self._check_termination(state=state, memory=memory)
             if terminal_result is not None:
@@ -1481,6 +1608,55 @@ class AgentController:
                 memory.working.pending_actions.clear()
             self._save_memory(memory, state, status=state.status.value)
         return None
+
+    def _normalize_registered_plan_action(
+        self,
+        call: ToolCall,
+        *,
+        state: SessionState,
+    ) -> ToolCall:
+        """Canonicalize an exact registered check before policy and plan validation."""
+        artifact = self.plan_runtime.memory.plan_artifact if self.plan_runtime.memory else None
+        step = artifact.current_step if artifact is not None else None
+        if (
+            artifact is None
+            or artifact.status != PlanStatus.EXECUTING
+            or step is None
+            or step.operation not in {PlanOperation.COMMAND, PlanOperation.VERIFY}
+            or len(step.verification_ids) != 1
+            or call.name != "run_command"
+        ):
+            return call
+        command = call.arguments.get("command")
+        cwd = call.arguments.get("cwd", ".")
+        check_id = step.verification_ids[0]
+        if not isinstance(command, str) or not isinstance(cwd, str):
+            return call
+        try:
+            matches = self.verification_runtime.command_matches(
+                check_id,
+                command=command,
+                cwd=cwd,
+            )
+        except ValueError:
+            return call
+        if not matches:
+            return call
+        normalized = ToolCall(
+            id=call.id,
+            name="run_verification",
+            arguments={"check_id": check_id},
+        )
+        self._log(
+            "plan_action_normalized",
+            step=state.step_count,
+            tool_call_id=call.id,
+            requested_tool=call.name,
+            normalized_tool=normalized.name,
+            check_id=check_id,
+            reason="exact_registered_verification_command",
+        )
+        return normalized
 
     def _record_meta_result(
         self,
@@ -2029,6 +2205,58 @@ class AgentController:
                 break
         return None
 
+    def _advance_registered_plan_steps(
+        self,
+        *,
+        state: SessionState,
+        memory: MemoryState,
+    ) -> tuple[AgentResult | None, bool]:
+        """Controller-schedule typed checks for ready command and verify plan steps."""
+        plan = state.verification_plan
+        if plan is None:
+            return None, False
+        registered = {check.check_id for check in plan.checks}
+        ran = False
+        while True:
+            artifact = memory.plan_artifact
+            step = artifact.current_step if artifact is not None else None
+            if (
+                artifact is None
+                or artifact.status != PlanStatus.EXECUTING
+                or step is None
+                or step.status != PlanStepStatus.PENDING
+                or step.operation not in {PlanOperation.COMMAND, PlanOperation.VERIFY}
+            ):
+                break
+            check_ids = [check_id for check_id in step.verification_ids if check_id in registered]
+            if not check_ids:
+                break
+            previous_step_id = step.step_id
+            self._log(
+                "plan_checks_scheduled",
+                plan_id=artifact.plan_id,
+                step_id=step.step_id,
+                operation=step.operation.value,
+                check_ids=check_ids,
+                reason="current_plan_step_has_registered_checks",
+            )
+            terminal_result = self._run_verification_batch(
+                check_ids,
+                state=state,
+                memory=memory,
+            )
+            ran = True
+            if terminal_result is not None:
+                return terminal_result, ran
+            if state.verification_plan_revision_required:
+                break
+            current = artifact.current_step
+            if current is not None and current.step_id == previous_step_id:
+                break
+        if memory.plan_artifact is not None and memory.plan_artifact.status == PlanStatus.EXECUTING:
+            state.status = AgentStatus.EXECUTING
+        return None, ran
+
     @staticmethod
     def _append_system_feedback(
         state: SessionState,
@@ -2166,6 +2394,21 @@ class AgentController:
                     )
                 )
             ]
+            artifact = (
+                self.plan_runtime.memory.plan_artifact
+                if self.plan_runtime.memory is not None
+                else None
+            )
+            if artifact is not None and artifact.status == PlanStatus.EXECUTING:
+                allowed_side_effects = self._plan_step_side_effect_tools(artifact.current_step)
+                schemas = [
+                    schema
+                    for schema in schemas
+                    if not self.tool_registry.is_state_changing(
+                        str(schema.get("function", {}).get("name", ""))
+                    )
+                    or schema.get("function", {}).get("name") in allowed_side_effects
+                ]
         if self.skill_runtime is not None:
             names = {str(schema.get("function", {}).get("name", "")) for schema in schemas}
             allowed = self.skill_runtime.allowed_tool_names(names)
@@ -2180,6 +2423,20 @@ class AgentController:
             if schema.get("function", {}).get("name") != "record_decision"
         ]
 
+    @staticmethod
+    def _plan_step_side_effect_tools(step: PlanStep | None) -> set[str]:
+        """Return the only mutating capabilities valid for the active plan step."""
+        if step is None:
+            return set()
+        return {
+            PlanOperation.EDIT: {"edit_file"},
+            PlanOperation.CREATE: {"write_file"},
+            PlanOperation.COMMAND: {"run_command", "run_verification"},
+            # run_command remains an input alias here because exact registered commands are
+            # canonicalized to run_verification before validation and execution.
+            PlanOperation.VERIFY: {"run_command", "run_verification"},
+        }[step.operation]
+
     def _skill_completion_report(self, memory: MemoryState) -> SkillRequirementReport:
         if self.skill_runtime is None or self.skill_runtime.active is None:
             return SkillRequirementReport(complete=True)
@@ -2188,10 +2445,20 @@ class AgentController:
             self.skill_runtime.active.manifest.requirements.before_finish,
         )
 
-    def _skill_policy_messages(self) -> list[dict[str, Any]]:
+    def _skill_policy_messages(self, memory: MemoryState) -> list[dict[str, Any]]:
         if self.skill_runtime is None:
             return []
-        scoped_bundles = [("system", bundle) for bundle in self.skill_runtime.system]
+        scoped_bundles = [
+            ("system", bundle)
+            for bundle in self.skill_runtime.system_for_task(
+                "\n".join(
+                    [
+                        memory.fixed.original_task if memory.fixed is not None else "",
+                        *memory.task_updates,
+                    ]
+                )
+            )
+        ]
         if self.skill_runtime.active is not None:
             scoped_bundles.append(("global", self.skill_runtime.active))
         messages: list[dict[str, Any]] = []
@@ -2308,7 +2575,7 @@ class AgentController:
                         self.termination_policy.step_limit(state) - state.step_count,
                     ),
                     tools=tool_schemas,
-                    policy_messages=self._skill_policy_messages(),
+                    policy_messages=self._skill_policy_messages(memory),
                 )
             except ContextBudgetExceededError as error:
                 last_reason = str(error)
@@ -2318,6 +2585,30 @@ class AgentController:
                     reason=last_reason,
                 )
                 continue
+
+            protocol_checkpoints = 0
+            options = self._model_request_options(state)
+            if state.sanitize_unreplayable_provider_history and (
+                options is None or options.thinking_enabled is not False
+            ):
+                messages, protocol_checkpoints = checkpoint_unreplayable_tool_turns(messages)
+                if protocol_checkpoints:
+                    try:
+                        self.context_manager.reestimate_request(messages, tool_schemas)
+                    except ContextBudgetExceededError as error:
+                        last_reason = str(error)
+                        self._log(
+                            "context_preflight_overflow",
+                            attempt=attempt,
+                            reason=last_reason,
+                        )
+                        continue
+                    self._log(
+                        "provider_reasoning_context_restarted",
+                        step=state.step_count + 1,
+                        checkpointed_tool_turns=protocol_checkpoints,
+                        thinking_enabled=True,
+                    )
 
             estimate = self.context_manager.last_estimate
             self._log(
@@ -2329,7 +2620,6 @@ class AgentController:
                 effective_estimated_prompt_tokens=estimate.effective,
             )
             try:
-                options = self._model_request_options(state)
                 response = self.model_client.complete(
                     messages=messages,
                     tools=tool_schemas,
@@ -2389,7 +2679,7 @@ class AgentController:
         return None
 
     @staticmethod
-    def _history_requires_non_thinking(memory: MemoryState) -> bool:
+    def _history_requires_reasoning_checkpoint(memory: MemoryState) -> bool:
         if not memory.provider_requires_reasoning_content:
             return False
         return any(

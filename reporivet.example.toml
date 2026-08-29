@@ -11,6 +11,10 @@ thinking_mode = "provider_default"
 # tokenizer_encoding = "o200k_base"
 timeout_seconds = 60
 max_retries = 3
+# Restart once with provider thinking disabled when a stream spends this long producing only
+# hidden reasoning and has not started an answer or tool request. This is not an output cap.
+reasoning_stall_seconds = 20
+reasoning_stall_chars = 12000
 
 [token]
 # Cost ceiling for one active cache epoch. The safe model budget still takes precedence.
@@ -45,6 +49,13 @@ global_enabled = true
 # enter read-only Plan Mode for complex work. Generated plans still require user review.
 auto_plan = "adaptive"
 
+[planning.llm]
+# Adaptive mode asks this isolated classifier only when local rules do not already require Plan.
+enabled = true
+# model = "small-classifier-model"
+timeout_seconds = 10
+confidence_threshold = 0.70
+
 [approval]
 # allow-all, llm-auto, safe-auto, or always-ask
 mode = "safe-auto"
@@ -58,7 +69,7 @@ enabled = true
 # model = "approval-model"
 # A local gate sends higher-risk allow recommendations to human approval.
 max_auto_approve_risk = "medium"
-timeout_seconds = 10
+timeout_seconds = 30
 
 [approval.safety]
 deny_outside_workspace_write = true

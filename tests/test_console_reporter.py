@@ -97,6 +97,34 @@ def test_console_reporter_shows_approval_model_review_status(
     assert reporter._active_status is None
 
 
+def test_console_reporter_shows_adaptive_plan_review_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    buffer = StringIO()
+    console = Console(file=buffer, force_terminal=False, color_system=None, width=240)
+    reporter = ConsoleEventReporter(console)
+    status = RecordingStatus()
+    captured: dict[str, str] = {}
+
+    def create_status(message: str, *, spinner: str) -> RecordingStatus:
+        captured["message"] = message
+        captured["spinner"] = spinner
+        return status
+
+    monkeypatch.setattr(console, "status", create_status)
+
+    reporter.log("auto_plan_review_started")
+
+    assert status.started is True
+    assert "Evaluating whether Plan Mode is needed" in captured["message"]
+    assert captured["spinner"] == "dots"
+
+    reporter.log("auto_plan_reviewed", decision="execute")
+
+    assert status.stopped is True
+    assert reporter._active_status is None
+
+
 @pytest.mark.parametrize(
     ("tool", "message"),
     [

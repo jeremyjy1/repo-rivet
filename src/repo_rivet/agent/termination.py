@@ -66,7 +66,7 @@ class TerminationPolicy:
             )
         if state.consecutive_protocol_failures >= self.config.max_consecutive_protocol_failures:
             return (
-                "maximum consecutive decision protocol failures reached "
+                "maximum consecutive action protocol failures reached "
                 f"({self.config.max_consecutive_protocol_failures})"
             )
         if state.repeated_tool_calls >= self.config.max_repeated_tool_calls:

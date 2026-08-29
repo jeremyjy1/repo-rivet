@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import fnmatch
+import re
+
 from repo_rivet.memory.models import MemoryState
 from repo_rivet.planning.models import PlanStatus, WorkflowMode
 from repo_rivet.skills.errors import SkillError, SkillStaleError, SkillValidationError
@@ -154,6 +157,10 @@ class SkillRuntime:
             if name in CONTROL_TOOLS or name in self._active.manifest.requested_tools
         }
 
+    def system_for_task(self, task: str) -> tuple[SkillBundle, ...]:
+        """Return loaded system guidance whose declared triggers match the task."""
+        return tuple(bundle for bundle in self._system if _matches_task(bundle, task))
+
     @staticmethod
     def _invalidate_plan(memory: MemoryState) -> None:
         if memory.plan_artifact is None or memory.plan_artifact.status in {
@@ -163,3 +170,44 @@ class SkillRuntime:
             return
         memory.plan_artifact.status = PlanStatus.STALE
         memory.workflow_mode = WorkflowMode.PLAN_READY
+
+
+def _matches_task(bundle: SkillBundle, task: str) -> bool:
+    triggers = bundle.manifest.triggers
+    if not any(
+        (
+            triggers.task_types,
+            triggers.file_globs,
+            triggers.project_markers,
+            triggers.keywords,
+        )
+    ):
+        return True
+
+    normalized = " ".join(task.casefold().replace("_", " ").replace("-", " ").split())
+    phrases = [*triggers.task_types, *triggers.keywords]
+    if any(
+        " ".join(phrase.casefold().replace("_", " ").replace("-", " ").split()) in normalized
+        for phrase in phrases
+        if phrase.strip()
+    ):
+        return True
+
+    path_candidates = {
+        value.strip("'\"`()[]{}<>,:;").replace("\\", "/") for value in re.findall(r"[^\s]+", task)
+    }
+    path_candidates.discard("")
+    for pattern in triggers.file_globs:
+        normalized_pattern = pattern.replace("\\", "/")
+        short_pattern = (
+            normalized_pattern[3:] if normalized_pattern.startswith("**/") else normalized_pattern
+        )
+        if any(
+            fnmatch.fnmatch(candidate, normalized_pattern)
+            or fnmatch.fnmatch(candidate, short_pattern)
+            for candidate in path_candidates
+        ):
+            return True
+
+    basenames = {candidate.rsplit("/", 1)[-1].casefold() for candidate in path_candidates}
+    return any(marker.casefold() in basenames for marker in triggers.project_markers)

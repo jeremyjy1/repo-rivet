@@ -31,6 +31,7 @@ class AutoPlanPolicy:
     """Choose planning conservatively; ambiguous cases stay model-requested."""
 
     mode: AutoPlanMode = AutoPlanMode.OFF
+    classifier_confidence_threshold: float = 0.70
 
     def preflight_reason(self, task: str) -> str | None:
         normalized = task.strip()

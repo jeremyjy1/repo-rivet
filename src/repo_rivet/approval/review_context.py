@@ -75,6 +75,8 @@ def build_review_payload(request: ApprovalRequest) -> dict[str, Any]:
 
 
 def _execution_plan(request: ApprovalRequest) -> dict[str, Any]:
+    if request.tool_name in {"write_file", "edit_file"}:
+        return _file_change_plan(request)
     command = request.normalized_arguments.get("command")
     if not isinstance(command, dict):
         return {"tool": request.tool_name}
@@ -101,3 +103,53 @@ def _execution_plan(request: ApprovalRequest) -> dict[str, Any]:
         "stderr": {"type": "capture"},
         "timeout_seconds": request.normalized_arguments.get("timeout_seconds"),
     }
+
+
+def _file_change_plan(request: ApprovalRequest) -> dict[str, Any]:
+    normalized = request.normalized_arguments
+    resolved_paths = normalized.get("_resolved_paths", {})
+    target = resolved_paths.get("path") if isinstance(resolved_paths, dict) else None
+    plan: dict[str, Any] = {
+        "tool": request.tool_name,
+        "operation": "create" if request.tool_name == "write_file" else "edit",
+        "target": target,
+        "overwrites_existing_file": request.facts.overwrites_existing,
+        "constraints": sorted(request.facts.constraints),
+    }
+    if request.tool_name == "write_file":
+        content = request.arguments.get("content")
+        if isinstance(content, str):
+            plan["content_summary"] = {
+                "characters": len(content),
+                "lines": len(content.splitlines()),
+            }
+        return plan
+
+    operations = normalized.get("operations")
+    if isinstance(operations, list):
+        plan["operations"] = [
+            {
+                key: value
+                for key, value in operation.items()
+                if key
+                in {
+                    "op",
+                    "start_line",
+                    "end_line",
+                    "line",
+                    "new_line_count",
+                }
+            }
+            for operation in operations
+            if isinstance(operation, dict)
+        ]
+    diff_preview = normalized.get("diff_preview")
+    if isinstance(diff_preview, str):
+        plan["diff_preview"] = _bounded_text(diff_preview)
+    return plan
+
+
+def _bounded_text(value: str, limit: int = 12_000) -> str:
+    if len(value) <= limit:
+        return value
+    return value[:limit] + "\n... preview truncated by approval context limit ..."

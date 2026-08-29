@@ -409,6 +409,145 @@ def test_llm_auto_accepts_complete_medium_risk_review(tmp_path: Path) -> None:
     assert human.requests == []
 
 
+def test_llm_auto_locally_allows_bounded_workspace_file_creation(tmp_path: Path) -> None:
+    human = FakeHumanApprover(action=ApprovalAction.DENY)
+    reviewer = FakeReviewer(None)
+    engine, _ = create_engine(
+        tmp_path,
+        mode=ApprovalMode.LLM_AUTO,
+        human=human,
+        reviewer=reviewer,
+    )
+
+    outcome = engine.authorize(
+        tool_name="write_file",
+        arguments={"path": "new.py", "content": "value = 1\n"},
+        capabilities={Capability.FILESYSTEM_WRITE},
+        session_id=engine.session_id,
+    )
+
+    assert outcome.decision.action == ApprovalAction.ALLOW
+    assert outcome.decision.source == "llm_auto_template:bounded_workspace_create"
+    assert reviewer.requests == []
+    assert human.requests == []
+
+
+def test_llm_auto_locally_allows_preflighted_snapshot_edit(tmp_path: Path) -> None:
+    path = tmp_path / "main.py"
+    path.write_text("value = 1\n", encoding="utf-8")
+    human = FakeHumanApprover(action=ApprovalAction.DENY)
+    reviewer = FakeReviewer(None)
+    engine, _ = create_engine(
+        tmp_path,
+        mode=ApprovalMode.LLM_AUTO,
+        human=human,
+        reviewer=reviewer,
+    )
+
+    outcome = engine.authorize(
+        tool_name="edit_file",
+        arguments={
+            "path": "main.py",
+            "snapshot_id": "snapshot-1",
+            "prepared_live_hash": "live-hash-1",
+            "operations": [
+                {
+                    "op": "replace",
+                    "start_line": 1,
+                    "end_line": 1,
+                    "new_line_count": 1,
+                }
+            ],
+            "diff_preview": "-value = 1\n+value = 2",
+        },
+        capabilities={Capability.FILESYSTEM_READ, Capability.FILESYSTEM_WRITE},
+        session_id=engine.session_id,
+    )
+
+    assert outcome.decision.action == ApprovalAction.ALLOW
+    assert outcome.decision.source == "llm_auto_template:bounded_workspace_edit"
+    assert reviewer.requests == []
+    assert human.requests == []
+
+
+def test_llm_auto_executes_bounded_create_and_edit_without_review(tmp_path: Path) -> None:
+    human = FakeHumanApprover(action=ApprovalAction.DENY)
+    reviewer = FakeReviewer(None)
+    engine, _ = create_engine(
+        tmp_path,
+        mode=ApprovalMode.LLM_AUTO,
+        human=human,
+        reviewer=reviewer,
+    )
+    registry = create_default_registry(tmp_path, approval_engine=engine)
+
+    created = registry.execute(
+        ToolCall(
+            id="create-bounded",
+            name="write_file",
+            arguments={"path": "main.py", "content": "value = 1\n"},
+        )
+    )
+    read = registry.execute(
+        ToolCall(id="read-bounded", name="read_file", arguments={"path": "main.py"})
+    )
+    assert read.metadata
+    edited = registry.execute(
+        ToolCall(
+            id="edit-bounded",
+            name="edit_file",
+            arguments={
+                "path": "main.py",
+                "snapshot_id": read.metadata["snapshot_id"],
+                "operations": [
+                    {
+                        "op": "replace",
+                        "start_line": 1,
+                        "end_line": 1,
+                        "new_lines": ["value = 2"],
+                    }
+                ],
+            },
+        )
+    )
+
+    assert created.ok and edited.ok
+    assert (tmp_path / "main.py").read_text(encoding="utf-8") == "value = 2\n"
+    assert reviewer.requests == []
+    assert human.requests == []
+
+
+def test_llm_auto_large_snapshot_edit_still_requires_human_review(tmp_path: Path) -> None:
+    path = tmp_path / "main.py"
+    path.write_text("\n".join(f"line {index}" for index in range(120)), encoding="utf-8")
+    human = FakeHumanApprover()
+    reviewer = FakeReviewer(None)
+    engine, _ = create_engine(
+        tmp_path,
+        mode=ApprovalMode.LLM_AUTO,
+        human=human,
+        reviewer=reviewer,
+    )
+
+    outcome = engine.authorize(
+        tool_name="edit_file",
+        arguments={
+            "path": "main.py",
+            "snapshot_id": "snapshot-1",
+            "prepared_live_hash": "live-hash-1",
+            "operations": [{"op": "delete", "start_line": 1, "end_line": 100}],
+            "diff_preview": "100 lines removed",
+        },
+        capabilities={Capability.FILESYSTEM_READ, Capability.FILESYSTEM_WRITE},
+        session_id=engine.session_id,
+    )
+
+    assert outcome.request.assessment.level == RiskLevel.HIGH
+    assert outcome.decision.source == "human"
+    assert len(reviewer.requests) == 1
+    assert len(human.requests) == 1
+
+
 def test_llm_review_audit_event_records_facts_without_confidence(tmp_path: Path) -> None:
     reviewer = FakeReviewer(
         LLMReviewResult(
@@ -484,6 +623,8 @@ def test_llm_timeout_falls_back_to_human(tmp_path: Path) -> None:
         human_approver=human,
         llm_reviewer=TimeoutReviewer(),
     )
+    events = EventCollector()
+    engine.event_logger = events
 
     outcome = engine.authorize(
         tool_name="run_command",
@@ -494,6 +635,9 @@ def test_llm_timeout_falls_back_to_human(tmp_path: Path) -> None:
 
     assert outcome.decision.source == "human"
     assert len(human.requests) == 1
+    failure = next(data for event, data in events.events if event == "llm_approval_review_failed")
+    assert failure["error_type"] == "TimeoutError"
+    assert failure["stage"] == "review"
 
 
 def test_openai_reviewer_treats_invalid_json_as_failure() -> None:
@@ -567,6 +711,58 @@ def test_openai_reviewer_rejects_legacy_confidence_schema() -> None:
     )
 
     assert reviewer.review(request) is None
+
+
+def test_openai_reviewer_retries_without_thinking_when_provider_rejects_it() -> None:
+    calls: list[dict[str, object]] = []
+
+    class UnsupportedThinkingError(Exception):
+        status_code = 400
+        body = {"error": {"message": "unsupported thinking option"}}
+
+    def create(**arguments: object) -> object:
+        calls.append(arguments)
+        if len(calls) == 1:
+            raise UnsupportedThinkingError("invalid thinking parameter")
+        content = {
+            "recommendation": "ask",
+            "risk_level": "medium",
+            "task_relevance": "required",
+            "recognized_effects": ["process_execution"],
+            "unknowns": [],
+            "required_constraints": ["shell_free_argv"],
+            "reason": "The command needs human confirmation.",
+            "user_prompt": "Allow this command?",
+        }
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(content)))]
+        )
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    reviewer = OpenAIApprovalReviewer(
+        ApiConfig(
+            api_key="test-secret",
+            base_url="https://example.com/v1",
+            model="reviewer",
+            context_window_tokens=8_192,
+        ),
+        client=client,
+    )
+    request = ApprovalRequest(
+        request_id="request",
+        session_id="session",
+        tool_name="run_command",
+        arguments={},
+        normalized_arguments={},
+        workspace="/workspace",
+        fingerprint="fingerprint",
+        assessment={"level": RiskLevel.MEDIUM},
+    )
+
+    assert reviewer.review(request) is not None
+    assert calls[0]["extra_body"] == {"thinking": {"type": "disabled"}}
+    assert "extra_body" not in calls[1]
+    assert reviewer.last_failure is None
 
 
 def test_llm_cannot_auto_approve_high_risk_network_command(tmp_path: Path) -> None:
@@ -699,8 +895,8 @@ def test_llm_allow_with_missing_effect_coverage_falls_back_to_human(tmp_path: Pa
     )
 
     outcome = engine.authorize(
-        tool_name="write_file",
-        arguments={"path": "new.py", "content": "value = 1\n"},
+        tool_name="custom_writer",
+        arguments={},
         capabilities={Capability.FILESYSTEM_WRITE},
         session_id=engine.session_id,
     )
@@ -800,6 +996,60 @@ def test_review_payload_expands_package_script_as_untrusted_semantic_context(
         "reason": ["expanded package test script to vitest"],
     }
     assert "execute_project_code" in outcome.request.facts.explicit_effects
+
+
+def test_review_payload_describes_file_changes_without_exposing_new_file_content(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "main.py"
+    path.write_text("value = 1\n", encoding="utf-8")
+    engine, _ = create_engine(tmp_path, mode=ApprovalMode.SAFE_AUTO)
+
+    created = engine.authorize(
+        tool_name="write_file",
+        arguments={"path": "new.py", "content": "private source text\n"},
+        capabilities={Capability.FILESYSTEM_WRITE},
+        session_id=engine.session_id,
+    )
+    edited = engine.authorize(
+        tool_name="edit_file",
+        arguments={
+            "path": "main.py",
+            "snapshot_id": "snapshot-1",
+            "prepared_live_hash": "live-hash-1",
+            "operations": [
+                {
+                    "op": "replace",
+                    "start_line": 1,
+                    "end_line": 1,
+                    "new_line_count": 1,
+                    "new_lines_sha256": "new-lines-hash",
+                }
+            ],
+            "diff_preview": "-value = 1\n+value = 2",
+        },
+        capabilities={Capability.FILESYSTEM_READ, Capability.FILESYSTEM_WRITE},
+        session_id=engine.session_id,
+    )
+
+    create_plan = build_review_payload(created.request)["execution_plan"]
+    assert create_plan["operation"] == "create"
+    assert create_plan["target"] == str((tmp_path / "new.py").resolve())
+    assert create_plan["content_summary"] == {"characters": 20, "lines": 1}
+    assert "private source text" not in json.dumps(create_plan)
+
+    edit_plan = build_review_payload(edited.request)["execution_plan"]
+    assert edit_plan["operation"] == "edit"
+    assert edit_plan["operations"] == [
+        {
+            "op": "replace",
+            "start_line": 1,
+            "end_line": 1,
+            "new_line_count": 1,
+        }
+    ]
+    assert edit_plan["diff_preview"] == "-value = 1\n+value = 2"
+    assert "new-lines-hash" not in json.dumps(edit_plan)
 
 
 def test_package_installation_facts_force_human_review(tmp_path: Path) -> None:
@@ -911,6 +1161,7 @@ def test_openai_reviewer_receives_structured_plan_and_no_output_limit(tmp_path: 
 
     assert outcome.decision.source == "human"
     assert "max_tokens" not in captured
+    assert captured["extra_body"] == {"thinking": {"type": "disabled"}}
     messages = captured["messages"]
     assert isinstance(messages, list)
     user_payload = json.loads(messages[1]["content"].split("\n", 1)[1])

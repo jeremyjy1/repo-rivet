@@ -38,6 +38,7 @@ from repo_rivet.memory.models import MemoryConfig, MemoryState
 from repo_rivet.memory.store import MemoryStore
 from repo_rivet.memory.token_calibrator import TokenCalibrationStore
 from repo_rivet.memory.token_estimator import create_token_estimator
+from repo_rivet.planning.classifier import OpenAIPlanClassifier
 from repo_rivet.planning.models import PlanArtifact, PlanStatus, WorkflowMode
 from repo_rivet.planning.policy import AutoPlanMode, AutoPlanPolicy
 from repo_rivet.reasoning.manager import ReasoningManager
@@ -1133,7 +1134,19 @@ def _build_runtime(
             memory_store=store,
             reasoning_manager=reasoning_manager,
             skill_runtime=skill_runtime,
-            auto_plan_policy=AutoPlanPolicy(auto_plan_mode),
+            auto_plan_policy=AutoPlanPolicy(
+                auto_plan_mode,
+                classifier_confidence_threshold=(config.planning.llm.confidence_threshold),
+            ),
+            plan_classifier=(
+                OpenAIPlanClassifier(
+                    config.api,
+                    model=config.planning.llm.model,
+                    timeout_seconds=config.planning.llm.timeout_seconds,
+                )
+                if auto_plan_mode == AutoPlanMode.ADAPTIVE and config.planning.llm.enabled
+                else None
+            ),
         )
         memory.status = SessionStatus.RUNNING.value
         store.save_state(memory, status=SessionStatus.RUNNING.value)
@@ -1287,6 +1300,8 @@ def _print_runtime(console: Console, workspace: Path, runtime: Runtime) -> None:
             f"Approval mode: {runtime.registry.approval_engine.mode.value}\n"
             f"Decision trace: {runtime.controller.reasoning_manager.config.display.value}\n"
             f"Auto plan: {runtime.controller.auto_plan_policy.mode.value}\n"
+            "Adaptive plan classifier: "
+            f"{'enabled' if runtime.config.planning.llm.enabled else 'disabled'}\n"
             f"System Skills: {system_skill_label or 'none'}\n"
             f"Global Skill: {global_skill_label}\n"
             f"Safe prompt budget: "

@@ -187,6 +187,48 @@ def test_runtime_eagerly_loads_all_system_skills_without_narrowing_tools(
     ]
 
 
+def test_runtime_injects_only_system_skills_matching_the_task(tmp_path: Path) -> None:
+    write_skill(
+        tmp_path / "system",
+        "matching-skill",
+        body="# Matching\n\nMATCHING_BODY",
+        automatic=True,
+        extra="triggers:\n  keywords: [special workflow]\n",
+    )
+    write_skill(
+        tmp_path / "system",
+        "unrelated-skill",
+        body="# Unrelated\n\nUNRELATED_BODY",
+        automatic=True,
+        extra="triggers:\n  keywords: [different task]\n",
+    )
+    runtime = SkillRuntime(
+        registry_for(tmp_path),
+        known_tools={"read_file"},
+    )
+
+    assert [bundle.manifest.id for bundle in runtime.system] == [
+        "matching-skill",
+        "unrelated-skill",
+    ]
+    assert [bundle.manifest.id for bundle in runtime.system_for_task("Use SPECIAL workflow")] == [
+        "matching-skill"
+    ]
+
+    model = FakeModelClient([ModelResponse(content="Done.")])
+    controller = AgentController(
+        model_client=model,
+        tool_registry=create_default_registry(tmp_path),
+        skill_runtime=runtime,
+    )
+    result = controller.run("Use special workflow", memory=MemoryState(session_id="matched"))
+
+    assert result.status == "success"
+    request = str(model.requests[0]["messages"])
+    assert "MATCHING_BODY" in request
+    assert "UNRELATED_BODY" not in request
+
+
 def test_legacy_skill_sources_migrate_to_system_and_global_layers() -> None:
     base_pin = {
         "id": "legacy-skill",

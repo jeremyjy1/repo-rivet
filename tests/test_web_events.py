@@ -61,6 +61,22 @@ def test_approval_review_events_have_stable_browser_names(tmp_path: Path) -> Non
     ]
 
 
+def test_auto_plan_review_events_have_stable_browser_names(tmp_path: Path) -> None:
+    path = tmp_path / "events.jsonl"
+    rows = [
+        {"timestamp": "start", "event": "auto_plan_review_started", "data": {}},
+        {"timestamp": "done", "event": "auto_plan_reviewed", "data": {}},
+        {"timestamp": "failed", "event": "auto_plan_review_failed", "data": {}},
+    ]
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+    assert [event.type for event in read_events(path, "session-a")] == [
+        "auto.plan.review.started",
+        "auto.plan.review.completed",
+        "auto.plan.review.failed",
+    ]
+
+
 def test_event_history_is_loaded_in_bounded_pages(tmp_path: Path) -> None:
     path = tmp_path / "events.jsonl"
     rows = [

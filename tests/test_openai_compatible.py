@@ -137,6 +137,38 @@ class InterruptedStreamCompletions:
         raise APITimeoutError("stream stalled")
 
 
+class StalledReasoningCompletions:
+    def __init__(self, *, recover: bool = True) -> None:
+        self.recover = recover
+        self.requests: list[dict[str, object]] = []
+
+    def create(self, **kwargs):  # type: ignore[no-untyped-def]
+        self.requests.append(kwargs)
+        if len(self.requests) == 1 or not self.recover:
+            return iter([stream_chunk(content=""), stream_chunk(reasoning="x" * 100)])
+        return iter([stream_chunk(content="direct result", finish_reason="stop")])
+
+
+class ReasoningProtocolError(RuntimeError):
+    def __init__(self) -> None:
+        super().__init__(
+            "The `reasoning_content` in the thinking mode must be passed back to the API."
+        )
+        self.status_code = 400
+        self.code = "invalid_request_error"
+
+
+class ReasoningProtocolFallbackCompletions:
+    def __init__(self) -> None:
+        self.requests: list[dict[str, object]] = []
+
+    def create(self, **kwargs):  # type: ignore[no-untyped-def]
+        self.requests.append(kwargs)
+        if len(self.requests) == 1:
+            raise ReasoningProtocolError()
+        return iter([stream_chunk(content="protocol recovered", finish_reason="stop")])
+
+
 def test_complete_calls_chat_completions_with_configured_model() -> None:
     completions = FakeCompletions()
     client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
@@ -235,6 +267,83 @@ def test_interrupted_stream_retries_from_a_clean_accumulator(
     assert retry["max_attempts"] == 2
 
 
+def test_hidden_reasoning_stall_restarts_once_with_thinking_disabled() -> None:
+    completions = StalledReasoningCompletions()
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    events = RecordingSink()
+    config = ApiConfig(
+        api_key=SecretStr("test-key"),
+        base_url="https://example.com/v1",
+        model="test-model",
+        context_window_tokens=32768,
+        max_retries=0,
+        reasoning_stall_seconds=0,
+        reasoning_stall_chars=100,
+    )
+    adapter = OpenAICompatibleClient(config, client=client, event_logger=events)
+
+    result = adapter.complete(messages=[{"role": "user", "content": "task"}], tools=[])
+
+    assert result.content == "direct result"
+    assert result.provider_thinking_disabled is True
+    assert result.reasoning_context_restart_required is True
+    assert len(completions.requests) == 2
+    assert "extra_body" not in completions.requests[0]
+    assert completions.requests[1]["extra_body"] == {"thinking": {"type": "disabled"}}
+    assert all("max_tokens" not in request for request in completions.requests)
+    recovery = next(
+        data for name, data in events.events if name == "model_stream_reasoning_recovery"
+    )
+    assert recovery["reasoning_chars"] == 100
+    assert recovery["recovery"] == "restart_with_thinking_disabled"
+
+
+def test_hidden_reasoning_stall_recovery_is_bounded() -> None:
+    completions = StalledReasoningCompletions(recover=False)
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    config = ApiConfig(
+        api_key=SecretStr("test-key"),
+        base_url="https://example.com/v1",
+        model="test-model",
+        context_window_tokens=32768,
+        max_retries=0,
+        reasoning_stall_seconds=0,
+        reasoning_stall_chars=100,
+    )
+    adapter = OpenAICompatibleClient(config, client=client)
+
+    with pytest.raises(ModelRequestError, match="only hidden reasoning"):
+        adapter.complete(messages=[{"role": "user", "content": "task"}], tools=[])
+
+    assert len(completions.requests) == 2
+
+
+def test_missing_reasoning_protocol_state_retries_once_without_thinking() -> None:
+    completions = ReasoningProtocolFallbackCompletions()
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    events = RecordingSink()
+    config = ApiConfig(
+        api_key=SecretStr("test-key"),
+        base_url="https://example.com/v1",
+        model="test-model",
+        context_window_tokens=32768,
+        max_retries=0,
+    )
+    adapter = OpenAICompatibleClient(config, client=client, event_logger=events)
+
+    result = adapter.complete(messages=[{"role": "user", "content": "continue"}], tools=[])
+
+    assert result.content == "protocol recovered"
+    assert result.provider_thinking_disabled is True
+    assert result.reasoning_context_restart_required is True
+    assert len(completions.requests) == 2
+    assert completions.requests[1]["extra_body"] == {"thinking": {"type": "disabled"}}
+    recovery = next(
+        data for name, data in events.events if name == "model_reasoning_protocol_recovery"
+    )
+    assert recovery["recovery"] == "retry_with_thinking_disabled"
+
+
 def test_complete_applies_explicit_thinking_recovery_options() -> None:
     completions = FakeCompletions()
     client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
@@ -246,12 +355,14 @@ def test_complete_applies_explicit_thinking_recovery_options() -> None:
     )
     adapter = OpenAICompatibleClient(config, client=client)
 
-    adapter.complete(
+    result = adapter.complete(
         messages=[{"role": "user", "content": "task"}],
         tools=[],
         options=ModelRequestOptions(thinking_enabled=False, reasoning_effort="low"),
     )
 
+    assert result.provider_thinking_disabled is True
+    assert result.reasoning_context_restart_required is False
     assert completions.kwargs["reasoning_effort"] == "low"
     assert completions.kwargs["extra_body"] == {"thinking": {"type": "disabled"}}
 

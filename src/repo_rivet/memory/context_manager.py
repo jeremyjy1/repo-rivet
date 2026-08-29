@@ -37,7 +37,9 @@ start registered verification or provide a final response, the Controller automa
 remaining pending required checks in plan order. Do not create a separate decision turn for each
 remaining verification check. A registered Verification Plan is the audit record for
 run_verification, so call it directly without record_decision; command policy and approval still
-apply when the check executes.
+apply when the check executes. During an approved Plan, an exact run_command matching the current
+step's single registered check is canonicalized to run_verification and receives the same typed
+authorization; do not repeat it after the registered result is returned.
 If a verification result is inconclusive because its oracle is insufficient, replace the full
 plan by calling register_verification directly. Preserve all still-required checks and add a
 deterministic output or artifact oracle; do not call record_decision for this plan revision.
@@ -169,6 +171,21 @@ class ContextManager:
             estimated=self.last_estimate.raw,
             actual=actual_prompt_tokens,
         )
+
+    def reestimate_request(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+    ) -> RequestTokenEstimate:
+        """Re-estimate a provider-specific request transformation."""
+        estimate = self.token_manager.estimate_request(messages, tools)
+        if estimate.effective > self.token_manager.config.request_budget:
+            raise ContextBudgetExceededError(
+                "Provider-compatible context exceeds the active prompt budget "
+                f"({estimate.effective} > {self.token_manager.config.request_budget} tokens)"
+            )
+        self.last_estimate = estimate
+        return estimate
 
     def observe_overflow(self) -> None:
         self.token_manager.observe_overflow()

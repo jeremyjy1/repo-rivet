@@ -35,6 +35,18 @@ class ModelRequestError(RuntimeError):
         self.record = record
 
 
+class ReasoningStreamStalled(RuntimeError):
+    """A stream produced excessive hidden reasoning without an actionable response."""
+
+    def __init__(self, *, elapsed_seconds: float, reasoning_chars: int) -> None:
+        super().__init__(
+            "Model stream produced only hidden reasoning for "
+            f"{elapsed_seconds:.1f}s ({reasoning_chars} characters)"
+        )
+        self.elapsed_seconds = elapsed_seconds
+        self.reasoning_chars = reasoning_chars
+
+
 class OpenAICompatibleClient:
     """Call a configured Chat Completions endpoint using native tool calling."""
 
@@ -76,16 +88,51 @@ class OpenAICompatibleClient:
             provider_options["extra_body"] = {
                 "thinking": {"type": "enabled" if thinking_enabled else "disabled"}
             }
+        provider_thinking_disabled = thinking_enabled is False
+        reasoning_context_restart_required = False
         max_attempts = self._config.max_retries + 1
+        reasoning_recovery_used = False
         for attempt in range(1, max_attempts + 1):
             try:
-                stream = self._create_stream(
-                    messages=messages,
-                    tools=tools,
-                    provider_options=provider_options,
-                    attempt=attempt,
-                )
-                parsed, usage = self._consume_stream(stream, attempt=attempt)
+                while True:
+                    try:
+                        stream = self._create_stream(
+                            messages=messages,
+                            tools=tools,
+                            provider_options=provider_options,
+                            attempt=attempt,
+                        )
+                        parsed, usage = self._consume_stream(stream, attempt=attempt)
+                    except ReasoningStreamStalled as error:
+                        if reasoning_recovery_used:
+                            raise
+                        reasoning_recovery_used = True
+                        provider_options = _disable_provider_thinking(provider_options)
+                        provider_thinking_disabled = True
+                        reasoning_context_restart_required = True
+                        self._log(
+                            "model_stream_reasoning_recovery",
+                            attempt=attempt,
+                            elapsed_seconds=round(error.elapsed_seconds, 1),
+                            reasoning_chars=error.reasoning_chars,
+                            recovery="restart_with_thinking_disabled",
+                        )
+                        continue
+                    except Exception as error:
+                        if not _reasoning_content_replay_required(error) or reasoning_recovery_used:
+                            raise
+                        reasoning_recovery_used = True
+                        provider_options = _disable_provider_thinking(provider_options)
+                        provider_thinking_disabled = True
+                        reasoning_context_restart_required = True
+                        self._log(
+                            "model_reasoning_protocol_recovery",
+                            attempt=attempt,
+                            error_type=type(error).__name__,
+                            recovery="retry_with_thinking_disabled",
+                        )
+                        continue
+                    break
                 break
             except ResponseParseError:
                 raise
@@ -118,6 +165,8 @@ class OpenAICompatibleClient:
             parsed,
             input_tokens=_usage_value(usage, "prompt_tokens", "input_tokens"),
             output_tokens=_usage_value(usage, "completion_tokens", "output_tokens"),
+            provider_thinking_disabled=provider_thinking_disabled,
+            reasoning_context_restart_required=reasoning_context_restart_required,
         )
 
     def _create_stream(
@@ -155,7 +204,9 @@ class OpenAICompatibleClient:
         last_progress_at = started_at
         chunk_count = 0
         content_parts: list[str] = []
+        content_chars = 0
         reasoning_parts: list[str] = []
+        reasoning_chars = 0
         tool_fragments: dict[int, dict[str, Any]] = {}
         finish_reason: str | None = None
         usage: Any = None
@@ -178,9 +229,11 @@ class OpenAICompatibleClient:
                         if not isinstance(content, str):
                             raise ResponseParseError("Streamed model response content is not text")
                         content_parts.append(content)
+                        content_chars += len(content)
                     reasoning = _stream_reasoning_text(delta)
                     if reasoning is not None:
                         reasoning_parts.append(reasoning)
+                        reasoning_chars += len(reasoning)
                     for fallback_index, raw_call in enumerate(
                         getattr(delta, "tool_calls", None) or []
                     ):
@@ -189,6 +242,18 @@ class OpenAICompatibleClient:
                             raw_call,
                             fallback_index=fallback_index,
                         )
+
+            elapsed_seconds = time.monotonic() - started_at
+            if (
+                reasoning_chars >= self._config.reasoning_stall_chars
+                and elapsed_seconds >= self._config.reasoning_stall_seconds
+                and content_chars == 0
+                and not tool_fragments
+            ):
+                raise ReasoningStreamStalled(
+                    elapsed_seconds=elapsed_seconds,
+                    reasoning_chars=reasoning_chars,
+                )
 
             now = time.monotonic()
             if chunk_count == 1 or now - last_progress_at >= _STREAM_PROGRESS_INTERVAL_SECONDS:
@@ -344,6 +409,26 @@ def _stream_options_are_unsupported(error: Exception) -> bool:
     if body is not None:
         message += " " + str(body).lower()
     return "stream_options" in message or "stream options" in message
+
+
+def _reasoning_content_replay_required(error: Exception) -> bool:
+    message = str(error).lower()
+    return (
+        "reasoning_content" in message
+        and "thinking mode" in message
+        and ("passed back" in message or "required" in message)
+    )
+
+
+def _disable_provider_thinking(provider_options: dict[str, Any]) -> dict[str, Any]:
+    """Return a clean retry configuration that asks compatible providers for direct output."""
+    recovered = dict(provider_options)
+    recovered.pop("reasoning_effort", None)
+    extra_body = recovered.get("extra_body")
+    recovered_extra = dict(extra_body) if isinstance(extra_body, dict) else {}
+    recovered_extra["thinking"] = {"type": "disabled"}
+    recovered["extra_body"] = recovered_extra
+    return recovered
 
 
 def _usage_value(usage: Any, *names: str) -> int | None:

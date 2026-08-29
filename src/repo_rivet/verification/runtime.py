@@ -98,6 +98,22 @@ class VerificationRuntime:
             "timeout_seconds": check.command.timeout_seconds,
         }
 
+    def command_matches(self, check_id: str, *, command: str, cwd: str) -> bool:
+        """Return whether an arbitrary command exactly names a registered check command."""
+        check = self.check(check_id)
+        if check.command.stdin is not None:
+            return False
+        try:
+            requested_argv = self.command_policy.validate(command)
+            registered_argv = self.command_policy.validate(
+                shlex.join([check.command.program, *check.command.args])
+            )
+            requested_cwd = self.path_policy.resolve(cwd)
+            registered_cwd = self.path_policy.resolve(check.command.cwd)
+        except ValueError:
+            return False
+        return requested_argv == registered_argv and requested_cwd == registered_cwd
+
     def run(self, check_id: str) -> ToolResult:
         check = self.check(check_id)
         memory = self._memory()

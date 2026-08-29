@@ -2,7 +2,7 @@
 schema_version: 1
 id: test-failure-fix
 name: Test Failure Fix
-version: 1.1.0
+version: 1.1.1
 summary: Diagnose a concrete failing test, make a minimal snapshot-anchored repair, and verify it.
 category: workflow
 activation:
@@ -10,7 +10,7 @@ activation:
   automatic: true
 triggers:
   task_types: [fix-test]
-  keywords: [failing test, test failure, test regression]
+  keywords: [failing test, test failure, test regression, 测试失败, 修复测试, 测试回归]
 compatible_modes: [plan, execute]
 requested_tools:
   - list_files

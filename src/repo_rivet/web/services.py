@@ -45,6 +45,7 @@ class AgentQueryService:
                 "context_limit": config.api.context_window_tokens,
                 "approval_mode": config.approval.mode.value,
                 "auto_plan": (manager.default_auto_plan or config.planning.auto_plan).value,
+                "auto_plan_llm": config.planning.llm.enabled,
             },
             "capabilities": {"terminal": False, "websocket": False, "sse": True},
         }

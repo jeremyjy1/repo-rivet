@@ -42,6 +42,8 @@ class ApiConfig(BaseModel):
     tokenizer_encoding: str | None = Field(default=None, min_length=1)
     timeout_seconds: float = Field(default=60, gt=0, le=600)
     max_retries: int = Field(default=3, ge=0, le=10)
+    reasoning_stall_seconds: float = Field(default=20, ge=0, le=600)
+    reasoning_stall_chars: int = Field(default=12_000, ge=100, le=1_000_000)
 
     @field_validator("api_key", mode="before")
     @classmethod
@@ -99,7 +101,7 @@ class ApprovalLLMConfig(BaseModel):
     enabled: bool = True
     model: str | None = Field(default=None, min_length=1)
     max_auto_approve_risk: str = "medium"
-    timeout_seconds: float = Field(default=10, gt=0, le=120)
+    timeout_seconds: float = Field(default=30, gt=0, le=120)
 
     @field_validator("max_auto_approve_risk")
     @classmethod
@@ -153,12 +155,24 @@ class SkillsConfig(BaseModel):
     default_global: str | None = Field(default=None, min_length=2, max_length=64)
 
 
+class PlanningLLMConfig(BaseModel):
+    """Isolated classifier used only for ambiguous Adaptive Plan decisions."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    enabled: bool = True
+    model: str | None = Field(default=None, min_length=1)
+    timeout_seconds: float = Field(default=10, gt=0, le=120)
+    confidence_threshold: float = Field(default=0.70, ge=0.5, le=1)
+
+
 class PlanningConfig(BaseModel):
     """Select whether Controller may enter the read-only planning workflow automatically."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     auto_plan: AutoPlanMode = AutoPlanMode.ADAPTIVE
+    llm: PlanningLLMConfig = Field(default_factory=PlanningLLMConfig)
 
 
 class AppConfig(BaseModel):

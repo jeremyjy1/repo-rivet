@@ -9,6 +9,7 @@ from repo_rivet.approval.models import (
     EffectScope,
     ExecutableOrigin,
     OperationClass,
+    RiskLevel,
 )
 
 
@@ -47,6 +48,61 @@ class DeterministicApprovalTemplates:
         if match is not None:
             return match
         return self._managed_generation(request)
+
+    def match_llm_auto(self, request: ApprovalRequest) -> TemplateMatch | None:
+        """Match local writes that are safe to resolve before consulting the LLM reviewer."""
+        facts = request.facts
+        if request.tool_name not in {"write_file", "edit_file"}:
+            return None
+        if request.assessment.level > RiskLevel.MEDIUM:
+            return None
+        if facts.operation_class != OperationClass.EDIT:
+            return None
+        if facts.analysis_level != AnalysisLevel.EXACT:
+            return None
+        if facts.effect_scope != EffectScope.WORKSPACE or len(facts.write_paths) != 1:
+            return None
+        if facts.accesses_network or facts.requires_privilege or facts.outside_workspace:
+            return None
+        if facts.touches_sensitive_paths or facts.delete_paths or facts.potential_capabilities:
+            return None
+        if not facts.explicit_effects <= {"filesystem_read", "filesystem_write"}:
+            return None
+        required_constraints = {"typed_tool", "workspace_path_policy", "snapshot_precondition"}
+        if not required_constraints <= facts.constraints:
+            return None
+
+        arguments = request.normalized_arguments
+        if request.tool_name == "write_file":
+            content = arguments.get("content")
+            if facts.overwrites_existing or not isinstance(content, dict):
+                return None
+            if not isinstance(content.get("characters"), int) or not isinstance(
+                content.get("sha256"), str
+            ):
+                return None
+            return TemplateMatch(
+                name="bounded_workspace_create",
+                reason=("typed file creation is confined to one new non-sensitive workspace path"),
+                constraints=sorted(facts.constraints),
+            )
+
+        if not facts.overwrites_existing:
+            return None
+        if not isinstance(arguments.get("snapshot_id"), str) or not isinstance(
+            arguments.get("prepared_live_hash"), str
+        ):
+            return None
+        operations = arguments.get("operations")
+        if not isinstance(operations, list) or not operations:
+            return None
+        if not isinstance(arguments.get("diff_preview"), str):
+            return None
+        return TemplateMatch(
+            name="bounded_workspace_edit",
+            reason=("exact snapshot-bound edit is confined to one non-sensitive workspace file"),
+            constraints=sorted(facts.constraints),
+        )
 
     @staticmethod
     def _reporivet_skill_cli(request: ApprovalRequest) -> TemplateMatch | None:

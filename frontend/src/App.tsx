@@ -1,6 +1,7 @@
 import { memo, useCallback, useEffect, useRef, useState } from "react";
 import {
   Bot,
+  Check,
   CheckCircle2,
   ChevronRight,
   CircleStop,
@@ -31,7 +32,7 @@ type Bootstrap = {
   workspace: string;
   active_session_id: string | null;
   sessions: SessionSummary[];
-  settings: { model: string; base_url: string; context_limit: number; approval_mode: string; auto_plan: "off" | "adaptive" | "always" };
+  settings: { model: string; base_url: string; context_limit: number; approval_mode: string; auto_plan: "off" | "adaptive" | "always"; auto_plan_llm: boolean };
 };
 type FileEntry = { name: string; path: string; kind: "file" | "directory"; size: number | null };
 type Skill = { id: string; name: string; description: string; version: string; source: string };
@@ -63,6 +64,7 @@ const sessionRefreshEvents = new Set([
   "plan.cancelled",
   "plan.submitted",
   "plan.updated",
+  "plan.step.finished",
   "auto.plan.started",
   "run.finished",
   "session.start",
@@ -301,17 +303,43 @@ const Timeline = memo(function Timeline({ session, isRunning, pendingApprovalId,
     "model.error",
     "model.stream.progress",
     "model.stream.retry",
+    "model.stream.reasoning.recovery",
+    "model.reasoning.protocol.recovery",
+    "auto.plan.review.started",
+    "auto.plan.review.completed",
+    "auto.plan.review.failed",
     "approval.review.started",
     "approval.review.completed",
     "approval.review.failed",
   ].includes(event.type));
   let workingLabel = "Model is working";
   if (latestModelActivity?.type === "model.stream.progress") {
-    const chunks = numberValue(latestModelActivity.payload.chunk_count);
+    const elapsed = numberValue(latestModelActivity.payload.elapsed_seconds);
+    const contentChars = numberValue(latestModelActivity.payload.content_chars);
+    const reasoningChars = numberValue(latestModelActivity.payload.reasoning_chars);
     const toolChars = numberValue(latestModelActivity.payload.tool_argument_chars);
-    workingLabel = latestModelActivity.payload.completed === true
-      ? "Finishing streamed model response"
-      : `Receiving model response${chunks !== null ? ` · ${chunks.toLocaleString()} chunks` : ""}${toolChars !== null && toolChars > 0 ? ` · ${toolChars.toLocaleString()} tool characters` : ""}`;
+    const elapsedLabel = elapsed !== null ? ` · ${formatElapsed(elapsed)}` : "";
+    if (latestModelActivity.payload.completed === true) {
+      workingLabel = "Finishing streamed model response";
+    } else if (toolChars !== null && toolChars > 0) {
+      workingLabel = `Receiving tool request · ${toolChars.toLocaleString()} characters${elapsedLabel}`;
+    } else if (contentChars !== null && contentChars > 0) {
+      workingLabel = `Receiving answer · ${contentChars.toLocaleString()} characters${elapsedLabel}`;
+    } else if (reasoningChars !== null && reasoningChars > 0) {
+      workingLabel = `Model is reasoning${elapsedLabel}`;
+    } else {
+      workingLabel = `Waiting for model output${elapsedLabel}`;
+    }
+  } else if (latestModelActivity?.type === "model.stream.reasoning.recovery") {
+    workingLabel = "Hidden reasoning stalled · retrying this request directly";
+  } else if (latestModelActivity?.type === "model.reasoning.protocol.recovery") {
+    workingLabel = "Provider reasoning state was not replayable · retrying this request directly";
+  } else if (latestModelActivity?.type === "auto.plan.review.started") {
+    workingLabel = "Evaluating whether Plan Mode is needed";
+  } else if (latestModelActivity?.type === "auto.plan.review.completed") {
+    workingLabel = "Plan Mode evaluation completed";
+  } else if (latestModelActivity?.type === "auto.plan.review.failed") {
+    workingLabel = "Plan Mode evaluation unavailable · continuing safely";
   } else if (latestModelActivity?.type === "model.stream.retry") {
     workingLabel = `Retrying model stream · attempt ${textValue(latestModelActivity.payload.attempt)}/${textValue(latestModelActivity.payload.max_attempts)}`;
   } else if (latestModelActivity?.type === "approval.review.started") {
@@ -480,7 +508,7 @@ const Composer = memo(function Composer({ disabled, isRunning, mode, setMode, pl
         <div className="composer-controls">
           <span className="composer-settings-icon" title="Request settings"><Settings2 size={13} /></span>
           <label className={`composer-control ${mode === "planning" ? "plan" : ""}`} title="Workflow mode">{mode === "planning" ? <ListChecks size={13} /> : <Hammer size={13} />}<select aria-label="Workflow mode" value={mode} disabled={planReady} onChange={(event) => setMode(event.target.value as "execute" | "planning")}><option value="execute">Execute</option><option value="planning">{planReady ? "Plan ready" : "Plan"}</option></select></label>
-          <label className="composer-control" title="Automatic planning"><RefreshCw size={13} /><select aria-label="Automatic planning" value={autoPlan} onChange={(event) => setAutoPlan(event.target.value as "off" | "adaptive" | "always")}><option value="adaptive">Adaptive plan</option><option value="always">Plan first</option><option value="off">No auto plan</option></select></label>
+          <label className="composer-control" title={settings.auto_plan_llm ? "Automatic planning · Adaptive uses an isolated LLM classifier" : "Automatic planning · LLM classifier disabled"}><RefreshCw size={13} /><select aria-label="Automatic planning" value={autoPlan} onChange={(event) => setAutoPlan(event.target.value as "off" | "adaptive" | "always")}><option value="adaptive">Adaptive plan</option><option value="always">Plan first</option><option value="off">No auto plan</option></select></label>
           <label className="composer-control" title="Approval mode"><ShieldAlert size={13} /><select aria-label="Approval mode" value={approvalMode} onChange={(event) => setApprovalMode(event.target.value)}><option value="safe-auto">Safe auto</option><option value="llm-auto">LLM auto</option><option value="always-ask">Always ask</option><option value="allow-all">Allow all</option></select></label>
           <label className="composer-control" title="Global Skill"><Sparkles size={13} /><select aria-label="Global Skill" value={selectedSkill} onChange={(event) => setSelectedSkill(event.target.value)}><option value="">No skill</option>{skills.filter((skill) => skill.source === "global").map((skill) => <option key={skill.id} value={skill.id}>{skill.name}</option>)}</select></label>
         </div>
@@ -502,6 +530,13 @@ function textValue(value: unknown): string {
 
 function numberValue(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function formatElapsed(seconds: number): string {
+  if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 1 : 0)}s`;
+  const minutes = Math.floor(seconds / 60);
+  const remainder = Math.floor(seconds % 60);
+  return `${minutes}m ${remainder.toString().padStart(2, "0")}s`;
 }
 
 function recordValue(value: unknown): Record<string, unknown> {
@@ -637,7 +672,15 @@ function presentEvent(event: AgentEvent, pendingApprovalId: string | null): Even
     case "approval.review.completed":
       return { title: "Approval review complete", summary: `${humanize(textValue(payload.recommendation) || "reviewed")} · ${humanize(tool || "tool request")}`, detail: [textValue(payload.risk) ? `${textValue(payload.risk)} risk` : "", numberValue(payload.duration_seconds) !== null ? `${numberValue(payload.duration_seconds)!.toFixed(1)}s` : ""].filter(Boolean).join(" · ") };
     case "approval.review.failed":
-      return { title: "Approval review unavailable", summary: `Falling back to human approval for ${humanize(tool || "tool request")}`, detail: numberValue(payload.duration_seconds) !== null ? `${numberValue(payload.duration_seconds)!.toFixed(1)}s` : "" };
+      return {
+        title: "Approval review unavailable",
+        summary: `Falling back to human approval for ${humanize(tool || "tool request")}`,
+        detail: [
+          textValue(payload.error_type) ? humanize(textValue(payload.error_type)) : "",
+          textValue(payload.stage) ? `during ${humanize(textValue(payload.stage))}` : "",
+          numberValue(payload.duration_seconds) !== null ? `${numberValue(payload.duration_seconds)!.toFixed(1)}s` : "",
+        ].filter(Boolean).join(" · "),
+      };
     case "reasoning": {
       const nextAction = recordValue(payload.next_action);
       const nextTool = textValue(nextAction.tool_name) || textValue(nextAction.tool);
@@ -652,6 +695,30 @@ function presentEvent(event: AgentEvent, pendingApprovalId: string | null): Even
       return { title: "Assessment", summary, detail: stringList(payload.changes).length ? `changes: ${stringList(payload.changes).join(", ")}` : "" };
     case "auto.plan.started":
       return { title: "Automatic planning", summary: "Entered read-only Plan Mode", detail: clipped(textValue(payload.reason)) };
+    case "auto.plan.review.started":
+      return {
+        title: "Adaptive Plan evaluation",
+        summary: "Classifying the task before the coding agent starts",
+        detail: payload.workspace_empty === true ? "Empty workspace" : `${numberValue(payload.sampled_files) ?? 0} sampled files`,
+      };
+    case "auto.plan.review.completed":
+      return {
+        title: "Adaptive Plan evaluation",
+        summary: `${humanize(textValue(payload.decision) || "reviewed")} · ${clipped(textValue(payload.reason), 300)}`,
+        detail: [
+          numberValue(payload.confidence) !== null ? `${Math.round(numberValue(payload.confidence)! * 100)}% confidence` : "",
+          payload.applied === true ? "Plan Mode selected" : "Execute Mode selected",
+          numberValue(payload.input_tokens) !== null ? `${numberValue(payload.input_tokens)!.toLocaleString()} input tokens` : "",
+          numberValue(payload.output_tokens) !== null ? `${numberValue(payload.output_tokens)!.toLocaleString()} output tokens` : "",
+          numberValue(payload.duration_seconds) !== null ? `${numberValue(payload.duration_seconds)!.toFixed(1)}s` : "",
+        ].filter(Boolean).join(" · "),
+      };
+    case "auto.plan.review.failed":
+      return {
+        title: "Adaptive Plan evaluation unavailable",
+        summary: "Continuing in Execute Mode; the main agent may still request planning",
+        detail: clipped(textValue(payload.reason)),
+      };
     case "verification.result": {
       const check = textValue(payload.check_id) || "verification";
       const reasons = stringList(payload.reasons);
@@ -687,6 +754,21 @@ function presentEvent(event: AgentEvent, pendingApprovalId: string | null): Even
         title: "Retrying model stream",
         summary: `${humanize(textValue(payload.error_type) || "stream interrupted")} · attempt ${textValue(payload.attempt)}/${textValue(payload.max_attempts)}`,
         detail: numberValue(payload.delay_seconds) !== null ? `Retrying in ${numberValue(payload.delay_seconds)} seconds` : "",
+      };
+    case "model.stream.reasoning.recovery":
+      return {
+        title: "Recovering stalled reasoning",
+        summary: "Retrying this request without thinking; the next turn restarts thinking context",
+        detail: [
+          numberValue(payload.elapsed_seconds) !== null ? formatElapsed(numberValue(payload.elapsed_seconds)!) : "",
+          numberValue(payload.reasoning_chars) !== null ? `${numberValue(payload.reasoning_chars)!.toLocaleString()} hidden reasoning characters discarded` : "",
+        ].filter(Boolean).join(" · "),
+      };
+    case "model.reasoning.protocol.recovery":
+      return {
+        title: "Recovering provider reasoning protocol",
+        summary: "Retrying this request without thinking; the next turn restarts thinking context",
+        detail: humanize(textValue(payload.error_type)),
       };
     case "model.stream.usage.unavailable":
       return {
@@ -752,8 +834,8 @@ const PlanResultCard = memo(function PlanResultCard({ session, invoke, refresh }
       <b>rev {plan.workspace_revision}</b>
     </div>
     <ol className="conversation-plan-steps">
-      {(plan.steps || []).map((step: any, index: number) => <li key={step.step_id}>
-        <b>{index + 1}</b>
+      {(plan.steps || []).map((step: any, index: number) => <li className={step.status} key={step.step_id}>
+        <PlanStepMarker index={index} status={step.status} />
         <div><strong>{step.title}</strong><small>{humanize(step.operation)} · {step.risk} risk{step.target_files?.length ? ` · ${step.target_files.join(", ")}` : ""}</small></div>
       </li>)}
     </ol>
@@ -766,12 +848,18 @@ const PlanResultCard = memo(function PlanResultCard({ session, invoke, refresh }
   </article>;
 });
 
+function PlanStepMarker({ index, status }: { index: number; status: string }) {
+  return <b aria-label={status === "completed" ? `Step ${index + 1} completed` : `Step ${index + 1}: ${status}`}>
+    {status === "completed" ? <Check size={13} strokeWidth={3} /> : index + 1}
+  </b>;
+}
+
 function Inspector({ session, fileView, diffView, refreshDiff, mode, invoke, refresh }: any) {
   const [tab, setTab] = useState<"plan" | "file" | "diff">("plan");
   const plan = session?.plan;
   return <><div className="tabs"><button className={tab === "plan" ? "active" : ""} onClick={() => setTab("plan")}>Plan</button><button className={tab === "file" ? "active" : ""} onClick={() => setTab("file")}>File</button><button className={tab === "diff" ? "active" : ""} onClick={() => { setTab("diff"); void refreshDiff(); }}>Diff</button></div>
     <div className="inspector-content">
-      {tab === "plan" && <>{!plan ? <div className="muted-card"><ListChecks size={20} /><p>{mode === "planning" ? "Plan Mode is active. Submit a task to begin read-only inspection." : "No plan artifact for this session."}</p></div> : <div className="plan-card"><div className="plan-status"><strong>{plan.goal}</strong><span>{plan.status}</span></div>{plan.steps?.map((step: any, index: number) => <div className={`plan-step ${step.status}`} key={step.step_id}><b>{index + 1}</b><div><strong>{step.title}</strong><small>{step.operation} · {step.risk}</small></div></div>)}{plan.status === "ready" || plan.status === "stale" ? <PlanControls sessionId={session.session_id} invoke={invoke} refresh={refresh} /> : null}</div>}
+      {tab === "plan" && <>{!plan ? <div className="muted-card"><ListChecks size={20} /><p>{mode === "planning" ? "Plan Mode is active. Submit a task to begin read-only inspection." : "No plan artifact for this session."}</p></div> : <div className="plan-card"><div className="plan-status"><strong>{plan.goal}</strong><span>{plan.status}</span></div>{plan.steps?.map((step: any, index: number) => <div className={`plan-step ${step.status}`} key={step.step_id}><PlanStepMarker index={index} status={step.status} /><div><strong>{step.title}</strong><small>{step.operation} · {step.risk}</small></div></div>)}{plan.status === "ready" || plan.status === "stale" ? <PlanControls sessionId={session.session_id} invoke={invoke} refresh={refresh} /> : null}</div>}
         <h3>Verification</h3>{Object.entries(session?.verification || {}).length === 0 ? <p className="subtle">No verification results yet.</p> : Object.entries(session.verification).map(([id, value]: any) => <div className="verification" key={id}><CheckCircle2 size={15} /><span><strong>{id}</strong><small>{value.status}</small></span></div>)}</>}
       {tab === "file" && (!fileView ? <div className="muted-card"><Files size={20} /><p>Select a workspace file to inspect its current snapshot.</p></div> : <><div className="file-title"><FileCode2 size={15} /><strong>{fileView.path}</strong><span>{fileView.snapshot_tag}</span></div><pre className="code-view">{fileView.content.split("\n").map((line: string, index: number) => <div key={index}><i>{fileView.start_line + index}</i><code>{line || " "}</code></div>)}</pre></>)}
       {tab === "diff" && <>{!diffView.trim() ? <div className="muted-card"><GitBranch size={20} /><p>The workspace has no tracked changes.</p></div> : <pre className="diff-view">{diffView}</pre>}</>}
