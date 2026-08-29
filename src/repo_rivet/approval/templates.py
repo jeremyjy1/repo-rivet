@@ -31,6 +31,9 @@ class DeterministicApprovalTemplates:
         if facts.touches_sensitive_paths or facts.delete_paths:
             return None
 
+        match = self._reporivet_skill_cli(request)
+        if match is not None:
+            return match
         match = self._bounded_build(request)
         if match is not None:
             return match
@@ -44,6 +47,40 @@ class DeterministicApprovalTemplates:
         if match is not None:
             return match
         return self._managed_generation(request)
+
+    @staticmethod
+    def _reporivet_skill_cli(request: ApprovalRequest) -> TemplateMatch | None:
+        facts = request.facts
+        if "reporivet_skill_cli" not in facts.constraints:
+            return None
+        if request.tool_name not in {"run_command", "run_verification"}:
+            return None
+        if facts.analysis_level != AnalysisLevel.EXACT:
+            return None
+        if facts.executable_origin != ExecutableOrigin.TRUSTED_TOOLCHAIN:
+            return None
+        if facts.operation_class in {OperationClass.READ, OperationClass.STATIC_CHECK}:
+            if facts.write_paths or facts.effect_scope not in {
+                EffectScope.NONE,
+                EffectScope.WORKSPACE,
+            }:
+                return None
+            return TemplateMatch(
+                name="reporivet_skill_inspection",
+                reason="trusted RepoRivet CLI performs a bounded Skill read or validation",
+                constraints=sorted(facts.constraints),
+            )
+        if facts.operation_class != OperationClass.GENERATE:
+            return None
+        if not facts.write_paths or facts.effect_scope != EffectScope.WORKSPACE:
+            return None
+        if set(facts.output_provenance.values()) != {ArtifactProvenance.NEW}:
+            return None
+        return TemplateMatch(
+            name="reporivet_skill_generation",
+            reason="trusted RepoRivet CLI creates one new Skill draft inside the workspace",
+            constraints=sorted(facts.constraints),
+        )
 
     @staticmethod
     def _bounded_build(request: ApprovalRequest) -> TemplateMatch | None:

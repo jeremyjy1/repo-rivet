@@ -51,6 +51,11 @@ class SessionState:
     verification_plan: VerificationPlan | None = None
     verification_results: dict[str, VerificationResult] = field(default_factory=dict)
     verification_plan_recovery_attempts: int = 0
+    verification_plan_revision_required: bool = False
+    verification_plan_revision_reason: str | None = None
+    verification_plan_revision_guidance: str | None = None
+    verification_plan_revision_attempts: int = 0
+    skill_completion_recovery_attempts: int = 0
     candidate_final_assessment: FinalAssessment | None = None
     consecutive_failures: int = 0
     repeated_tool_calls: int = 0
@@ -206,6 +211,12 @@ class SessionState:
             f"Modified files: {modified}.\n"
             f"Workspace revision: {self.workspace_revision}.\n"
             f"Verification checks: {verification}.\n"
+            "Verification plan revision required: "
+            f"{self.verification_plan_revision_required}"
+            f" ({self.verification_plan_revision_reason or 'none'}).\n"
+            "Recovery attempts: "
+            f"verification-plan={self.verification_plan_revision_attempts}, "
+            f"skill-completion={self.skill_completion_recovery_attempts}.\n"
             f"One-shot pending decision: {pending_decision}.\n"
             f"Recent errors: {errors}."
         )

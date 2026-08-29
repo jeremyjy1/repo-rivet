@@ -86,6 +86,52 @@ def passed_verification_result(*, check_id: str = "tests", revision: int = 1) ->
     )
 
 
+def inconclusive_verification_result(
+    *, check_id: str = "script_syntax", revision: int = 0
+) -> ToolResult:
+    now = datetime.now(UTC).isoformat()
+    return ToolResult(
+        ok=True,
+        output="Command finished with exit code 0.",
+        metadata={
+            "exit_code": 0,
+            "verification_result": {
+                "check_id": check_id,
+                "status": "inconclusive",
+                "workspace_revision": revision,
+                "exit_code": 0,
+                "reasons": ["custom check has no output or artifact oracle"],
+                "started_at": now,
+                "finished_at": now,
+            },
+        },
+    )
+
+
+def script_syntax_plan(call_id: str, *, deterministic_oracle: bool) -> ToolCall:
+    criteria: dict[str, object] = {"expected_exit_codes": [0]}
+    if deterministic_oracle:
+        criteria["stdout_exact"] = "ok"
+    return call(
+        call_id,
+        "register_verification",
+        {
+            "requirements": ["script_syntax"],
+            "checks": [
+                {
+                    "check_id": "script_syntax",
+                    "title": "Check shell script syntax",
+                    "kind": "custom",
+                    "command": {"program": "bash", "args": ["-n", "script.sh"]},
+                    "criteria": criteria,
+                    "required": True,
+                    "provenance": "model",
+                }
+            ],
+        },
+    )
+
+
 def controller(
     model: FakeModelClient,
     tools: FakeToolRegistry,
@@ -366,6 +412,100 @@ def test_started_verification_runs_remaining_required_checks_without_model_round
         and data.get("requested_by") == "model"
         for event_type, data in event_logger.events
     )
+
+
+def test_inconclusive_verification_requires_direct_complete_plan_revision() -> None:
+    first_check = call("run-1", "run_verification", {"check_id": "script_syntax"})
+    second_check = call("run-2", "run_verification", {"check_id": "script_syntax"})
+    model = FakeModelClient(
+        [
+            ModelResponse(tool_calls=[script_syntax_plan("plan-1", deterministic_oracle=False)]),
+            ModelResponse(tool_calls=[first_check]),
+            ModelResponse(tool_calls=[decision("unneeded-decision", "register_verification")]),
+            ModelResponse(tool_calls=[script_syntax_plan("plan-2", deterministic_oracle=True)]),
+            ModelResponse(tool_calls=[second_check]),
+            ModelResponse(content="Shell script syntax is valid."),
+        ]
+    )
+    tools = FakeToolRegistry(
+        [
+            inconclusive_verification_result(),
+            passed_verification_result(check_id="script_syntax", revision=0),
+        ]
+    )
+    memory = MemoryState(session_id="inconclusive-verification-recovery")
+
+    result = controller(model, tools).run("validate the scripts", memory=memory)
+
+    assert result.status == "success"
+    assert [executed.name for executed in tools.calls] == [
+        "run_verification",
+        "run_verification",
+    ]
+    rejected_decision = next(
+        message
+        for message in memory.messages
+        if message.role == "tool" and message.tool_call_id == "unneeded-decision"
+    )
+    assert "verification_plan_revision_required" in (rejected_decision.content or "")
+    revision_request = model.requests[2]["messages"]
+    assert any(
+        "does not require record_decision" in str(message.get("content"))
+        for message in revision_request
+    )
+    assert memory.verification_plan_revision_required is False
+    assert memory.verification_plan_revision_reason is None
+
+
+def test_automatic_inconclusive_verification_enters_plan_revision_recovery() -> None:
+    model = FakeModelClient(
+        [
+            ModelResponse(tool_calls=[script_syntax_plan("plan-1", deterministic_oracle=False)]),
+            ModelResponse(content="The scripts are ready."),
+            ModelResponse(tool_calls=[script_syntax_plan("plan-2", deterministic_oracle=True)]),
+            ModelResponse(content="The scripts are ready."),
+        ]
+    )
+    tools = FakeToolRegistry(
+        [
+            inconclusive_verification_result(),
+            passed_verification_result(check_id="script_syntax", revision=0),
+        ]
+    )
+    memory = MemoryState(session_id="automatic-inconclusive-verification-recovery")
+
+    result = controller(model, tools).run("validate the scripts", memory=memory)
+
+    assert result.status == "success"
+    assert len(model.requests) == 4
+    assert [executed.arguments["check_id"] for executed in tools.calls] == [
+        "script_syntax",
+        "script_syntax",
+    ]
+    assert any(
+        "verification_plan_revision_required" in str(message.get("content"))
+        for message in model.requests[2]["messages"]
+    )
+    assert memory.verification_plan_revision_required is False
+
+
+def test_verification_plan_revision_recovery_is_bounded_for_repeated_final_text() -> None:
+    model = FakeModelClient(
+        [ModelResponse(content="Already done.") for _item in range(3)]
+    )
+    memory = MemoryState(session_id="bounded-verification-plan-revision")
+    memory.verification_plan_revision_required = True
+    memory.verification_plan_revision_reason = "behavior verification kind is missing"
+    memory.verification_plan_revision_guidance = (
+        "Call register_verification with a complete replacement plan."
+    )
+
+    result = controller(model, FakeToolRegistry([])).run("continue", memory=memory)
+
+    assert result.status == "incomplete"
+    assert result.reason is not None
+    assert "revision was not provided after 3 recovery attempts" in result.reason
+    assert len(model.requests) == 3
 
 
 def test_verification_pass_on_final_model_step_finishes_instead_of_stopping() -> None:

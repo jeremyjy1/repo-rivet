@@ -29,6 +29,10 @@ RepoRivet 是一个本地优先的单智能体编程工具。它使用模型原�
 
 Plan Mode 是 Controller 强制执行的只读规划工作流，而不是审批模式。使用 `reporivet plan <task>`，或在对话中输入 `:plan`、`/approval plan` 进入；后者是工作流快捷入口，不会把 `plan` 加入审批策略枚举。规划阶段只暴露项目浏览、搜索、Git 检查和结构化计划工具，写文件、运行命令与验证会被本地拒绝。计划会保存目标、证据、步骤、风险、验证要求、工作区修订和文件快照，经过本地验证后等待用户选择执行、修改、继续检查或取消。批准计划只切换到执行阶段，不会绕过任何工具审批。对话中使用 `:execute`、`:revise`、`:inspect` 和 `:cancel` 管理该流程。
 
+Skill 是可复用、可版本化的声明式任务策略，不是可执行插件，也不会授予权限。RepoRivet 将 Skill 分为两层：随程序发布的系统 Skill 会在每个运行时按稳定顺序全部加载，但只在当前任务符合其目标或触发条件时提供指导，不收窄工具、也不强制任务级完成条件；用户安装在 `~/.reporivet/skills/<id>/SKILL.md` 的全局 Skill 对所有工作区可见，可为某个会话显式选择，并进一步收窄当前模式和全局策略已经允许的工具。所有实际调用仍经过参数验证、审批、路径策略与执行器，选中的全局 Skill 固定编辑前和完成条件由 Controller 本地判断。使用 `reporivet skill list/show/install/uninstall/use/clear` 管理系统与全局 Skill；`skill install --replace` 显式更新同 ID 的全局 Skill。运行时可传入 `--skill ID`、`--no-skills`，其中 `--no-skills` 只禁用会话选择的全局 Skill，系统 Skill 始终加载；对话中支持 `:skills`、`:skill current/show/use/clear`。选中的全局 Skill 会被会话和 Plan Artifact 固定 ID、版本与内容哈希，内容变化后必须重新选择，旧计划会变为 stale。
+
+Skill 创作采用确定性工具链：`reporivet skill init ID` 在 `reporivet-skills/` 生成不会覆盖现有文件的原生草稿，`skill validate PATH` 检查完整 Schema、正文预算、工具名和固定条件，`skill convert SOURCE` 将原生、Codex 风格、Claude 风格或普通 Markdown 安全转换并报告被删除字段和无法映射的工具，`skill install PATH` 在再次校验后安装到用户全局目录且拒绝隐式覆盖，更新必须显式使用 `--replace`。转换永远剥离 Hook、脚本、回调、动态代码和未知权限声明；安装、更新和卸载只能由用户显式执行。系统 `skill-authoring` 可指导 Agent 在工作区设计或转换草稿，但不能自行安装。首版仍只支持一个会话选中的全局 Skill，不支持自动路由、项目 Skill、远程市场、依赖解析、Verification Profile 转换或可执行 Hook；系统 Skill 还包括 `repository-onboarding` 和 `test-failure-fix`。
+
 CLI 默认省略工具请求 ID、步骤号、安全低风险审批和常规自动放行；重要审批单独显示一行，耗时命令保留运行提示，实际执行的工具各用一行显示最终成功、失败、退出码和耗时。状态行不显示文件内容、完整命令参数或原始输出，完整结构化事件仍写入会话的 `events.jsonl`。模型最终回答默认使用简洁纯文本；只有用户明确要求 Markdown，或内容确实需要相应结构时才使用 Markdown。
 
 安全边界：审批位于 Tool Registry 与本地执行器之间。所有工具声明能力，路径和命令先规范化并评估风险；工作区外写入、软链接逃逸、提权、设备与凭据访问由硬规则拒绝，任何审批模式均不能绕过。批准后会立即重新解析路径和指纹再执行。命令不经过 shell；普通 subprocess 不是完整操作系统沙箱，请仅在可信项目中运行。

@@ -79,6 +79,8 @@ class PlanRuntime:
             affected_files=affected_files,
             workspace_revision=memory.workspace_revision,
             snapshots=snapshots,
+            system_skills=list(memory.system_skills),
+            skill=memory.active_skill,
         )
         memory.plan_artifact = artifact
         memory.workflow_mode = WorkflowMode.PLAN_READY
@@ -118,6 +120,10 @@ class PlanRuntime:
         memory = self._memory()
         value = artifact or self._require_plan()
         reasons: list[str] = []
+        if value.system_skills != memory.system_skills:
+            reasons.append("system Skills changed after planning")
+        if value.skill != memory.active_skill:
+            reasons.append("global Skill changed after planning")
         expected_revision = (
             value.execution_workspace_revision
             if value.status == PlanStatus.EXECUTING

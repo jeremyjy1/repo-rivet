@@ -123,6 +123,15 @@ def test_run_parser_accepts_workspace_config_and_task(tmp_path: Path) -> None:
     assert arguments.task == ["fix", "the", "bug"]
 
 
+def test_runtime_parser_accepts_explicit_skill_and_no_skills() -> None:
+    selected = build_parser().parse_args(["run", "--skill", "test-failure-fix", "fix"])
+    disabled = build_parser().parse_args(["chat", "--no-skills"])
+
+    assert selected.skill == "test-failure-fix"
+    assert not selected.no_skills
+    assert disabled.no_skills
+
+
 def test_cli_reports_missing_config_without_calling_model(tmp_path: Path) -> None:
     buffer = StringIO()
     console = Console(file=buffer, force_terminal=False, color_system=None)

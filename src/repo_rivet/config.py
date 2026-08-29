@@ -143,6 +143,15 @@ class ApprovalConfig(BaseModel):
     toolchains: ApprovalToolchainConfig = Field(default_factory=ApprovalToolchainConfig)
 
 
+class SkillsConfig(BaseModel):
+    """User-global Skill activation; packaged system Skills are always loaded."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    global_enabled: bool = True
+    default_global: str | None = Field(default=None, min_length=2, max_length=64)
+
+
 class AppConfig(BaseModel):
     """Top-level RepoRivet configuration."""
 
@@ -152,6 +161,7 @@ class AppConfig(BaseModel):
     token: TokenConfig = Field(default_factory=TokenConfig)
     approval: ApprovalConfig = Field(default_factory=ApprovalConfig)
     reasoning: ReasoningConfig = Field(default_factory=ReasoningConfig)
+    skills: SkillsConfig = Field(default_factory=SkillsConfig)
 
     @model_validator(mode="after")
     def validate_prompt_budget(self) -> "AppConfig":

@@ -45,6 +45,16 @@ from repo_rivet.session.errors import SessionError
 from repo_rivet.session.lock import SessionLock
 from repo_rivet.session.models import SessionMetadata, SessionStatus
 from repo_rivet.session.store import FileSessionStore, LoadedSession
+from repo_rivet.skills.authoring import (
+    convert_skill,
+    create_skill,
+    install_skill,
+    uninstall_skill,
+    validate_skill,
+)
+from repo_rivet.skills.models import SkillActivation
+from repo_rivet.skills.registry import SkillRegistry
+from repo_rivet.skills.runtime import SkillRuntime
 from repo_rivet.storage.console_reporter import ConsoleEventReporter
 from repo_rivet.storage.event_sink import CompositeEventSink, EventSink
 from repo_rivet.storage.terminal_text import escape_terminal_controls
@@ -100,6 +110,7 @@ class Runtime:
     controller: AgentController
     session_manager: FileSessionStore
     session_lock: SessionLock
+    skill_runtime: SkillRuntime
     loaded_existing_session: bool = False
 
     def close(self) -> None:
@@ -181,6 +192,68 @@ def build_parser() -> argparse.ArgumentParser:
 
     repair_parser = session_commands.add_parser("repair", help="Repair an interrupted session")
     repair_parser.add_argument("session_id")
+
+    skill_parser = subparsers.add_parser("skill", help="Manage declarative task skills")
+    skill_commands = skill_parser.add_subparsers(dest="skill_command", required=True)
+    skill_commands.add_parser("list", help="List available skill metadata")
+    skill_show = skill_commands.add_parser("show", help="Show one skill manifest and body")
+    skill_show.add_argument("skill_id")
+    skill_use = skill_commands.add_parser(
+        "use", help="Select an installed global Skill for the current session"
+    )
+    skill_use.add_argument("skill_id")
+    skill_use.add_argument("--workspace", type=Path, default=Path.cwd())
+    skill_clear = skill_commands.add_parser(
+        "clear", help="Clear the selected global Skill from the current session"
+    )
+    skill_clear.add_argument("--workspace", type=Path, default=Path.cwd())
+    skill_init = skill_commands.add_parser("init", help="Generate a native Skill draft")
+    skill_init.add_argument("skill_id")
+    skill_init.add_argument("--name")
+    skill_init.add_argument("--summary")
+    skill_init.add_argument("--output", type=Path, default=Path("reporivet-skills"))
+    skill_init.add_argument("--tool", action="append", dest="tools")
+    skill_init.add_argument("--mode", action="append", choices=["plan", "execute"])
+    skill_init.add_argument(
+        "--before-edit",
+        action="append",
+        choices=["target_snapshot_current", "target_range_seen", "plan_approved"],
+    )
+    skill_init.add_argument(
+        "--before-finish",
+        action="append",
+        choices=[
+            "no_active_processes",
+            "required_build_passed",
+            "required_tests_passed",
+            "required_behavior_checks_passed",
+            "no_stale_verification",
+            "git_diff_reviewed",
+        ],
+    )
+    skill_validate = skill_commands.add_parser(
+        "validate", help="Validate a native Skill without installing it"
+    )
+    skill_validate.add_argument("path", type=Path)
+    skill_convert = skill_commands.add_parser(
+        "convert", help="Safely convert a Markdown Skill to RepoRivet format"
+    )
+    skill_convert.add_argument("source", type=Path)
+    skill_convert.add_argument("--id", dest="skill_id")
+    skill_convert.add_argument("--name")
+    skill_convert.add_argument("--summary")
+    skill_convert.add_argument("--output", type=Path, default=Path("reporivet-skills"))
+    skill_install = skill_commands.add_parser(
+        "install", help="Install a validated Skill into the user-global scope"
+    )
+    skill_install.add_argument("source", type=Path)
+    skill_install.add_argument(
+        "--replace", action="store_true", help="Replace the same installed global Skill ID"
+    )
+    skill_uninstall = skill_commands.add_parser(
+        "uninstall", help="Remove one installed global Skill"
+    )
+    skill_uninstall.add_argument("skill_id")
     return parser
 
 
@@ -214,6 +287,13 @@ def _add_model_runtime_arguments(parser: argparse.ArgumentParser) -> None:
         choices=[mode.value for mode in ApprovalMode],
         help="Override the configured tool approval mode",
     )
+    skill_group = parser.add_mutually_exclusive_group()
+    skill_group.add_argument("--skill", help="Select one installed global Skill ID")
+    skill_group.add_argument(
+        "--no-skills",
+        action="store_true",
+        help="Run without a selected global Skill; system Skills remain loaded",
+    )
 
 
 def cli(
@@ -240,6 +320,8 @@ def cli(
         return _run_plan(arguments, output, reader, approval_prompt_reader=prompt_reader)
     if arguments.command == "session":
         return _session_command(arguments, output, prompt_reader=prompt_reader)
+    if arguments.command == "skill":
+        return _skill_command(arguments, output)
     output.print("[red]Unknown command.[/red]")
     return 2
 
@@ -317,6 +399,7 @@ def _run_plan(
             )
             if choice == "e":
                 try:
+                    runtime.skill_runtime.restore(runtime.memory)
                     plan_runtime.approve()
                 except ValueError as error:
                     runtime.store.save_state(runtime.memory, status=SessionStatus.PLAN_READY.value)
@@ -397,6 +480,7 @@ def _chat_agent(
             memory_store=runtime.store,
             approval_engine=runtime.registry.approval_engine,
             plan_runtime=runtime.registry.plan_runtime,
+            skill_runtime=runtime.skill_runtime,
             show_history_on_start=runtime.loaded_existing_session,
         )
         idle_status = _idle_session_status(runtime.memory)
@@ -492,6 +576,199 @@ def _session_command(
     return 2
 
 
+def _skill_command(arguments: argparse.Namespace, console: Console) -> int:
+    manager = FileSessionStore()
+    registry = _create_skill_registry(manager)
+    try:
+        if arguments.skill_command == "list":
+            _print_skill_list(console, registry)
+            return 0
+        if arguments.skill_command == "show":
+            _print_skill(console, registry, arguments.skill_id)
+            return 0
+        known_tools = set(create_default_registry(Path.cwd()).names)
+        if arguments.skill_command == "init":
+            target = create_skill(
+                skill_id=arguments.skill_id,
+                output_root=arguments.output,
+                name=arguments.name,
+                summary=arguments.summary,
+                requested_tools=arguments.tools,
+                compatible_modes=arguments.mode,
+                before_edit=arguments.before_edit,
+                before_finish=arguments.before_finish,
+                known_tools=known_tools,
+            )
+            validate_skill(target, known_tools=known_tools)
+            console.print(f"Skill draft created and validated: {_terminal_text(str(target))}")
+            return 0
+        if arguments.skill_command == "validate":
+            report = validate_skill(arguments.path, known_tools=known_tools)
+            console.print(
+                f"Skill valid: {report.skill_id}@{report.version}\n"
+                f"Path: {_terminal_text(str(report.path))}\n"
+                f"Estimated body tokens: {report.estimated_prompt_tokens}\n"
+                f"Requested tools: {', '.join(report.requested_tools)}"
+            )
+            return 0
+        if arguments.skill_command == "convert":
+            report = convert_skill(
+                arguments.source,
+                output_root=arguments.output,
+                known_tools=known_tools,
+                skill_id=arguments.skill_id,
+                name=arguments.name,
+                summary=arguments.summary,
+            )
+            details = [
+                f"Skill converted: {_terminal_text(str(report.target))}",
+                f"Detected format: {report.source_format}",
+                f"Mapped tools: {', '.join(report.mapped_tools)}",
+            ]
+            if report.dropped_fields:
+                details.append("Dropped fields: " + ", ".join(report.dropped_fields))
+            details.extend(f"Warning: {_terminal_text(item)}" for item in report.warnings)
+            console.print("\n".join(details))
+            return 0
+        if arguments.skill_command == "install":
+            target = install_skill(
+                arguments.source,
+                global_root=manager.root / "skills",
+                known_tools=known_tools,
+                replace=arguments.replace,
+                reserved_ids={item.manifest.id for item in registry.system_skills()},
+            )
+            action = "updated" if arguments.replace else "installed"
+            console.print(
+                f"Global Skill {action} after validation: " + _terminal_text(str(target))
+            )
+            return 0
+        if arguments.skill_command == "uninstall":
+            target = uninstall_skill(
+                arguments.skill_id,
+                global_root=manager.root / "skills",
+            )
+            console.print(
+                "Global Skill uninstalled: "
+                + _terminal_text(str(target))
+                + ". Sessions pinned to it must select another global Skill."
+            )
+            return 0
+
+        workspace = arguments.workspace.expanduser().resolve()
+        metadata = manager.get_active(workspace)
+        if metadata is None:
+            raise SessionError(
+                f"No selected session for workspace {workspace}. Create or select a session first."
+            )
+        loaded = manager.load(metadata.session_id)
+        runtime = SkillRuntime(
+            registry,
+            known_tools=known_tools,
+        )
+        with manager.lock(metadata.session_id):
+            if arguments.skill_command == "use":
+                if arguments.skill_id == "auto":
+                    raise ValueError(
+                        "Automatic Skill routing is not supported in the first version; "
+                        "provide an ID"
+                    )
+                bundle = runtime.activate(loaded.memory, arguments.skill_id)
+                loaded.store.save_state(loaded.memory, status=loaded.memory.status)
+                loaded.store.log(
+                    "skill_activated",
+                    skill_id=bundle.manifest.id,
+                    version=bundle.manifest.version,
+                    content_hash=bundle.content_hash,
+                    activation=SkillActivation.EXPLICIT.value,
+                )
+                console.print(
+                    f"Global Skill for session {metadata.short_id}: "
+                    f"{bundle.manifest.id}@{bundle.manifest.version}"
+                )
+                return 0
+            if arguments.skill_command == "clear":
+                previous = (
+                    loaded.memory.active_skill.id
+                    if loaded.memory.active_skill is not None
+                    else None
+                )
+                runtime.clear(loaded.memory)
+                loaded.store.save_state(loaded.memory, status=loaded.memory.status)
+                loaded.store.log(
+                    "skill_deactivated",
+                    skill_id=previous,
+                    reason="user_cleared",
+                )
+                console.print(f"Global Skill cleared for session {metadata.short_id}.")
+                return 0
+    except (SessionError, OSError, ValueError) as error:
+        console.print(f"[bold red]Skill error:[/bold red] {error}")
+        return 2
+    console.print("[red]Unknown skill command.[/red]")
+    return 2
+
+
+def _print_skill_list(console: Console, registry: SkillRegistry) -> None:
+    skills = registry.discover(refresh=True)
+    errors = registry.discovery_errors()
+    if not skills:
+        console.print("No Skills found.")
+        for key, error in errors:
+            console.print(f"[yellow]Skipped {key}:[/yellow] {_terminal_text(error)}")
+        return
+    table = Table(title="RepoRivet Skills")
+    table.add_column("ID", no_wrap=True)
+    table.add_column("Name")
+    table.add_column("Version")
+    table.add_column("Scope")
+    table.add_column("Summary")
+    for item in skills:
+        table.add_row(
+            item.manifest.id,
+            item.manifest.name,
+            item.manifest.version,
+            item.source.value,
+            _terminal_text(item.manifest.summary),
+        )
+    console.print(table)
+    for key, error in errors:
+        console.print(f"[yellow]Skipped {key}:[/yellow] {_terminal_text(error)}")
+
+
+def _print_skill(console: Console, registry: SkillRegistry, skill_id: str) -> None:
+    bundle = registry.load(skill_id)
+    manifest = bundle.manifest
+    details = Text()
+    details.append(f"ID: {manifest.id}\n")
+    details.append(f"Name: {_terminal_text(manifest.name)}\n")
+    details.append(f"Version: {manifest.version}\n")
+    details.append(f"Source: {bundle.source.value}\n")
+    details.append(f"Modes: {', '.join(sorted(manifest.compatible_modes))}\n")
+    details.append(f"Requested tools: {', '.join(sorted(manifest.requested_tools))}\n")
+    before_edit = ", ".join(manifest.requirements.before_edit) or "none"
+    before_finish = ", ".join(manifest.requirements.before_finish) or "none"
+    details.append(f"Before edit: {before_edit}\n")
+    details.append(f"Before finish: {before_finish}\n\n")
+    details.append(_terminal_text(bundle.body))
+    console.print(Panel(details, title="Skill"))
+
+
+def _print_current_skill(console: Console, runtime: SkillRuntime) -> None:
+    system = (
+        ", ".join(
+            f"{bundle.manifest.id}@{bundle.manifest.version}" for bundle in runtime.system
+        )
+        or "none"
+    )
+    console.print(f"System Skills: {system}")
+    bundle = runtime.active
+    if bundle is None:
+        console.print("Global Skill: none")
+        return
+    console.print(f"Global Skill: {bundle.manifest.id}@{bundle.manifest.version}")
+
+
 def _session_list(
     arguments: argparse.Namespace,
     console: Console,
@@ -567,6 +844,8 @@ def _session_resume(
         max_seconds=arguments.max_seconds,
         approval_mode=arguments.approval_mode,
         reasoning=arguments.reasoning,
+        skill=arguments.skill,
+        no_skills=arguments.no_skills,
         session=metadata.session_id,
     )
     reader = prompt_reader or (lambda prompt: Prompt.ask(prompt, console=console))
@@ -632,6 +911,10 @@ def _print_session_details(
     modified = ", ".join(sorted(memory.modified_files)) or "none"
     details.append(f"Modified:  {_terminal_text(modified)}\n")
     details.append(f"Verification: {_terminal_text(memory.summary.verification_status)}")
+    if memory.active_skill is not None:
+        details.append(
+            f"\nGlobal Skill: {memory.active_skill.id}@{memory.active_skill.version}"
+        )
     if memory.plan_artifact is not None:
         details.append(f"\nPlan:      {memory.plan_artifact.status.value}")
         details.append(
@@ -757,6 +1040,55 @@ def _build_runtime(
             event_logger=runtime_events,
             initial_workspace_revision=memory.workspace_revision,
         )
+        skill_runtime = SkillRuntime(
+            _create_skill_registry(session_manager),
+            known_tools=set(registry.names),
+        )
+        previous_skill = memory.active_skill
+        requested_skill = getattr(arguments, "skill", None)
+        no_skills = bool(getattr(arguments, "no_skills", False))
+        if requested_skill == "auto":
+            raise ValueError(
+                "Automatic Skill routing is not supported in the first version; provide an ID"
+            )
+        if no_skills or not config.skills.global_enabled:
+            if requested_skill and not config.skills.global_enabled:
+                raise ValueError("Global Skills are disabled by configuration")
+            skill_runtime.clear(memory)
+        elif requested_skill:
+            skill_runtime.activate(
+                memory,
+                requested_skill,
+                activation=SkillActivation.EXPLICIT,
+            )
+        elif memory.active_skill is not None:
+            skill_runtime.restore(memory)
+        elif config.skills.default_global:
+            skill_runtime.activate(
+                memory,
+                config.skills.default_global,
+                activation=SkillActivation.CONFIG_DEFAULT,
+            )
+        system_pins = skill_runtime.sync_system(memory)
+        store.log(
+            "system_skills_loaded",
+            skills=[pin.model_dump(mode="json") for pin in system_pins],
+        )
+        if memory.active_skill != previous_skill:
+            if memory.active_skill is None:
+                store.log(
+                    "skill_deactivated",
+                    skill_id=previous_skill.id if previous_skill is not None else None,
+                    reason="runtime_disabled",
+                )
+            else:
+                store.log(
+                    "skill_activated",
+                    skill_id=memory.active_skill.id,
+                    version=memory.active_skill.version,
+                    content_hash=memory.active_skill.content_hash,
+                    activation=memory.active_skill.activation.value,
+                )
         controller = AgentController(
             model_client=OpenAICompatibleClient(config.api),
             tool_registry=registry,
@@ -765,6 +1097,7 @@ def _build_runtime(
             event_logger=runtime_events,
             memory_store=store,
             reasoning_manager=reasoning_manager,
+            skill_runtime=skill_runtime,
         )
         memory.status = SessionStatus.RUNNING.value
         store.save_state(memory, status=SessionStatus.RUNNING.value)
@@ -780,6 +1113,7 @@ def _build_runtime(
         controller=controller,
         session_manager=session_manager,
         session_lock=session_lock,
+        skill_runtime=skill_runtime,
         loaded_existing_session=loaded_existing_session,
     )
 
@@ -790,6 +1124,13 @@ def _argument_task_preview(arguments: argparse.Namespace) -> str:
     if arguments.command == "chat":
         return " ".join(arguments.initial_task).strip()
     return ""
+
+
+def _create_skill_registry(session_manager: FileSessionStore) -> SkillRegistry:
+    return SkillRegistry(
+        system_root=Path(__file__).resolve().parent / "builtin_skills",
+        global_root=session_manager.root / "skills",
+    )
 
 
 def _build_approval_engine(
@@ -889,6 +1230,16 @@ def _token_budget_config(memory_config: MemoryConfig) -> TokenBudgetConfig:
 
 
 def _print_runtime(console: Console, workspace: Path, runtime: Runtime) -> None:
+    system_skill_label = ", ".join(
+        f"{bundle.manifest.id}@{bundle.manifest.version}"
+        for bundle in runtime.skill_runtime.system
+    )
+    active_skill = runtime.skill_runtime.active
+    global_skill_label = (
+        f"{active_skill.manifest.id}@{active_skill.manifest.version}"
+        if active_skill is not None
+        else "none"
+    )
     console.print(
         Panel.fit(
             f"Workspace: {workspace.resolve()}\n"
@@ -899,6 +1250,8 @@ def _print_runtime(console: Console, workspace: Path, runtime: Runtime) -> None:
             f"Token estimator: {runtime.controller.context_manager.token_manager.name}\n"
             f"Approval mode: {runtime.registry.approval_engine.mode.value}\n"
             f"Decision trace: {runtime.controller.reasoning_manager.config.display.value}\n"
+            f"System Skills: {system_skill_label or 'none'}\n"
+            f"Global Skill: {global_skill_label}\n"
             f"Safe prompt budget: "
             f"{runtime.controller.context_manager.token_manager.config.prompt_budget} tokens\n"
             f"Session: {runtime.store.session_dir}",
@@ -917,6 +1270,7 @@ def _chat_loop(
     memory_store: MemoryStore | None = None,
     approval_engine: ApprovalModeManager | None = None,
     plan_runtime: PlanWorkflowManager | None = None,
+    skill_runtime: SkillRuntime | None = None,
     show_history_on_start: bool = False,
 ) -> int:
     if plan_runtime is not None:
@@ -951,11 +1305,79 @@ def _chat_loop(
             request = ":plan" + request[len(approval_plan_prefix) :]
         if request.startswith(":"):
             normalized = request.lower()
+            if normalized == ":skills":
+                if skill_runtime is None:
+                    console.print("Skill controls are unavailable in this runtime.")
+                else:
+                    _print_skill_list(console, skill_runtime.registry)
+                continue
+            if normalized == ":skill current":
+                if skill_runtime is None:
+                    console.print("Skill controls are unavailable in this runtime.")
+                else:
+                    _print_current_skill(console, skill_runtime)
+                continue
+            if normalized.startswith(":skill show "):
+                if skill_runtime is None:
+                    console.print("Skill controls are unavailable in this runtime.")
+                    continue
+                skill_id = request.split(maxsplit=2)[2].strip()
+                try:
+                    _print_skill(console, skill_runtime.registry, skill_id)
+                except ValueError as error:
+                    console.print(f"[bold yellow]Skill error:[/bold yellow] {error}")
+                continue
+            if normalized.startswith(":skill use "):
+                if skill_runtime is None:
+                    console.print("Skill controls are unavailable in this runtime.")
+                    continue
+                skill_id = request.split(maxsplit=2)[2].strip()
+                try:
+                    bundle = skill_runtime.activate(memory, skill_id)
+                except ValueError as error:
+                    console.print(f"[bold yellow]Skill error:[/bold yellow] {error}")
+                    continue
+                console.print(
+                    f"Global Skill: {bundle.manifest.id}@{bundle.manifest.version}. Session saved."
+                )
+                if memory_store is not None:
+                    memory_store.log(
+                        "skill_activated",
+                        skill_id=bundle.manifest.id,
+                        version=bundle.manifest.version,
+                        content_hash=bundle.content_hash,
+                        activation=SkillActivation.EXPLICIT.value,
+                    )
+                    memory_store.save_state(memory, status=_idle_session_status(memory).value)
+                continue
+            if normalized == ":skill clear":
+                if skill_runtime is None:
+                    console.print("Skill controls are unavailable in this runtime.")
+                    continue
+                previous = memory.active_skill.id if memory.active_skill is not None else None
+                skill_runtime.clear(memory)
+                console.print("Global Skill cleared. System Skills remain loaded. Session saved.")
+                if memory_store is not None:
+                    memory_store.log(
+                        "skill_deactivated",
+                        skill_id=previous,
+                        reason="user_cleared",
+                    )
+                    memory_store.save_state(memory, status=_idle_session_status(memory).value)
+                continue
+            if normalized.startswith(":skill"):
+                console.print(
+                    "Usage: :skills, :skill current, :skill show <id>, "
+                    ":skill use <id>, or :skill clear"
+                )
+                continue
             if normalized == ":execute":
                 if plan_runtime is None:
                     console.print("Plan controls are unavailable in this runtime.")
                     continue
                 try:
+                    if skill_runtime is not None:
+                        skill_runtime.restore(memory)
                     approved_plan = plan_runtime.approve()
                 except ValueError as error:
                     console.print(f"[bold yellow]Cannot execute plan:[/bold yellow] {error}")
@@ -1081,6 +1503,11 @@ def _handle_chat_command(
             ":revise   Revise the current plan using more evidence\n"
             ":inspect  Continue read-only plan inspection\n"
             ":cancel   Cancel the current plan\n"
+            ":skills   List system and installed global Skills\n"
+            ":skill current  Show loaded system and selected global Skills\n"
+            ":skill show <id>  Show a Skill\n"
+            ":skill use <id>  Select a global Skill for this session\n"
+            ":skill clear  Clear the selected global Skill\n"
             "/exit     End interactive mode"
         )
         return False, False

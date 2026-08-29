@@ -34,6 +34,12 @@ require_for_mutating_tools = true
 require_for_commands = true
 max_reflection_only_turns = 2
 
+[skills]
+# Packaged system Skills are always loaded. This switch controls user-installed global Skills.
+global_enabled = true
+# Optionally select one installed global Skill by default.
+# default_global = "my-team-workflow"
+
 [approval]
 # allow-all, llm-auto, safe-auto, or always-ask
 mode = "safe-auto"

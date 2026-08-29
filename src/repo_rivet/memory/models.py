@@ -10,6 +10,7 @@ from repo_rivet.approval.models import ApprovalMode, OperationClass
 from repo_rivet.memory.token_estimator import ApproximateTokenEstimator
 from repo_rivet.planning.models import PlanArtifact, WorkflowMode
 from repo_rivet.reasoning.models import ObservationEvent, ReasoningEvent
+from repo_rivet.skills.models import ActiveSkillPin
 from repo_rivet.tools.base import ToolCall, ToolResult
 from repo_rivet.verification.models import (
     FinalAssessment,
@@ -250,6 +251,11 @@ class MemoryState(BaseModel):
     verification_plan: VerificationPlan | None = None
     verification_results: dict[str, VerificationResult] = Field(default_factory=dict)
     verification_plan_recovery_attempts: int = Field(default=0, ge=0)
+    verification_plan_revision_required: bool = False
+    verification_plan_revision_reason: str | None = Field(default=None, max_length=1_000)
+    verification_plan_revision_guidance: str | None = Field(default=None, max_length=2_000)
+    verification_plan_revision_attempts: int = Field(default=0, ge=0)
+    skill_completion_recovery_attempts: int = Field(default=0, ge=0)
     candidate_final_assessment: FinalAssessment | None = None
     last_model_error: ModelErrorRecord | None = None
     provider_requires_reasoning_content: bool = False
@@ -266,6 +272,8 @@ class MemoryState(BaseModel):
     approval_denial_guidance: dict[str, str] = Field(default_factory=dict)
     approval_mode_override: ApprovalMode | None = None
     workflow_mode: WorkflowMode = WorkflowMode.EXECUTE
+    system_skills: list[ActiveSkillPin] = Field(default_factory=list)
+    active_skill: ActiveSkillPin | None = None
     plan_artifact: PlanArtifact | None = None
     plan_update_reason: str | None = Field(default=None, max_length=1_000)
     reasoning_events: list[ReasoningEvent] = Field(default_factory=list)
@@ -279,13 +287,34 @@ class MemoryState(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def migrate_legacy_verification_fields(cls, value: Any) -> Any:
-        """Discard command-name verification state from pre-plan session snapshots."""
+        """Migrate durable fields whose representation changed between runtime versions."""
         if not isinstance(value, dict):
             return value
         migrated = dict(value)
         migrated.pop("last_file_change_step", None)
         migrated.pop("last_verification_step", None)
         migrated.pop("last_verification_success", None)
+        active_skill = migrated.get("active_skill")
+        if isinstance(active_skill, dict):
+            source = active_skill.get("source")
+            if source == "builtin":
+                migrated["active_skill"] = None
+            elif source == "user":
+                migrated["active_skill"] = {**active_skill, "source": "global"}
+        plan_artifact = migrated.get("plan_artifact")
+        if isinstance(plan_artifact, dict):
+            plan_skill = plan_artifact.get("skill")
+            if isinstance(plan_skill, dict):
+                source = plan_skill.get("source")
+                if source == "builtin":
+                    plan_artifact = {**plan_artifact, "skill": None}
+                    migrated["plan_artifact"] = plan_artifact
+                elif source == "user":
+                    plan_artifact = {
+                        **plan_artifact,
+                        "skill": {**plan_skill, "source": "global"},
+                    }
+                    migrated["plan_artifact"] = plan_artifact
         if "workspace_revision" not in migrated and migrated.get("modified_files"):
             migrated["workspace_revision"] = 1
         return migrated
@@ -331,6 +360,11 @@ class MemoryState(BaseModel):
         self.verification_plan = None
         self.verification_results.clear()
         self.verification_plan_recovery_attempts = 0
+        self.verification_plan_revision_required = False
+        self.verification_plan_revision_reason = None
+        self.verification_plan_revision_guidance = None
+        self.verification_plan_revision_attempts = 0
+        self.skill_completion_recovery_attempts = 0
         self.candidate_final_assessment = None
         self.last_model_error = None
         self.reflection_required = False

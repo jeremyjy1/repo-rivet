@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shlex
 import shutil
 import sys
@@ -29,6 +30,20 @@ _COMPILERS = frozenset({"c++", "cc", "clang", "clang++", "g++", "gcc", "rustc"})
 _GENERATORS = frozenset({"protoc"})
 _STATIC_CHECKERS = frozenset({"clang-tidy", "eslint", "mypy", "pyright", "ruff"})
 _TEST_RUNNERS = frozenset({"ctest", "pytest"})
+_REPORIVET_CLI = "reporivet"
+_SKILL_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{1,63}$")
+_SKILL_INIT_VALUE_FLAGS = frozenset(
+    {
+        "--name",
+        "--summary",
+        "--output",
+        "--tool",
+        "--mode",
+        "--before-edit",
+        "--before-finish",
+    }
+)
+_SKILL_CONVERT_VALUE_FLAGS = frozenset({"--id", "--name", "--summary", "--output"})
 _PACKAGE_MANAGERS = frozenset({"npm", "pnpm", "yarn"})
 _INSTALL_ACTIONS = frozenset({"add", "install", "sync", "update", "upgrade"})
 _DELETE_PROGRAMS = frozenset({"rm", "rmdir", "unlink"})
@@ -212,6 +227,14 @@ class ApprovalFactAnalyzer:
             constraints.add(f"timeout_{timeout:g}")
         if write_paths:
             constraints.add("declared_output_paths")
+        if (
+            program == _REPORIVET_CLI
+            and args[:1] == ["skill"]
+            and operation
+            in {OperationClass.READ, OperationClass.STATIC_CHECK, OperationClass.GENERATE}
+            and analysis == AnalysisLevel.EXACT
+        ):
+            constraints.add("reporivet_skill_cli")
         verification_kind = None
         if request.tool_name == "run_verification":
             verification_kind = self._verification_kind(request)
@@ -270,6 +293,14 @@ class ApprovalFactAnalyzer:
                 AnalysisLevel.OPAQUE,
                 ["command requests privilege escalation"],
             )
+        if program == _REPORIVET_CLI:
+            if origin != ExecutableOrigin.TRUSTED_TOOLCHAIN:
+                return (
+                    OperationClass.UNKNOWN,
+                    AnalysisLevel.OPAQUE,
+                    ["RepoRivet CLI does not resolve to the trusted runtime toolchain"],
+                )
+            return _classify_reporivet_skill_command(args)
         if program in _COMPILERS and any(_is_opaque_compiler_argument(item) for item in args):
             return (
                 OperationClass.UNKNOWN,
@@ -404,6 +435,7 @@ class ApprovalFactAnalyzer:
                     "go",
                     "python",
                     "python3",
+                    _REPORIVET_CLI,
                 }
                 | _GENERATORS
             ):
@@ -547,6 +579,8 @@ def _command_paths(
     args: list[str],
     cwd: Path,
 ) -> tuple[list[str], list[str]]:
+    if program == _REPORIVET_CLI:
+        return _reporivet_skill_paths(args, cwd)
     if operation in {OperationClass.STATIC_CHECK, OperationClass.TEST, OperationClass.FORMAT}:
         ignored_words = {"check", "run", "test", "pytest"}
         inputs = []
@@ -621,7 +655,9 @@ def _command_paths(
 def _operation_effects(operation: OperationClass) -> tuple[set[str], set[str]]:
     effects = {"process_execution"}
     potential: set[str] = set()
-    if operation == OperationClass.BUILD:
+    if operation == OperationClass.READ:
+        effects.add("filesystem_read")
+    elif operation == OperationClass.BUILD:
         effects.update({"filesystem_read", "filesystem_write", "compile_workspace_code"})
         potential.add("execute_toolchain_plugins")
     elif operation in {OperationClass.STATIC_CHECK, OperationClass.TEST}:
@@ -652,6 +688,141 @@ def _operation_effects(operation: OperationClass) -> tuple[set[str], set[str]]:
     else:
         potential.update({"filesystem_write", "network_access", "dynamic_code_execution"})
     return effects, potential
+
+
+def _classify_reporivet_skill_command(
+    args: list[str],
+) -> tuple[OperationClass, AnalysisLevel, list[str]]:
+    if args in (["skill", "--help"], ["skill", "list"], ["skill", "list", "--help"]):
+        return (
+            OperationClass.READ,
+            AnalysisLevel.EXACT,
+            ["RepoRivet reads installed Skill metadata"],
+        )
+    if len(args) == 3 and args[:2] == ["skill", "show"] and _valid_skill_id(args[2]):
+        return (
+            OperationClass.READ,
+            AnalysisLevel.EXACT,
+            ["RepoRivet reads one installed Skill"],
+        )
+    if args in (["skill", "show", "--help"], ["skill", "validate", "--help"]):
+        return (
+            OperationClass.READ,
+            AnalysisLevel.EXACT,
+            ["RepoRivet displays Skill command help"],
+        )
+    if len(args) == 3 and args[:2] == ["skill", "validate"] and not args[2].startswith("-"):
+        return (
+            OperationClass.STATIC_CHECK,
+            AnalysisLevel.EXACT,
+            ["RepoRivet validates one Skill artifact without installing it"],
+        )
+    if args in (["skill", "init", "--help"], ["skill", "convert", "--help"]):
+        return (
+            OperationClass.READ,
+            AnalysisLevel.EXACT,
+            ["RepoRivet displays Skill command help"],
+        )
+    if len(args) >= 3 and args[:2] == ["skill", "init"]:
+        parsed = _parse_skill_options(args[2:], _SKILL_INIT_VALUE_FLAGS)
+        if parsed is not None:
+            positionals, _options = parsed
+            if len(positionals) == 1 and _valid_skill_id(positionals[0]):
+                return (
+                    OperationClass.GENERATE,
+                    AnalysisLevel.EXACT,
+                    ["RepoRivet creates one non-overwriting workspace Skill draft"],
+                )
+    if len(args) >= 3 and args[:2] == ["skill", "convert"]:
+        parsed = _parse_skill_options(args[2:], _SKILL_CONVERT_VALUE_FLAGS)
+        if parsed is not None:
+            positionals, options = parsed
+            skill_id = options.get("--id", [None])[-1]
+            if (
+                len(positionals) == 1
+                and not positionals[0].startswith("-")
+                and isinstance(skill_id, str)
+                and _valid_skill_id(skill_id)
+            ):
+                return (
+                    OperationClass.GENERATE,
+                    AnalysisLevel.EXACT,
+                    ["RepoRivet converts one Skill into a non-overwriting workspace draft"],
+                )
+    return (
+        OperationClass.UNKNOWN,
+        AnalysisLevel.OPAQUE,
+        ["RepoRivet Skill subcommand has unclassified or stateful effects"],
+    )
+
+
+def _reporivet_skill_paths(args: list[str], cwd: Path) -> tuple[list[str], list[str]]:
+    if len(args) == 3 and args[:2] == ["skill", "validate"]:
+        return [_skill_source_path(args[2], cwd)], []
+    if len(args) >= 3 and args[:2] == ["skill", "init"]:
+        parsed = _parse_skill_options(args[2:], _SKILL_INIT_VALUE_FLAGS)
+        if parsed is None:
+            return [], []
+        positionals, options = parsed
+        if len(positionals) != 1:
+            return [], []
+        output_root = options.get("--output", ["reporivet-skills"])[-1]
+        return [], [str((cwd / output_root / positionals[0] / "SKILL.md").resolve(strict=False))]
+    if len(args) >= 3 and args[:2] == ["skill", "convert"]:
+        parsed = _parse_skill_options(args[2:], _SKILL_CONVERT_VALUE_FLAGS)
+        if parsed is None:
+            return [], []
+        positionals, options = parsed
+        skill_id = options.get("--id", [None])[-1]
+        if len(positionals) != 1 or not isinstance(skill_id, str):
+            return [], []
+        output_root = options.get("--output", ["reporivet-skills"])[-1]
+        return (
+            [_skill_source_path(positionals[0], cwd)],
+            [str((cwd / output_root / skill_id / "SKILL.md").resolve(strict=False))],
+        )
+    return [], []
+
+
+def _skill_source_path(value: str, cwd: Path) -> str:
+    candidate = (cwd / value).resolve(strict=False)
+    if candidate.is_dir():
+        candidate /= "SKILL.md"
+    return str(candidate)
+
+
+def _parse_skill_options(
+    args: list[str], value_flags: frozenset[str]
+) -> tuple[list[str], dict[str, list[str]]] | None:
+    positionals: list[str] = []
+    options: dict[str, list[str]] = {}
+    index = 0
+    while index < len(args):
+        argument = args[index]
+        if argument.startswith("--"):
+            flag, separator, inline_value = argument.partition("=")
+            if flag not in value_flags:
+                return None
+            if separator:
+                value = inline_value
+            else:
+                index += 1
+                if index >= len(args) or args[index].startswith("--"):
+                    return None
+                value = args[index]
+            if not value:
+                return None
+            options.setdefault(flag, []).append(value)
+        elif argument.startswith("-"):
+            return None
+        else:
+            positionals.append(argument)
+        index += 1
+    return positionals, options
+
+
+def _valid_skill_id(value: str) -> bool:
+    return _SKILL_ID_PATTERN.fullmatch(value) is not None
 
 
 def _git_writes(args: list[str]) -> bool:

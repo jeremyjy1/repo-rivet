@@ -58,6 +58,8 @@ max_context_overflow_retries = 1
     assert config.token.max_context_overflow_retries == 1
     assert config.approval.mode.value == "safe-auto"
     assert config.approval.non_interactive.value == "deny"
+    assert config.skills.global_enabled
+    assert config.skills.default_global is None
 
 
 def test_load_config_accepts_approval_settings(tmp_path: Path) -> None:

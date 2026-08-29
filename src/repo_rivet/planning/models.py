@@ -4,6 +4,8 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from repo_rivet.skills.models import ActiveSkillPin
+
 
 class WorkflowMode(StrEnum):
     EXECUTE = "execute"
@@ -168,6 +170,8 @@ class PlanArtifact(PlanDraft):
     snapshots: dict[str, str] = Field(default_factory=dict)
     execution_workspace_revision: int | None = Field(default=None, ge=0)
     execution_snapshots: dict[str, str] = Field(default_factory=dict)
+    system_skills: list[ActiveSkillPin] = Field(default_factory=list)
+    skill: ActiveSkillPin | None = None
 
     @property
     def current_step(self) -> PlanStep | None:

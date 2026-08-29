@@ -1243,6 +1243,167 @@ def test_exact_bounded_build_is_auto_approved_at_medium_risk(
     assert human.requests == []
 
 
+@pytest.mark.parametrize(
+    ("command", "operation"),
+    [
+        ("reporivet skill list", OperationClass.READ),
+        ("reporivet skill show sample-skill", OperationClass.READ),
+        ("reporivet skill validate draft/SKILL.md", OperationClass.STATIC_CHECK),
+    ],
+)
+def test_trusted_reporivet_skill_inspection_is_auto_approved(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    operation: OperationClass,
+) -> None:
+    monkeypatch.setattr(
+        "repo_rivet.approval.semantic_analyzer.shutil.which", lambda _: sys.executable
+    )
+    draft = tmp_path / "draft" / "SKILL.md"
+    draft.parent.mkdir()
+    draft.write_text("# draft\n", encoding="utf-8")
+    human = FakeHumanApprover()
+    engine, _ = create_engine(tmp_path, mode=ApprovalMode.SAFE_AUTO, human=human)
+
+    outcome = engine.authorize(
+        tool_name="run_command",
+        arguments={"command": command, "cwd": "."},
+        capabilities={Capability.PROCESS_EXECUTE},
+        session_id=engine.session_id,
+    )
+
+    assert outcome.request.facts.operation_class == operation
+    assert outcome.request.facts.analysis_level == AnalysisLevel.EXACT
+    assert outcome.request.facts.executable_origin == ExecutableOrigin.TRUSTED_TOOLCHAIN
+    assert outcome.decision.source == "semantic_template:reporivet_skill_inspection"
+    assert human.requests == []
+
+
+def test_trusted_reporivet_skill_generation_is_auto_approved_only_for_new_workspace_drafts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "repo_rivet.approval.semantic_analyzer.shutil.which", lambda _: sys.executable
+    )
+    source = tmp_path / "foreign" / "SKILL.md"
+    source.parent.mkdir()
+    source.write_text("# source\n", encoding="utf-8")
+    human = FakeHumanApprover()
+    engine, _ = create_engine(tmp_path, mode=ApprovalMode.SAFE_AUTO, human=human)
+
+    initialized = engine.authorize(
+        tool_name="run_command",
+        arguments={
+            "command": "reporivet skill init generated-skill --output drafts",
+            "cwd": ".",
+        },
+        capabilities={Capability.PROCESS_EXECUTE},
+        session_id=engine.session_id,
+    )
+    converted = engine.authorize(
+        tool_name="run_command",
+        arguments={
+            "command": (
+                "reporivet skill convert foreign/SKILL.md --id converted-skill --output drafts"
+            ),
+            "cwd": ".",
+        },
+        capabilities={Capability.PROCESS_EXECUTE},
+        session_id=engine.session_id,
+    )
+
+    assert initialized.request.facts.operation_class == OperationClass.GENERATE
+    assert converted.request.facts.operation_class == OperationClass.GENERATE
+    assert initialized.request.facts.write_paths == [
+        str((tmp_path / "drafts/generated-skill/SKILL.md").resolve())
+    ]
+    assert converted.request.facts.read_paths == [str(source.resolve())]
+    assert converted.request.facts.write_paths == [
+        str((tmp_path / "drafts/converted-skill/SKILL.md").resolve())
+    ]
+    assert initialized.decision.source == "semantic_template:reporivet_skill_generation"
+    assert converted.decision.source == "semantic_template:reporivet_skill_generation"
+    assert human.requests == []
+
+
+def test_reporivet_skill_global_changes_and_untrusted_executables_are_not_auto_approved(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "repo_rivet.approval.semantic_analyzer.shutil.which", lambda _: sys.executable
+    )
+    draft = tmp_path / "draft" / "SKILL.md"
+    draft.parent.mkdir()
+    draft.write_text("# draft\n", encoding="utf-8")
+    shadow = tmp_path / "reporivet"
+    shadow.write_text("#!/bin/sh\n", encoding="utf-8")
+    shadow.chmod(0o755)
+    human = FakeHumanApprover()
+    engine, _ = create_engine(tmp_path, mode=ApprovalMode.SAFE_AUTO, human=human)
+
+    install = engine.authorize(
+        tool_name="run_command",
+        arguments={"command": "reporivet skill install draft/SKILL.md", "cwd": "."},
+        capabilities={Capability.PROCESS_EXECUTE},
+        session_id=engine.session_id,
+    )
+    untrusted = engine.authorize(
+        tool_name="run_command",
+        arguments={"command": "./reporivet skill validate draft/SKILL.md", "cwd": "."},
+        capabilities={Capability.PROCESS_EXECUTE},
+        session_id=engine.session_id,
+    )
+
+    assert install.request.facts.analysis_level == AnalysisLevel.OPAQUE
+    assert install.decision.source == "human"
+    assert untrusted.request.facts.executable_origin == ExecutableOrigin.WORKSPACE
+    assert untrusted.request.facts.analysis_level == AnalysisLevel.OPAQUE
+    assert untrusted.decision.source == "human"
+    assert len(human.requests) == 2
+
+
+def test_reporivet_skill_generation_does_not_auto_approve_overwrite_or_workspace_escape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "repo_rivet.approval.semantic_analyzer.shutil.which", lambda _: sys.executable
+    )
+    existing = tmp_path / "drafts" / "existing-skill" / "SKILL.md"
+    existing.parent.mkdir(parents=True)
+    existing.write_text("# user draft\n", encoding="utf-8")
+    human = FakeHumanApprover()
+    engine, _ = create_engine(tmp_path, mode=ApprovalMode.SAFE_AUTO, human=human)
+
+    overwrite = engine.authorize(
+        tool_name="run_command",
+        arguments={
+            "command": "reporivet skill init existing-skill --output drafts",
+            "cwd": ".",
+        },
+        capabilities={Capability.PROCESS_EXECUTE},
+        session_id=engine.session_id,
+    )
+    escape = engine.authorize(
+        tool_name="run_command",
+        arguments={
+            "command": "reporivet skill init escaped-skill --output ../outside",
+            "cwd": ".",
+        },
+        capabilities={Capability.PROCESS_EXECUTE},
+        session_id=engine.session_id,
+    )
+
+    assert overwrite.request.facts.overwrites_existing
+    assert overwrite.decision.source == "human"
+    assert escape.request.facts.outside_workspace
+    assert escape.decision.source == "hard_policy"
+    assert len(human.requests) == 1
+
+
 def test_workspace_compiler_with_trusted_name_is_not_auto_approved(tmp_path: Path) -> None:
     compiler = tmp_path / "g++"
     compiler.write_text("#!/bin/sh\n", encoding="utf-8")

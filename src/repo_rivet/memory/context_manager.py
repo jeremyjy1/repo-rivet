@@ -31,6 +31,9 @@ remaining pending required checks in plan order. Do not create a separate decisi
 remaining verification check. A registered Verification Plan is the audit record for
 run_verification, so call it directly without record_decision; command policy and approval still
 apply when the check executes.
+If a verification result is inconclusive because its oracle is insufficient, replace the full
+plan by calling register_verification directly. Preserve all still-required checks and add a
+deterministic output or artifact oracle; do not call record_decision for this plan revision.
 Do not claim success unless every required check passes for the current workspace revision.
 Do not emit progress narration as a tool-free response. A tool-free response is treated as your
 final answer; if more work remains, issue the next valid tool call instead.
@@ -94,6 +97,7 @@ class ContextManager:
         state_summary: str,
         remaining_steps: int,
         tools: list[dict[str, Any]],
+        policy_messages: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         """Rebuild context, compacting before any request can exceed the safe budget."""
         if memory.fixed is None:
@@ -101,7 +105,7 @@ class ContextManager:
 
         manager = self._manager_for(memory)
         self._ensure_context_checkpoint(memory, state_summary)
-        stable_messages = self._stable_messages(memory)
+        stable_messages = self._stable_messages(memory, policy_messages=policy_messages)
         full_messages = [
             *stable_messages,
             *(message.as_chat_message() for message in memory.messages),
@@ -113,7 +117,7 @@ class ContextManager:
         # Compaction intentionally starts a new cache epoch. Its checkpoint captures the
         # structured facts that replace discarded raw messages and then remains immutable.
         self._ensure_context_checkpoint(memory, state_summary)
-        stable_messages = self._stable_messages(memory)
+        stable_messages = self._stable_messages(memory, policy_messages=policy_messages)
         fixed_estimate = manager.estimate_request(stable_messages, tools)
         manager.state.fixed_prompt_estimate = manager.estimator.base.estimate_request(
             stable_messages,
@@ -259,12 +263,17 @@ class ContextManager:
             )
 
     @staticmethod
-    def _stable_messages(memory: MemoryState) -> list[dict[str, Any]]:
+    def _stable_messages(
+        memory: MemoryState,
+        *,
+        policy_messages: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
         """Return the immutable provider-cache prefix for the current cache epoch."""
         if memory.context_checkpoint is None:
             raise ValueError("Memory has no cache-epoch checkpoint")
         return [
             {"role": "system", "content": memory.fixed.system_prompt},
+            *(policy_messages or []),
             {"role": "user", "content": memory.task_specification()},
             {"role": "system", "content": memory.context_checkpoint},
         ]
