@@ -490,9 +490,7 @@ def test_automatic_inconclusive_verification_enters_plan_revision_recovery() -> 
 
 
 def test_verification_plan_revision_recovery_is_bounded_for_repeated_final_text() -> None:
-    model = FakeModelClient(
-        [ModelResponse(content="Already done.") for _item in range(3)]
-    )
+    model = FakeModelClient([ModelResponse(content="Already done.") for _item in range(3)])
     memory = MemoryState(session_id="bounded-verification-plan-revision")
     memory.verification_plan_revision_required = True
     memory.verification_plan_revision_reason = "behavior verification kind is missing"

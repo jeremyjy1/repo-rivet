@@ -329,16 +329,13 @@ class AgentController:
                         tool_schemas = [
                             schema
                             for schema in tool_schemas
-                            if schema.get("function", {}).get("name")
-                            == "register_verification"
+                            if schema.get("function", {}).get("name") == "register_verification"
                         ]
                     response = self._complete_with_context_recovery(
                         state=state,
                         memory=memory,
                         tool_schemas=(
-                            []
-                            if state.status == AgentStatus.FINALIZING
-                            else tool_schemas
+                            [] if state.status == AgentStatus.FINALIZING else tool_schemas
                         ),
                     )
                 except ResponseParseError as error:
@@ -813,9 +810,7 @@ class AgentController:
                     replacement_required_checks = {
                         check.check_id for check in plan.checks if check.required
                     }
-                    missing_requirements = set(previous_plan.requirements) - set(
-                        plan.requirements
-                    )
+                    missing_requirements = set(previous_plan.requirements) - set(plan.requirements)
                     missing_checks = previous_required_checks - replacement_required_checks
                     if missing_requirements or missing_checks:
                         memory.verification_plan = previous_plan
@@ -1534,10 +1529,7 @@ class AgentController:
         state.skill_completion_recovery_attempts += 1
         memory.skill_completion_recovery_attempts = state.skill_completion_recovery_attempts
         failed = ", ".join(skill_report.failed)
-        if (
-            state.skill_completion_recovery_attempts
-            >= _MAX_SKILL_COMPLETION_RECOVERY_ATTEMPTS
-        ):
+        if state.skill_completion_recovery_attempts >= _MAX_SKILL_COMPLETION_RECOVERY_ATTEMPTS:
             return self._finish(
                 state,
                 memory,
@@ -1843,10 +1835,7 @@ class AgentController:
     ) -> AgentResult | None:
         state.verification_plan_revision_attempts += 1
         memory.verification_plan_revision_attempts = state.verification_plan_revision_attempts
-        if (
-            state.verification_plan_revision_attempts
-            >= _MAX_VERIFICATION_PLAN_REVISION_ATTEMPTS
-        ):
+        if state.verification_plan_revision_attempts >= _MAX_VERIFICATION_PLAN_REVISION_ATTEMPTS:
             return self._finish(
                 state,
                 memory,

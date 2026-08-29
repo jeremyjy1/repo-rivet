@@ -153,12 +153,8 @@ def test_global_skill_cannot_shadow_a_system_skill(tmp_path: Path) -> None:
 def test_runtime_eagerly_loads_all_system_skills_without_narrowing_tools(
     tmp_path: Path,
 ) -> None:
-    write_skill(
-        tmp_path / "system", "system-one", body="# One\n\nSYSTEM_ONE", automatic=True
-    )
-    write_skill(
-        tmp_path / "system", "system-two", body="# Two\n\nSYSTEM_TWO", automatic=True
-    )
+    write_skill(tmp_path / "system", "system-one", body="# One\n\nSYSTEM_ONE", automatic=True)
+    write_skill(tmp_path / "system", "system-two", body="# Two\n\nSYSTEM_TWO", automatic=True)
     runtime = SkillRuntime(
         registry_for(tmp_path),
         known_tools={"read_file", "edit_file"},
@@ -541,9 +537,7 @@ def test_unsatisfied_non_verification_skill_requirement_stops_after_bounded_reco
         started_at=now,
         finished_at=now,
     )
-    model = FakeModelClient(
-        [ModelResponse(content="Done.") for _item in range(3)]
-    )
+    model = FakeModelClient([ModelResponse(content="Done.") for _item in range(3)])
     controller = AgentController(
         model_client=model,
         tool_registry=FakeToolRegistry([]),  # type: ignore[arg-type]

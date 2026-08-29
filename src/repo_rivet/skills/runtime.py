@@ -71,9 +71,7 @@ class SkillRuntime:
                 "session's global Skill"
             )
         if not bundle.manifest.activation.explicit:
-            raise SkillValidationError(
-                f"Global Skill {skill_id} does not allow explicit selection"
-            )
+            raise SkillValidationError(f"Global Skill {skill_id} does not allow explicit selection")
         pin = ActiveSkillPin(
             id=bundle.manifest.id,
             version=bundle.manifest.version,
@@ -124,8 +122,7 @@ class SkillRuntime:
         unknown = bundle.manifest.requested_tools - self.known_tools
         if unknown:
             raise SkillValidationError(
-                f"Skill {bundle.manifest.id} requests unknown tools: "
-                + ", ".join(sorted(unknown))
+                f"Skill {bundle.manifest.id} requests unknown tools: " + ", ".join(sorted(unknown))
             )
         return bundle
 

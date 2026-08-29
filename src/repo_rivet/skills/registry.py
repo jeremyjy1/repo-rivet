@@ -43,9 +43,7 @@ class SkillRegistry:
                             f"{existing.path}: {path}"
                         )
                         continue
-                    errors[skill_id] = (
-                        f"Duplicate skill id {skill_id!r}: {existing.path}, {path}"
-                    )
+                    errors[skill_id] = f"Duplicate skill id {skill_id!r}: {existing.path}, {path}"
                     index.pop(skill_id)
                     continue
                 index[skill_id] = metadata

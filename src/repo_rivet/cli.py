@@ -639,9 +639,7 @@ def _skill_command(arguments: argparse.Namespace, console: Console) -> int:
                 reserved_ids={item.manifest.id for item in registry.system_skills()},
             )
             action = "updated" if arguments.replace else "installed"
-            console.print(
-                f"Global Skill {action} after validation: " + _terminal_text(str(target))
-            )
+            console.print(f"Global Skill {action} after validation: " + _terminal_text(str(target)))
             return 0
         if arguments.skill_command == "uninstall":
             target = uninstall_skill(
@@ -756,9 +754,7 @@ def _print_skill(console: Console, registry: SkillRegistry, skill_id: str) -> No
 
 def _print_current_skill(console: Console, runtime: SkillRuntime) -> None:
     system = (
-        ", ".join(
-            f"{bundle.manifest.id}@{bundle.manifest.version}" for bundle in runtime.system
-        )
+        ", ".join(f"{bundle.manifest.id}@{bundle.manifest.version}" for bundle in runtime.system)
         or "none"
     )
     console.print(f"System Skills: {system}")
@@ -912,9 +908,7 @@ def _print_session_details(
     details.append(f"Modified:  {_terminal_text(modified)}\n")
     details.append(f"Verification: {_terminal_text(memory.summary.verification_status)}")
     if memory.active_skill is not None:
-        details.append(
-            f"\nGlobal Skill: {memory.active_skill.id}@{memory.active_skill.version}"
-        )
+        details.append(f"\nGlobal Skill: {memory.active_skill.id}@{memory.active_skill.version}")
     if memory.plan_artifact is not None:
         details.append(f"\nPlan:      {memory.plan_artifact.status.value}")
         details.append(
@@ -1231,8 +1225,7 @@ def _token_budget_config(memory_config: MemoryConfig) -> TokenBudgetConfig:
 
 def _print_runtime(console: Console, workspace: Path, runtime: Runtime) -> None:
     system_skill_label = ", ".join(
-        f"{bundle.manifest.id}@{bundle.manifest.version}"
-        for bundle in runtime.skill_runtime.system
+        f"{bundle.manifest.id}@{bundle.manifest.version}" for bundle in runtime.skill_runtime.system
     )
     active_skill = runtime.skill_runtime.active
     global_skill_label = (
