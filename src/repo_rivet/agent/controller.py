@@ -1381,7 +1381,7 @@ class AgentController:
         if awaiting_plan_recovery and not registration_calls:
             error = (
                 "Verification-plan recovery requires register_verification before any other "
-                "action. Register the plan now; do not record a decision or repeat the edit yet."
+                "action. The pending action is held by the Controller; do not repeat it."
             )
             for call in calls:
                 self._log(
@@ -1402,11 +1402,28 @@ class AgentController:
                     self._record_meta_result(call, result, state=state, memory=memory)
                 else:
                     self._record_blocked_action(call, result, state=state, memory=memory)
-            return self._request_verification_plan_recovery(
-                state=state,
-                memory=memory,
-                trigger="recovery turn did not call register_verification",
+            state.record_protocol_failure(error)
+            self._log(
+                "model_response_invalid",
+                step=state.step_count,
+                error=error,
+                recovery="required_tool",
+                required_tool="register_verification",
             )
+            self._append_system_feedback(
+                state,
+                memory,
+                {
+                    "error": "verification_plan_recovery_protocol_violation",
+                    "allowed_next_actions": ["register_verification"],
+                    "instruction": (
+                        "Call register_verification only. The Controller still holds the "
+                        "previously authorized action, so do not reproduce it."
+                    ),
+                },
+            )
+            self._save_memory(memory, state, status=self._active_memory_status(state))
+            return None
         missing_plan_verification_calls = [
             call
             for call in action_calls
@@ -1985,6 +2002,15 @@ class AgentController:
                 and reasoning_event.next_action is not None
             ):
                 state.pending_decision = reasoning_event
+                if state.verification_plan is None and self.tool_registry.modifies_workspace_files(
+                    reasoning_event.next_action.tool_name
+                ):
+                    memory.verification_plan_recovery_decision = reasoning_event
+                    return self._request_verification_plan_recovery(
+                        state=state,
+                        memory=memory,
+                        trigger=("the pending workspace file change requires a verification plan"),
+                    )
             elif registration_calls and pending_decision is not None:
                 # A Controller-required registration attempt does not consume the already
                 # validated authority for the blocked file change, even if the submitted
@@ -3406,9 +3432,17 @@ class AgentController:
                 "modified_files": sorted(state.modified_files),
                 "requested_check_ids": requested_check_ids or [],
                 "allowed_next_actions": ["register_verification"],
+                "pending_action_held": (
+                    state.pending_decision.next_action.tool_name
+                    if state.pending_decision is not None
+                    and state.pending_decision.next_action is not None
+                    else None
+                ),
                 "instruction": (
                     "Your next response must call register_verification only. Do not emit "
-                    "progress text, record_decision, or another action in that response."
+                    "progress text, record_decision, or another action in that response. "
+                    "The Controller is holding any previously authorized action; do not "
+                    "reproduce it until registration succeeds."
                 ),
                 "recovery_attempts_remaining": (
                     _MAX_VERIFICATION_PLAN_RECOVERY_ATTEMPTS
@@ -4171,6 +4205,12 @@ class AgentController:
 
             protocol_checkpoints = 0
             options = self._model_request_options(state)
+            required_tool = self._required_model_tool(state)
+            if required_tool is not None:
+                options = replace(
+                    options or ModelRequestOptions(),
+                    required_tool=required_tool,
+                )
             if state.sanitize_unreplayable_provider_history and (
                 options is None or options.thinking_enabled is not False
             ):
@@ -4315,6 +4355,15 @@ class AgentController:
             phase="discovering",
             reason="the selected model does not expose configurable reasoning effort",
         )
+        return None
+
+    @staticmethod
+    def _required_model_tool(state: SessionState) -> str | None:
+        """Force protocol recovery at the provider boundary, not only in the prompt."""
+        if state.verification_plan_revision_required or (
+            state.verification_plan_recovery_attempts > 0 and state.verification_plan is None
+        ):
+            return "register_verification"
         return None
 
     def _reasoning_context(self, state: SessionState) -> ReasoningContext:

@@ -826,11 +826,14 @@ def test_file_change_without_verification_plan_is_blocked_before_execution() -> 
         ]
     )
     memory = MemoryState(session_id="missing-plan")
+    events = RecordingSink()
 
-    result = controller(model, tools).run("fix the bug", memory=memory)
+    result = controller(model, tools, event_logger=events).run("fix the bug", memory=memory)
 
     assert result.status == "success"
     assert len(model.requests) == 5
+    assert model.requests[1]["options"].required_tool == "register_verification"
+    assert model.requests[2]["options"].required_tool == "register_verification"
     assert [executed.name for executed in tools.calls] == ["write_file", "run_verification"]
     blocked_result = next(
         message
@@ -839,6 +842,46 @@ def test_file_change_without_verification_plan_is_blocked_before_execution() -> 
     )
     assert "verification_plan_missing" in (blocked_result.content or "")
     assert memory.verification_plan_recovery_decision is None
+    assert (
+        sum(
+            event_type == "verification_plan_recovery_started"
+            for event_type, _data in events.events
+        )
+        == 1
+    )
+
+
+def test_pending_file_decision_registers_verification_before_requesting_the_edit() -> None:
+    model = FakeModelClient(
+        [
+            ModelResponse(tool_calls=[decision("d1", "write_file")]),
+            ModelResponse(tool_calls=[verification_plan()]),
+            ModelResponse(
+                tool_calls=[call("write", "write_file", {"path": "app.py", "content": "new"})]
+            ),
+            ModelResponse(content="Implemented and verified."),
+        ]
+    )
+    tools = FakeToolRegistry(
+        [
+            ToolResult(ok=True, output="written"),
+            passed_verification_result(),
+        ]
+    )
+    memory = MemoryState(session_id="preflight-plan")
+
+    result = controller(model, tools).run("fix the bug", memory=memory)
+
+    assert result.status == "success"
+    assert len(model.requests) == 4
+    assert model.requests[1]["options"].required_tool == "register_verification"
+    assert [executed.name for executed in tools.calls] == ["write_file", "run_verification"]
+    assert not any(
+        message.role == "tool"
+        and message.tool_call_id == "write"
+        and "verification_plan_missing" in (message.content or "")
+        for message in memory.messages
+    )
 
 
 def test_resumed_missing_plan_recovery_allows_protocol_correction() -> None:
@@ -858,6 +901,8 @@ def test_resumed_missing_plan_recovery_allows_protocol_correction() -> None:
 
     assert result.status == "success"
     assert len(model.requests) == 3
+    assert model.requests[0]["options"].required_tool == "register_verification"
+    assert model.requests[1]["options"].required_tool == "register_verification"
     assert memory.verification_plan_recovery_attempts == 0
     rejected_decision = next(
         message

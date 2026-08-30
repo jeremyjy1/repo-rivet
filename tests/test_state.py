@@ -59,6 +59,21 @@ def test_record_tool_result_tracks_changes_and_failures() -> None:
     assert "not found" in state.state_summary()
 
 
+def test_state_summary_distinguishes_verification_recovery_counters() -> None:
+    state = SessionState(
+        task="task",
+        verification_plan_recovery_attempts=1,
+        verification_plan_revision_attempts=2,
+        plan_scope_revision_attempts=3,
+    )
+
+    summary = state.state_summary()
+
+    assert "verification-plan-registration=1" in summary
+    assert "verification-plan-revision=2" in summary
+    assert "plan-scope=3" in summary
+
+
 def test_only_new_successful_tool_observations_count_as_progress() -> None:
     state = SessionState(task="task")
     read = ToolCall(id="read-1", name="read_file", arguments={"path": "app.py"})

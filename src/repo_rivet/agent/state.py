@@ -232,7 +232,12 @@ class SessionState:
                 )
         errors = " | ".join(self.recent_errors) or "none"
         pending_decision = (
-            self.pending_decision.next_action.tool_name
+            (
+                f"{self.pending_decision.next_action.tool_name} "
+                "(held until register_verification succeeds)"
+                if self.verification_plan_recovery_attempts > 0 and self.verification_plan is None
+                else self.pending_decision.next_action.tool_name
+            )
             if self.pending_decision is not None and self.pending_decision.next_action is not None
             else "none"
         )
@@ -252,7 +257,8 @@ class SessionState:
             f"{self.plan_scope_revision_required}"
             f" ({self.plan_scope_revision_reason or 'none'}).\n"
             "Recovery attempts: "
-            f"verification-plan={self.verification_plan_revision_attempts}, "
+            f"verification-plan-registration={self.verification_plan_recovery_attempts}, "
+            f"verification-plan-revision={self.verification_plan_revision_attempts}, "
             f"plan-scope={self.plan_scope_revision_attempts}.\n"
             f"One-shot pending decision: {pending_decision}.\n"
             f"Recent errors: {errors}."

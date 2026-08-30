@@ -130,6 +130,17 @@ class OpenAICompatibleClient:
             provider_options["extra_body"] = {
                 "thinking": {"type": "enabled" if thinking_enabled else "disabled"}
             }
+        tool_choice: str | dict[str, Any] = "auto"
+        if request_options.required_tool is not None:
+            available_tools = {str(tool.get("function", {}).get("name", "")) for tool in tools}
+            if request_options.required_tool not in available_tools:
+                raise ValueError(
+                    f"Required tool is not present in this request: {request_options.required_tool}"
+                )
+            tool_choice = {
+                "type": "function",
+                "function": {"name": request_options.required_tool},
+            }
         provider_thinking_disabled = thinking_enabled is False
         reasoning_context_restart_required = False
         max_attempts = self._config.max_retries + 1
@@ -143,6 +154,7 @@ class OpenAICompatibleClient:
                             messages=messages,
                             tools=tools,
                             provider_options=provider_options,
+                            tool_choice=tool_choice,
                             attempt=attempt,
                         )
                         parsed, usage = self._consume_stream(
@@ -251,13 +263,14 @@ class OpenAICompatibleClient:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
         provider_options: dict[str, Any],
+        tool_choice: str | dict[str, Any],
         attempt: int,
     ) -> Any:
         request: dict[str, Any] = {
             "model": self._config.model,
             "messages": cast(Any, messages),
             "tools": cast(Any, tools),
-            "tool_choice": "auto",
+            "tool_choice": tool_choice,
             "stream": True,
             "stream_options": {"include_usage": True},
             **provider_options,

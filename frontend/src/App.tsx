@@ -143,6 +143,7 @@ const visibleTimelineEvents = new Set([
   "skill.deactivated",
   "skill.load.failed",
   "stale.snapshot.recovery.finished",
+  "tool.finished",
   "tool.requested",
   "user.input",
   "verification.plan.recovery.started",
@@ -196,6 +197,12 @@ function compactTimelineEvents(
       .map((event) => textValue(event.payload.tool_call_id))
       .filter(Boolean),
   );
+  const finishedToolCalls = new Set(
+    events
+      .filter((event) => event.type === "tool.finished")
+      .map((event) => textValue(event.payload.tool_call_id))
+      .filter(Boolean),
+  );
   const compacted: AgentEvent[] = [];
   const queuedInputs = new Map<string, number>();
   for (const event of events) {
@@ -210,8 +217,16 @@ function compactTimelineEvents(
     }
     if (
       event.type === "tool.requested"
-      && observedToolCalls.has(textValue(event.payload.tool_call_id))
+      && (
+        observedToolCalls.has(textValue(event.payload.tool_call_id))
+        || finishedToolCalls.has(textValue(event.payload.tool_call_id))
+      )
     ) continue;
+    if (event.type === "tool.finished") {
+      const toolCallId = textValue(event.payload.tool_call_id);
+      const failedOrSkipped = event.payload.ok === false || event.payload.executed === false;
+      if (observedToolCalls.has(toolCallId) || !failedOrSkipped) continue;
+    }
     if (event.type === "approval.resolved" && !shouldShowApprovalResolution(event)) continue;
     if (
       event.type === "approval.awaiting.human"
@@ -1090,10 +1105,13 @@ function presentEvent(event: AgentEvent, pendingApprovalId: string | null): Even
     }
     case "tool.finished": {
       const ok = payload.ok !== false;
+      const executed = payload.executed !== false;
       return {
-        title: `${ok ? "Completed" : "Failed"} · ${toolLabel(tool)}`,
+        title: `${!executed ? "Not executed" : ok ? "Completed" : "Failed"} · ${toolLabel(tool)}`,
         summary: textValue(payload.error) || (ok ? "Tool completed successfully" : "Tool operation failed"),
-        detail: textValue(payload.error_code),
+        detail: [textValue(payload.error_code), !executed ? "Workspace unchanged" : ""]
+          .filter(Boolean)
+          .join(" · "),
       };
     }
     case "approval.requested": {

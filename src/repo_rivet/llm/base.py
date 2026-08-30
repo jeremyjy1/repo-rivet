@@ -30,6 +30,7 @@ class ModelRequestOptions:
 
     reasoning_effort: ReasoningEffort | None = None
     thinking_enabled: bool | None = None
+    required_tool: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

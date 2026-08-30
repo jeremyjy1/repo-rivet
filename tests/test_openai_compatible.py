@@ -249,6 +249,29 @@ def test_complete_calls_chat_completions_with_configured_model() -> None:
     assert completions.kwargs["stream_options"] == {"include_usage": True}
 
 
+def test_complete_can_require_the_only_recovery_tool() -> None:
+    completions = FakeCompletions()
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    config = ApiConfig(
+        api_key=SecretStr("test-key"),
+        base_url="https://example.com/v1",
+        model="test-model",
+        context_window_tokens=32768,
+    )
+    adapter = OpenAICompatibleClient(config, client=client)
+
+    adapter.complete(
+        messages=[{"role": "user", "content": "register checks"}],
+        tools=[{"type": "function", "function": {"name": "register_verification"}}],
+        options=ModelRequestOptions(required_tool="register_verification"),
+    )
+
+    assert completions.kwargs["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "register_verification"},
+    }
+
+
 def test_complete_maps_adaptive_effort_to_provider_capabilities() -> None:
     completions = FakeCompletions()
     client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
@@ -375,12 +398,25 @@ def test_streaming_falls_back_when_provider_rejects_usage_options() -> None:
     )
     adapter = OpenAICompatibleClient(config, client=client, event_logger=events)
 
-    result = adapter.complete(messages=[{"role": "user", "content": "task"}], tools=[])
+    tools = [{"type": "function", "function": {"name": "register_verification"}}]
+    result = adapter.complete(
+        messages=[{"role": "user", "content": "task"}],
+        tools=tools,
+        options=ModelRequestOptions(required_tool="register_verification"),
+    )
 
     assert result.content == "fallback"
     assert len(completions.requests) == 2
     assert "stream_options" in completions.requests[0]
     assert "stream_options" not in completions.requests[1]
+    assert all(
+        request["tool_choice"]
+        == {
+            "type": "function",
+            "function": {"name": "register_verification"},
+        }
+        for request in completions.requests
+    )
     assert any(name == "model_stream_usage_unavailable" for name, _data in events.events)
 
 
