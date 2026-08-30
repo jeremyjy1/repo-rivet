@@ -10,7 +10,6 @@ from repo_rivet.skills.models import ActiveSkillPin
 class WorkflowMode(StrEnum):
     EXECUTE = "execute"
     PLANNING = "planning"
-    PLAN_READY = "plan_ready"
 
 
 class PlanStatus(StrEnum):
@@ -23,14 +22,10 @@ class PlanStatus(StrEnum):
 
 class PlanStepStatus(StrEnum):
     PENDING = "pending"
-    READY = "ready"
     RUNNING = "running"
     COMPLETED = "completed"
-    SATISFIED = "satisfied"
     BLOCKED = "blocked"
     FAILED = "failed"
-    STALE = "stale"
-    SKIPPED = "skipped"
 
 
 class PlanOperation(StrEnum):
@@ -39,19 +34,6 @@ class PlanOperation(StrEnum):
     DELETE = "delete"
     COMMAND = "command"
     VERIFY = "verify"
-
-
-class CompletionPredicateKind(StrEnum):
-    ACTION_SUCCEEDED = "action_succeeded"
-    VERIFICATION_PASSED = "verification_passed"
-
-
-class CompletionPredicate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    kind: CompletionPredicateKind
-    check_id: str | None = Field(default=None, max_length=100)
-    revision_scope: str = Field(default="current_workspace", max_length=100)
 
 
 class PlanVerification(BaseModel):
@@ -81,11 +63,6 @@ class PlanStepSpec(BaseModel):
         ),
     )
     verification_ids: list[str] = Field(default_factory=list, max_length=50)
-    completion_predicates: list[CompletionPredicate] = Field(
-        default_factory=list,
-        max_length=50,
-    )
-    depends_on: list[str] = Field(default_factory=list, max_length=50)
     risk: str = Field(pattern=r"^(low|medium|high)$")
 
     @model_validator(mode="after")
@@ -97,19 +74,6 @@ class PlanStepSpec(BaseModel):
             raise ValueError(f"{self.operation.value} steps require exactly one target path")
         if self.operation == PlanOperation.VERIFY and len(self.verification_ids) != 1:
             raise ValueError("verify steps require exactly one verification ID")
-        if not self.completion_predicates:
-            if self.verification_ids:
-                self.completion_predicates = [
-                    CompletionPredicate(
-                        kind=CompletionPredicateKind.VERIFICATION_PASSED,
-                        check_id=check_id,
-                    )
-                    for check_id in self.verification_ids
-                ]
-            else:
-                self.completion_predicates = [
-                    CompletionPredicate(kind=CompletionPredicateKind.ACTION_SUCCEEDED)
-                ]
         return self
 
 
@@ -135,45 +99,6 @@ class PlanDraft(BaseModel):
         step_ids = [step.step_id for step in self.steps]
         if len(step_ids) != len(set(step_ids)):
             raise ValueError("plan step IDs must be unique")
-        known_steps = set(step_ids)
-        step_positions = {step_id: index for index, step_id in enumerate(step_ids)}
-        for step in self.steps:
-            missing = set(step.depends_on) - known_steps
-            if missing:
-                raise ValueError(
-                    f"step {step.step_id} depends on unknown steps: {', '.join(sorted(missing))}"
-                )
-            if step.step_id in step.depends_on:
-                raise ValueError(f"step {step.step_id} cannot depend on itself")
-            later_dependencies = [
-                dependency
-                for dependency in step.depends_on
-                if step_positions[dependency] > step_positions[step.step_id]
-            ]
-            if later_dependencies:
-                raise ValueError(
-                    f"step {step.step_id} depends on later steps: "
-                    + ", ".join(sorted(later_dependencies))
-                )
-
-        visiting: set[str] = set()
-        visited: set[str] = set()
-        dependencies = {step.step_id: step.depends_on for step in self.steps}
-
-        def visit(step_id: str) -> None:
-            if step_id in visiting:
-                raise ValueError("plan step dependencies contain a cycle")
-            if step_id in visited:
-                return
-            visiting.add(step_id)
-            for dependency in dependencies[step_id]:
-                visit(dependency)
-            visiting.remove(step_id)
-            visited.add(step_id)
-
-        for step_id in step_ids:
-            visit(step_id)
-
         verification_ids = [item.check_id for item in self.verification]
         if len(verification_ids) != len(set(verification_ids)):
             raise ValueError("plan verification IDs must be unique")
@@ -226,12 +151,22 @@ class PlanArtifact(PlanDraft):
                 if step.status
                 in {
                     PlanStepStatus.PENDING,
-                    PlanStepStatus.READY,
                     PlanStepStatus.RUNNING,
                     PlanStepStatus.BLOCKED,
                     PlanStepStatus.FAILED,
-                    PlanStepStatus.STALE,
                 }
             ),
             None,
         )
+
+    def as_draft(self) -> PlanDraft:
+        """Project controller-owned execution state out of the model-editable plan."""
+        payload = self.model_dump(
+            mode="json",
+            include=set(PlanDraft.model_fields) - {"steps"},
+        )
+        payload["steps"] = [
+            step.model_dump(mode="json", include=set(PlanStepSpec.model_fields))
+            for step in self.steps
+        ]
+        return PlanDraft.model_validate(payload)

@@ -77,8 +77,8 @@ class VerificationRuntime:
         memory = self._memory()
         memory.verification_plan = plan
         memory.verification_results.clear()
-        if memory.runtime_v2 is not None:
-            memory.runtime_v2.revisions.verification_plan += 1
+        if memory.runtime is not None:
+            memory.runtime.revisions.verification_plan += 1
         return plan
 
     def check(self, check_id: str) -> VerificationCheck:

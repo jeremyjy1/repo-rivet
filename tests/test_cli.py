@@ -1,5 +1,7 @@
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
+from typing import cast
 
 from rich.console import Console
 
@@ -9,7 +11,7 @@ from repo_rivet.cli import _chat_loop, _print_result, build_parser, cli
 from repo_rivet.memory.context_manager import SYSTEM_PROMPT
 from repo_rivet.memory.models import MemoryConfig, MemoryState, Message
 from repo_rivet.memory.store import MemoryStore
-from repo_rivet.planning.models import WorkflowMode
+from repo_rivet.planning.models import PlanArtifact, PlanStatus, WorkflowMode
 from repo_rivet.verification.models import VerificationOutcome
 
 
@@ -405,10 +407,8 @@ def test_approval_plan_shortcut_enters_planning_workflow() -> None:
 def test_chat_execute_command_approves_plan_without_approving_tools() -> None:
     agent = FakeConversationAgent()
     plan_runtime = FakePlanRuntime()
-    memory = MemoryState(
-        session_id="chat-execute",
-        workflow_mode=WorkflowMode.PLAN_READY,
-    )
+    memory = MemoryState(session_id="chat-execute")
+    memory.plan_artifact = cast(PlanArtifact, SimpleNamespace(status=PlanStatus.READY))
     inputs = iter([":execute", "/exit"])
     console = Console(file=StringIO(), force_terminal=False, color_system=None)
 
@@ -428,10 +428,8 @@ def test_chat_execute_command_approves_plan_without_approving_tools() -> None:
 
 def test_chat_requires_explicit_review_action_for_ready_plan() -> None:
     agent = FakeConversationAgent()
-    memory = MemoryState(
-        session_id="chat-plan-ready",
-        workflow_mode=WorkflowMode.PLAN_READY,
-    )
+    memory = MemoryState(session_id="chat-plan-ready")
+    memory.plan_artifact = cast(PlanArtifact, SimpleNamespace(status=PlanStatus.READY))
     inputs = iter(["make changes", "/exit"])
     buffer = StringIO()
     console = Console(file=buffer, force_terminal=False, color_system=None)

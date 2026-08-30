@@ -119,7 +119,6 @@ def test_mutating_tool_without_decision_is_rejected_before_executor() -> None:
     assert result.status == "success"
     assert tools.calls == []
     assert memory.observation_events == []
-    assert not memory.reflection_required
     tool_payload = next(
         message.content or "" for message in memory.messages if message.tool_call_id == "write-1"
     )
@@ -133,7 +132,6 @@ def test_non_plan_delete_uses_structured_approval_as_decision(tmp_path: Path) ->
     memory.modified_files.add("src")
     memory.invalidated_files.add("src/main.cpp")
     memory.workspace_revision = 1
-    memory.reflection_required = True
     approval = ApprovalEngine(
         mode=ApprovalMode.ALLOW_ALL,
         normalizer=RequestNormalizer(tmp_path),
@@ -180,7 +178,6 @@ def test_non_plan_delete_uses_structured_approval_as_decision(tmp_path: Path) ->
     assert result.status == "success"
     assert not target.exists()
     assert memory.reasoning_events == []
-    assert not memory.reflection_required
     assert not any(
         message.tool_call_id == "delete-1"
         and "decision_validation_failed" in (message.content or "")
@@ -244,7 +241,6 @@ def test_delete_preflight_failure_can_be_corrected_without_reflection(tmp_path: 
 
     assert result.status == "success"
     assert not directory.exists()
-    assert not memory.reflection_required
     first_result = next(message for message in memory.messages if message.tool_call_id == first.id)
     assert "invalid_delete_target" in (first_result.content or "")
 
@@ -351,7 +347,6 @@ def test_more_than_one_state_changing_action_in_a_turn_is_rejected() -> None:
 
     assert tools.calls == []
     assert memory.observation_events == []
-    assert not memory.reflection_required
 
 
 def test_standalone_decision_authorizes_immediately_following_matching_action() -> None:
@@ -405,7 +400,6 @@ def test_protocol_rejection_does_not_require_reflection_or_count_as_tool_failure
     assert result.status == "success"
     assert result.tool_call_count == 1
     assert tools.calls == [accepted]
-    assert not memory.reflection_required
     assert all(event.tool_call_id != "command-rejected" for event in memory.observation_events)
 
 
@@ -709,7 +703,6 @@ def test_failed_action_blocks_identical_replay_but_allows_distinct_recovery() ->
         message.content or "" for message in memory.messages if message.tool_call_id == "command-2"
     )
     assert "recovery state forbids repeating" in blocked_payload
-    assert not memory.reflection_required
 
 
 def test_task_decision_cannot_bypass_independent_human_approval(tmp_path: Path) -> None:
@@ -754,6 +747,5 @@ def test_task_decision_cannot_bypass_independent_human_approval(tmp_path: Path) 
         event for event in memory.observation_events if event.tool_call_id == "write-1"
     )
     assert not write_observation.ok
-    assert not memory.reflection_required
-    assert memory.runtime_v2 is not None
-    assert memory.runtime_v2.recovery is not None
+    assert memory.runtime is not None
+    assert memory.runtime.recovery is not None

@@ -1,4 +1,4 @@
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Any
 
 from repo_rivet.llm.base import ModelRequestOptions, ModelResponse
@@ -45,3 +45,14 @@ class FakeToolRegistry:
     def execute(self, call: ToolCall) -> ToolResult:
         self.calls.append(call)
         return next(self._results)
+
+    def execute_with_lifecycle(
+        self,
+        call: ToolCall,
+        observer: Callable[[str, dict[str, Any]], None] | None = None,
+    ) -> ToolResult:
+        notify = observer or (lambda _stage, _payload: None)
+        notify("prepared", {"valid": True})
+        notify("dispatched", {})
+        notify("running", {})
+        return self.execute(call)

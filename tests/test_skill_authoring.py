@@ -61,7 +61,7 @@ def test_generate_portable_skill_and_refuse_overwrite_or_invalid_name(tmp_path: 
         create_skill(skill_id="Invalid Name", output_root=tmp_path / "drafts")
 
 
-def test_convert_skill_removes_host_metadata_and_preserves_resources(tmp_path: Path) -> None:
+def test_convert_markdown_keeps_standard_metadata_and_resources(tmp_path: Path) -> None:
     source = tmp_path / "foreign" / "SKILL.md"
     reference = source.parent / "references" / "details.md"
     reference.parent.mkdir(parents=True)
@@ -89,9 +89,9 @@ Read the implementation, locate the failure, and explain the repair.
         skill_id="legacy-debug-helper",
     )
 
-    assert report.source_format == "claude"
+    assert report.source_format == "markdown"
     assert set(report.dropped_fields) == {"hooks", "model"}
-    assert any("Executable metadata was removed" in warning for warning in report.warnings)
+    assert report.warnings == ("Non-standard front matter was omitted: hooks, model",)
     rendered = report.target.read_text(encoding="utf-8")
     assert "bootstrap.sh" not in rendered
     assert "provider-specific-model" not in rendered
@@ -174,7 +174,7 @@ def test_cli_init_validate_convert_and_builtin_authoring_skill(
         )
         == 0
     )
-    assert "Detected format: generic-markdown" in buffer.getvalue()
+    assert "Detected format: markdown" in buffer.getvalue()
 
     builtin = (
         Path(__file__).parents[1]

@@ -48,8 +48,6 @@ class TerminationPolicy:
         now: float | None = None,
         include_step_limit: bool = True,
     ) -> str | None:
-        if state.interrupted:
-            return "interrupted by user"
         step_limit = self.step_limit(state)
         if include_step_limit and state.step_count >= step_limit:
             return self.step_checkpoint_reason(state)

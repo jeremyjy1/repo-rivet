@@ -72,7 +72,6 @@ def plan_payload(*, operation: str = "edit", target: str = "app.py") -> dict[str
                 "evidence_refs": ["obs-read"],
                 "operation": "verify",
                 "verification_ids": ["tests"],
-                "depends_on": ["change"],
                 "risk": "low",
             },
         ],
@@ -97,15 +96,7 @@ def inspected_memory(workspace: Path) -> MemoryState:
     return memory
 
 
-def test_plan_draft_rejects_cycles_and_missing_verify_steps() -> None:
-    payload = plan_payload()
-    steps = payload["steps"]
-    assert isinstance(steps, list)
-    steps[0]["depends_on"] = ["verify"]  # type: ignore[index]
-
-    with pytest.raises(ValueError, match="depends on later steps"):
-        PlanDraft.model_validate(payload)
-
+def test_plan_draft_rejects_missing_verify_steps() -> None:
     payload = plan_payload()
     steps = payload["steps"]
     assert isinstance(steps, list)
@@ -233,19 +224,23 @@ def test_plan_runtime_binds_snapshot_and_rejects_stale_execution(tmp_path: Path)
     assert artifact.status == PlanStatus.READY
     assert artifact.workspace_revision == 0
     assert set(artifact.snapshots) == {"app.py"}
-    assert memory.workflow_mode == WorkflowMode.PLAN_READY
+    assert memory.workflow_mode == WorkflowMode.EXECUTE
+    projected_steps = artifact.as_draft().model_dump(mode="json")["steps"]
+    assert all(
+        not {"status", "last_observation_ref", "last_error"} & set(step) for step in projected_steps
+    )
 
     store = MemoryStore(tmp_path / "session")
     store.save_state(memory, status="plan_ready")
     restored = store.load_state()
     assert restored.plan_artifact == artifact
-    assert restored.workflow_mode == WorkflowMode.PLAN_READY
+    assert restored.workflow_mode == WorkflowMode.EXECUTE
 
     (tmp_path / "app.py").write_text("value = 2\n", encoding="utf-8")
     with pytest.raises(ValueError, match="Plan is stale"):
         runtime.approve()
     assert artifact.status == PlanStatus.STALE
-    assert memory.workflow_mode == WorkflowMode.PLAN_READY
+    assert memory.workflow_mode == WorkflowMode.EXECUTE
 
 
 def test_plan_runtime_rejects_duplicate_normalized_create_targets(tmp_path: Path) -> None:
@@ -266,11 +261,9 @@ def test_plan_runtime_rejects_duplicate_normalized_create_targets(tmp_path: Path
             "operation": "create",
             "target_files": ["./new.py"],
             "verification_ids": ["tests"],
-            "depends_on": ["change"],
             "risk": "low",
         },
     )
-    steps[2]["depends_on"] = ["create-again"]  # type: ignore[index]
 
     with pytest.raises(ValueError, match="create target new.py is repeated"):
         runtime.submit({"plan": payload})
@@ -403,7 +396,6 @@ def test_completed_file_target_can_be_refined_during_the_next_edit_step(
                         "evidence_refs": ["obs-read"],
                         "operation": "edit",
                         "target_files": ["src/Board.cpp"],
-                        "depends_on": ["edit-board-header"],
                         "risk": "low",
                     },
                     {
@@ -413,7 +405,6 @@ def test_completed_file_target_can_be_refined_during_the_next_edit_step(
                         "evidence_refs": ["obs-read"],
                         "operation": "verify",
                         "verification_ids": ["board-tests"],
-                        "depends_on": ["edit-board-source"],
                         "risk": "low",
                     },
                 ],
@@ -634,7 +625,7 @@ def test_execute_plan_exposes_only_current_step_side_effect_capability(tmp_path:
     assert "write_file" not in names
 
 
-def test_out_of_scope_edit_forces_one_plan_update_turn(tmp_path: Path) -> None:
+def test_scope_revision_can_reread_invalidated_target_before_plan_update(tmp_path: Path) -> None:
     memory = inspected_memory(tmp_path)
     makefile = tmp_path / "Makefile"
     makefile.write_text("build:\n\ttrue\n", encoding="utf-8")
@@ -656,6 +647,7 @@ def test_out_of_scope_edit_forces_one_plan_update_turn(tmp_path: Path) -> None:
     registry.plan_runtime.bind(memory)
     registry.plan_runtime.submit({"plan": plan_payload()})
     registry.plan_runtime.approve()
+    memory.invalidated_files.add("app.py")
     out_of_scope_edit = ToolCall(
         id="edit-makefile",
         name="edit_file",
@@ -686,11 +678,9 @@ def test_out_of_scope_edit_forces_one_plan_update_turn(tmp_path: Path) -> None:
             "operation": "edit",
             "target_files": ["Makefile"],
             "verification_ids": ["tests"],
-            "depends_on": ["change"],
             "risk": "low",
         },
     )
-    steps[2]["depends_on"] = ["repair-build"]  # type: ignore[index]
     update = ToolCall(
         id="update-plan",
         name="update_plan",
@@ -703,6 +693,24 @@ def test_out_of_scope_edit_forces_one_plan_update_turn(tmp_path: Path) -> None:
         [
             ModelResponse(tool_calls=[out_of_scope_edit]),
             ModelResponse(tool_calls=[update]),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="reread-app",
+                        name="read_file",
+                        arguments={"path": "app.py"},
+                    )
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="update-plan-retry",
+                        name="update_plan",
+                        arguments=update.arguments,
+                    )
+                ]
+            ),
         ]
     )
 
@@ -716,8 +724,16 @@ def test_out_of_scope_edit_forces_one_plan_update_turn(tmp_path: Path) -> None:
     assert memory.plan_artifact.status == PlanStatus.READY
     assert "Makefile" in memory.plan_artifact.affected_files
     assert memory.plan_scope_revision_required is False
+    assert "app.py" not in memory.invalidated_files
     second_request_tools = {schema["function"]["name"] for schema in model.requests[1]["tools"]}
-    assert second_request_tools == {"update_plan"}
+    assert second_request_tools == {
+        "git_diff",
+        "git_status",
+        "list_files",
+        "read_file",
+        "search_text",
+        "update_plan",
+    }
     recovery = next(
         json.loads(message["content"])
         for message in model.requests[1]["messages"]
@@ -725,7 +741,19 @@ def test_out_of_scope_edit_forces_one_plan_update_turn(tmp_path: Path) -> None:
         and isinstance(message.get("content"), str)
         and '"plan_scope_revision_required":true' in message["content"]
     )
-    assert recovery["allowed_next_actions"] == ["update_plan"]
+    assert set(recovery["allowed_next_actions"]) == second_request_tools
+    retry_feedback = next(
+        json.loads(message["content"])
+        for message in model.requests[2]["messages"]
+        if message.get("role") == "system"
+        and isinstance(message.get("content"), str)
+        and '"error":"plan_scope_revision_required"' in message["content"]
+        and '"current_plan":' in message["content"]
+    )
+    assert all(
+        not {"status", "last_observation_ref", "last_error"} & set(step)
+        for step in retry_feedback["current_plan"]["steps"]
+    )
     assert makefile.read_text(encoding="utf-8") == "build:\n\ttrue\n"
 
 
@@ -760,7 +788,6 @@ def test_plan_step_transition_corrects_replay_of_completed_create(tmp_path: Path
                         "operation": "create",
                         "target_files": ["second.py"],
                         "verification_ids": ["tests"],
-                        "depends_on": ["create-first"],
                         "risk": "low",
                     },
                     {
@@ -770,7 +797,6 @@ def test_plan_step_transition_corrects_replay_of_completed_create(tmp_path: Path
                         "evidence_refs": ["obs-read"],
                         "operation": "verify",
                         "verification_ids": ["tests"],
-                        "depends_on": ["create-second"],
                         "risk": "low",
                     },
                 ],
@@ -1094,11 +1120,9 @@ def test_plan_update_preserves_completed_steps_and_clears_old_reflection(
             "operation": "edit",
             "target_files": ["new.py"],
             "verification_ids": ["tests"],
-            "depends_on": ["change"],
             "risk": "low",
         },
     )
-    steps[2]["depends_on"] = ["fix-selftest"]  # type: ignore[index]
 
     updated = runtime.submit(
         {"plan": revised},
@@ -1107,10 +1131,8 @@ def test_plan_update_preserves_completed_steps_and_clears_old_reflection(
 
     assert updated.steps[0].status == PlanStepStatus.COMPLETED
     assert updated.steps[0].last_observation_ref == "obs-write"
-    memory.reflection_required = True
     runtime.approve()
     assert updated.current_step is updated.steps[1]
-    assert not memory.reflection_required
 
 
 def test_plan_mode_hides_and_rejects_mutating_capabilities(tmp_path: Path) -> None:

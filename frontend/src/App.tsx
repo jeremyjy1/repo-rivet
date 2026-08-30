@@ -187,7 +187,7 @@ function App() {
   useEffect(() => {
     if (session?.run?.settings.mode) {
       setMode(session.run.settings.mode);
-    } else if (session?.workflow_mode === "planning" || session?.workflow_mode === "plan_ready") {
+    } else if (session?.workflow_mode === "planning") {
       setMode("planning");
     } else if (session?.workflow_mode === "execute") {
       setMode("execute");
@@ -282,6 +282,7 @@ function App() {
 
   const approval = session?.run?.pending_approval || null;
   const isRunning = ["queued", "running", "awaiting_approval", "stopping"].includes(session?.run?.status || "");
+  const planReady = session?.plan?.status === "ready" || session?.plan?.status === "stale";
   const updateOptions = (updates: Partial<{
     mode: "execute" | "planning";
     approvalMode: string;
@@ -384,7 +385,7 @@ function App() {
           isRunning={isRunning}
           mode={mode}
           setMode={(value) => updateOptions({ mode: value })}
-          planReady={session?.workflow_mode === "plan_ready"}
+          planReady={planReady}
           autoPlan={autoPlan}
           setAutoPlan={(value) => updateOptions({ autoPlan: value })}
           approvalMode={approvalMode}

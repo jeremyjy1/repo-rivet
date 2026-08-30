@@ -1,10 +1,8 @@
-"""Pure reducer for v2 run, model-call, and action lifecycle events."""
+"""Pure reducer for run, model-call, and action lifecycle events."""
 
 from __future__ import annotations
 
 from datetime import UTC, datetime
-
-from pydantic import BaseModel, ConfigDict, Field
 
 from repo_rivet.actions.models import (
     ActionRecord,
@@ -22,19 +20,12 @@ from repo_rivet.agent.phases import (
     WaitState,
     WorkflowPhase,
 )
-from repo_rivet.agent.runtime_state import AgentRuntimeState
-from repo_rivet.events.models import DomainEvent, DomainEventKind, Effect, EffectKind
+from repo_rivet.agent.runtime import AgentRuntimeState
+from repo_rivet.events.models import DomainEvent, DomainEventKind
 
 
 class TransitionError(RuntimeError):
     """Raised when an event requests an impossible state transition."""
-
-
-class TransitionResult(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    state: AgentRuntimeState
-    effects: list[Effect] = Field(default_factory=list)
 
 
 _ACTION_TRANSITIONS: dict[ActionStatus, set[ActionStatus]] = {
@@ -80,7 +71,7 @@ def _action(state: AgentRuntimeState, event: DomainEvent) -> ActionRecord:
         raise TransitionError(f"Unknown action for {event.kind}: {action_id}") from None
 
 
-def reduce(state: AgentRuntimeState, event: DomainEvent) -> TransitionResult:
+def reduce(state: AgentRuntimeState, event: DomainEvent) -> AgentRuntimeState:
     """Return a new state without performing any external side effect."""
     if event.seq != state.last_event_seq + 1:
         raise TransitionError(
@@ -116,7 +107,6 @@ def reduce(state: AgentRuntimeState, event: DomainEvent) -> TransitionResult:
         if active is None or active.status != ActionStatus.OBSERVED:
             value.phase = WorkflowPhase.RECOVERING
         value.wait = None
-        value.current_decision_epoch_id = None
         recovery = event.payload.get("recovery")
         if recovery is not None:
             value.recovery = RecoveryState.model_validate(recovery)
@@ -128,7 +118,6 @@ def reduce(state: AgentRuntimeState, event: DomainEvent) -> TransitionResult:
         record = ModelCallRecord.model_validate(event.payload["model_call"])
         value.model_call = record
         value.decision_epoch = DecisionEpoch.model_validate(event.payload["decision_epoch"])
-        value.current_decision_epoch_id = record.decision_epoch_id
         value.status = RunStatus.WAITING
         value.wait = WaitState(
             kind=WaitKind.MODEL_RESPONSE,
@@ -266,33 +255,7 @@ def reduce(state: AgentRuntimeState, event: DomainEvent) -> TransitionResult:
         value.status = RunStatus(event.payload["status"])
         value.terminal_reason = event.payload.get("reason")
         value.wait = None
-        value.current_decision_epoch_id = None
     else:  # pragma: no cover - exhaustive guard for future enum additions
         raise TransitionError(f"Unhandled domain event: {kind}")
 
-    effects = [
-        Effect(
-            kind=EffectKind.PERSIST_CHECKPOINT,
-            correlation_id=event.correlation_id,
-            payload={"event_id": event.event_id, "state_version": value.state_version},
-        ),
-        Effect(
-            kind=EffectKind.EMIT_UI_EVENT,
-            correlation_id=event.correlation_id,
-            payload={"event_id": event.event_id, "domain_event": event.kind.value},
-        ),
-    ]
-    external_effect = {
-        DomainEventKind.MODEL_CALL_STARTED: EffectKind.CALL_MODEL,
-        DomainEventKind.APPROVAL_REQUESTED: EffectKind.REQUEST_APPROVAL,
-        DomainEventKind.ACTION_DISPATCHED: EffectKind.EXECUTE_TOOL,
-    }.get(kind)
-    if external_effect is not None:
-        effects.append(
-            Effect(
-                kind=external_effect,
-                correlation_id=event.correlation_id,
-                payload=event.payload,
-            )
-        )
-    return TransitionResult(state=value, effects=effects)
+    return value

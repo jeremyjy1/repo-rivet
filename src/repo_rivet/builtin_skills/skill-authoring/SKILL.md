@@ -51,7 +51,7 @@ When converting another agent's Skill:
 
 - Preserve its reusable Markdown instructions and portable resources.
 - Normalize the directory and `name` together.
-- Map a legacy summary to `description` and a simple version to `metadata.version`.
+- Supply an explicit standard `description` when the source does not have one.
 - Omit provider models, lifecycle hooks, callbacks, permission claims, and other host-only fields.
 - Report meaningful behavior that could not be represented instead of hiding the loss.
 

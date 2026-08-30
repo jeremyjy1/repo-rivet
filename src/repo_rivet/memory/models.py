@@ -6,7 +6,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from repo_rivet.agent.runtime_state import AgentRuntimeState
+from repo_rivet.agent.runtime import AgentRuntimeState
 from repo_rivet.approval.models import ApprovalMode, OperationClass
 from repo_rivet.memory.token_estimator import ApproximateTokenEstimator
 from repo_rivet.planning.models import PlanArtifact, WorkflowMode
@@ -237,7 +237,7 @@ class MemoryState(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     session_id: str
-    runtime_v2: AgentRuntimeState | None = None
+    runtime: AgentRuntimeState | None = None
     applied_action_ids: set[str] = Field(default_factory=set)
     config: MemoryConfig = Field(default_factory=MemoryConfig)
     fixed: FixedMemory | None = None
@@ -284,7 +284,6 @@ class MemoryState(BaseModel):
     plan_update_reason: str | None = Field(default=None, max_length=1_000)
     reasoning_events: list[ReasoningEvent] = Field(default_factory=list)
     observation_events: list[ObservationEvent] = Field(default_factory=list)
-    reflection_required: bool = False
     last_agent_outcome: (
         Literal["success", "plan_ready", "incomplete", "blocked", "stopped", "error"] | None
     ) = None
@@ -347,13 +346,12 @@ class MemoryState(BaseModel):
         self.plan_scope_revision_attempts = 0
         self.candidate_final_assessment = None
         self.last_model_error = None
-        self.reflection_required = False
         self.working.recent_modified_files.clear()
         self.working.last_verification_result = None
         self.plan_artifact = None
         self.plan_update_reason = None
         self.workflow_mode = WorkflowMode.EXECUTE
-        self.runtime_v2 = None
+        self.runtime = None
         self.applied_action_ids.clear()
         self.last_agent_outcome = None
 
@@ -372,7 +370,6 @@ class MemoryState(BaseModel):
         self.working.current_focus = normalized
         self.working.pending_actions.clear()
         self.candidate_final_assessment = None
-        self.reflection_required = False
 
     def repair_interrupted_tool_history(
         self,
@@ -514,23 +511,21 @@ class MemoryState(BaseModel):
         if call.name == "read_file" and result.ok and isinstance(path, str):
             sha256 = metadata.get("sha256")
             if isinstance(sha256, str):
+                was_invalidated = path in self.invalidated_files
                 existing = self.file_memories.get(path)
                 if existing and existing.sha256 == sha256:
                     existing.last_read_step = step
                     existing.content_preview = (result.raw_output or result.output)[:2_000]
                 else:
-                    was_invalidated = path in self.invalidated_files
                     self.file_memories[path] = FileMemory(
                         path=path,
                         sha256=sha256,
                         last_read_step=step,
                         content_preview=(result.raw_output or result.output)[:2_000],
                     )
-                    self.invalidated_files.discard(path)
-                    if was_invalidated:
-                        context_output = (
-                            f"Latest version after prior invalidation:\n{context_output}"
-                        )
+                self.invalidated_files.discard(path)
+                if was_invalidated:
+                    context_output = f"Latest version after prior invalidation:\n{context_output}"
                 add_unique(self.summary.files_read, path)
                 snapshot_id = metadata.get("snapshot_id")
                 if isinstance(snapshot_id, str):

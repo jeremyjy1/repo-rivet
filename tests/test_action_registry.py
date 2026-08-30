@@ -7,8 +7,8 @@ from repo_rivet.actions.models import (
     DuplicateDisposition,
 )
 from repo_rivet.actions.registry import ActionRegistry
-from repo_rivet.agent.phases import RevisionVector, WorkflowPhase
-from repo_rivet.agent.runtime_state import AgentRuntimeState
+from repo_rivet.agent.phases import RevisionVector
+from repo_rivet.agent.runtime import AgentRuntimeState
 from repo_rivet.memory.models import MemoryState
 from repo_rivet.tools.base import ToolCall
 
@@ -30,10 +30,8 @@ def test_verification_result_is_reused_only_at_same_revision() -> None:
     record = ActionRegistry.build_record(
         call,
         semantic_key=key,
-        runtime=runtime,
         revisions=runtime.revisions,
         plan_step_id="verify",
-        continuation_phase=WorkflowPhase.VERIFYING,
     )
     record.status = ActionStatus.SUCCEEDED
     record.result = ActionResultSnapshot(ok=True, output="passed")
@@ -72,10 +70,8 @@ def test_failed_action_requires_an_alternative_not_external_replay() -> None:
     record = ActionRegistry.build_record(
         call,
         semantic_key=key,
-        runtime=runtime,
         revisions=runtime.revisions,
         plan_step_id=None,
-        continuation_phase=WorkflowPhase.RECOVERING,
     )
     record.status = ActionStatus.FAILED
     record.result = ActionResultSnapshot(ok=False, output="", error="failed")

@@ -159,9 +159,9 @@ class MemoryStore:
         if changed:
             memory.context_checkpoint = None
             memory.workspace_revision += 1
-            if memory.runtime_v2 is not None:
-                memory.runtime_v2.revisions.workspace = memory.workspace_revision
-                memory.runtime_v2.revisions.knowledge += 1
+            if memory.runtime is not None:
+                memory.runtime.revisions.workspace = memory.workspace_revision
+                memory.runtime.revisions.knowledge += 1
             for check_id, result in list(memory.verification_results.items()):
                 if result.status != VerificationStatus.STALE:
                     memory.verification_results[check_id] = result.model_copy(
@@ -229,9 +229,7 @@ class MemoryStore:
 
         runtime_results = {
             action.tool_call_id: action.result
-            for action in (
-                memory.runtime_v2.actions.values() if memory.runtime_v2 is not None else ()
-            )
+            for action in (memory.runtime.actions.values() if memory.runtime is not None else ())
             if action.result is not None and not action.result_applied
         }
 

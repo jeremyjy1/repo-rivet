@@ -22,13 +22,9 @@ class SkillActivation(StrEnum):
 
 
 class SkillManifest(BaseModel):
-    """Portable ``SKILL.md`` front matter.
+    """Portable ``SKILL.md`` front matter accepted by RepoRivet."""
 
-    Unknown fields are retained but never interpreted as RepoRivet policy. This keeps discovery
-    forward compatible while ensuring a Skill cannot grant itself capabilities.
-    """
-
-    model_config = ConfigDict(extra="allow", frozen=True, populate_by_name=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
 
     name: str = Field(
         min_length=1,

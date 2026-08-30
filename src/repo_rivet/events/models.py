@@ -1,4 +1,4 @@
-"""Event and effect envelopes used by the v2 runtime kernel."""
+"""Domain event envelopes used by the runtime kernel."""
 
 from __future__ import annotations
 
@@ -32,15 +32,6 @@ class DomainEventKind(StrEnum):
     RUN_FINISHED = "run_finished"
 
 
-class EffectKind(StrEnum):
-    CALL_MODEL = "call_model"
-    REQUEST_APPROVAL = "request_approval"
-    EXECUTE_TOOL = "execute_tool"
-    RUN_VERIFICATION = "run_verification"
-    PERSIST_CHECKPOINT = "persist_checkpoint"
-    EMIT_UI_EVENT = "emit_ui_event"
-
-
 class DomainEvent(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -50,12 +41,3 @@ class DomainEvent(BaseModel):
     correlation_id: str | None = None
     payload: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
-
-
-class Effect(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    effect_id: str = Field(default_factory=lambda: f"effect-{uuid4().hex[:12]}")
-    kind: EffectKind
-    correlation_id: str | None = None
-    payload: dict[str, Any] = Field(default_factory=dict)

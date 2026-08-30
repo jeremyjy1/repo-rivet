@@ -5,15 +5,14 @@ from __future__ import annotations
 from typing import Any
 
 from repo_rivet.agent.invariants import assert_state_invariants
-from repo_rivet.agent.runtime_state import AgentRuntimeState
-from repo_rivet.events.models import DomainEvent, DomainEventKind, Effect
+from repo_rivet.agent.runtime import AgentRuntimeState
+from repo_rivet.events.models import DomainEvent, DomainEventKind
 from repo_rivet.events.reducer import reduce
 
 
 class RuntimeKernel:
     def __init__(self, state: AgentRuntimeState) -> None:
         self.state = state
-        self.last_effects: list[Effect] = []
         assert_state_invariants(state)
 
     def dispatch(
@@ -29,8 +28,7 @@ class RuntimeKernel:
             correlation_id=correlation_id,
             payload=payload or {},
         )
-        transition = reduce(self.state, event)
-        assert_state_invariants(transition.state)
-        self.state = transition.state
-        self.last_effects = transition.effects
+        next_state = reduce(self.state, event)
+        assert_state_invariants(next_state)
+        self.state = next_state
         return event

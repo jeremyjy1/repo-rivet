@@ -87,10 +87,10 @@ class PlanRuntime:
             skill=memory.active_skill,
         )
         memory.plan_artifact = artifact
-        memory.workflow_mode = WorkflowMode.PLAN_READY
+        memory.workflow_mode = WorkflowMode.EXECUTE
         memory.plan_update_reason = update_reason
-        if memory.runtime_v2 is not None:
-            memory.runtime_v2.revisions.plan += 1
+        if memory.runtime is not None:
+            memory.runtime.revisions.plan += 1
         return artifact
 
     def approve(self) -> PlanArtifact:
@@ -99,7 +99,6 @@ class PlanRuntime:
         stale_reasons = self.stale_reasons(artifact)
         if stale_reasons:
             artifact.status = PlanStatus.STALE
-            memory.workflow_mode = WorkflowMode.PLAN_READY
             raise ValueError("Plan is stale: " + "; ".join(stale_reasons))
         artifact.status = PlanStatus.EXECUTING
         if artifact.execution_workspace_revision is None:
@@ -109,16 +108,13 @@ class PlanRuntime:
         for step in artifact.steps:
             if step.status not in {
                 PlanStepStatus.COMPLETED,
-                PlanStepStatus.SATISFIED,
-                PlanStepStatus.SKIPPED,
             }:
                 step.status = PlanStepStatus.PENDING
                 step.last_error = None
         memory.workflow_mode = WorkflowMode.EXECUTE
-        memory.reflection_required = False
         memory.working.pending_actions.clear()
-        if memory.runtime_v2 is not None:
-            memory.runtime_v2.revisions.plan += 1
+        if memory.runtime is not None:
+            memory.runtime.revisions.plan += 1
         return artifact
 
     def cancel(self) -> None:
@@ -126,8 +122,8 @@ class PlanRuntime:
         if memory.plan_artifact is not None:
             memory.plan_artifact.status = PlanStatus.CANCELLED
         memory.workflow_mode = WorkflowMode.EXECUTE
-        if memory.runtime_v2 is not None:
-            memory.runtime_v2.revisions.plan += 1
+        if memory.runtime is not None:
+            memory.runtime.revisions.plan += 1
 
     def stale_reasons(self, artifact: PlanArtifact | None = None) -> list[str]:
         memory = self._memory()
@@ -255,8 +251,6 @@ class PlanRuntime:
         step = self.matching_step(call) if call is not None else self._require_plan().current_step
         if step is not None and step.status not in {
             PlanStepStatus.COMPLETED,
-            PlanStepStatus.SATISFIED,
-            PlanStepStatus.SKIPPED,
         }:
             step.status = PlanStepStatus.RUNNING
         return step
@@ -272,7 +266,7 @@ class PlanRuntime:
         step = self.matching_step(call)
         if step is None:
             return
-        refinement = step.status in {PlanStepStatus.COMPLETED, PlanStepStatus.SATISFIED}
+        refinement = step.status == PlanStepStatus.COMPLETED
         if not refinement and step.status != PlanStepStatus.RUNNING:
             return
         passed = result.ok
@@ -336,11 +330,7 @@ class PlanRuntime:
                     else PlanStepStatus.FAILED
                 )
             step.last_error = result.error or "tool result did not satisfy the step"
-        if all(
-            item.status
-            in {PlanStepStatus.COMPLETED, PlanStepStatus.SATISFIED, PlanStepStatus.SKIPPED}
-            for item in artifact.steps
-        ):
+        if all(item.status == PlanStepStatus.COMPLETED for item in artifact.steps):
             artifact.status = PlanStatus.COMPLETED
 
     def _completed_file_refinement_step(
@@ -357,7 +347,7 @@ class PlanRuntime:
             (
                 step
                 for step in artifact.steps
-                if step.status in {PlanStepStatus.COMPLETED, PlanStepStatus.SATISFIED}
+                if step.status == PlanStepStatus.COMPLETED
                 and step.operation in {PlanOperation.CREATE, PlanOperation.EDIT}
                 and normalized_path in step.target_files
             ),

@@ -1,4 +1,4 @@
-"""Serializable v2 state shared by the reducer, Controller, and checkpoints."""
+"""Serializable state shared by the reducer, Controller, and checkpoints."""
 
 from __future__ import annotations
 
@@ -20,7 +20,6 @@ from repo_rivet.agent.phases import (
 class AgentRuntimeState(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: int = 2
     session_id: str
     run_id: str = Field(default_factory=lambda: f"run-{uuid4().hex[:12]}")
     state_version: int = Field(default=0, ge=0)
@@ -32,7 +31,6 @@ class AgentRuntimeState(BaseModel):
     actions: dict[str, ActionRecord] = Field(default_factory=dict)
     model_call: ModelCallRecord | None = None
     decision_epoch: DecisionEpoch | None = None
-    current_decision_epoch_id: str | None = None
     recovery: RecoveryState | None = None
     pending_observation_ids: list[str] = Field(default_factory=list)
     terminal_reason: str | None = None

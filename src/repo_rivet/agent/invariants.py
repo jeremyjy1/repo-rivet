@@ -1,8 +1,8 @@
-"""Fail-fast invariants for the v2 runtime state."""
+"""Fail-fast invariants for the runtime state."""
 
 from repo_rivet.actions.models import ActionStatus
 from repo_rivet.agent.phases import MODEL_PHASES, ModelCallStatus, RunStatus, WaitKind
-from repo_rivet.agent.runtime_state import AgentRuntimeState
+from repo_rivet.agent.runtime import AgentRuntimeState
 
 
 class StateInvariantError(RuntimeError):
@@ -36,8 +36,6 @@ def assert_state_invariants(state: AgentRuntimeState) -> None:
         in {
             WaitKind.APPROVAL,
             WaitKind.TOOL_COMPLETION,
-            WaitKind.PROCESS_OUTPUT,
-            WaitKind.USER_INPUT,
         }
         and state.phase in MODEL_PHASES
     ):

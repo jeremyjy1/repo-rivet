@@ -19,9 +19,6 @@ PORTABLE_FIELDS = frozenset(
     {"name", "description", "license", "compatibility", "metadata", "allowed-tools"}
 )
 PACKAGE_DIRECTORIES = ("references", "scripts", "assets")
-EXECUTABLE_FIELDS = frozenset(
-    {"hooks", "hook", "commands", "command", "on_activate", "on_deactivate", "python", "shell"}
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,22 +107,13 @@ def convert_skill(
     for field in ("license", "compatibility", "allowed-tools"):
         if field in metadata:
             portable[field] = metadata[field]
-    if "allowed-tools" not in portable:
-        declared_tools = metadata.get("allowed_tools") or metadata.get("requested_tools")
-        if declared_tools:
-            portable["allowed-tools"] = declared_tools
     portable_metadata = metadata.get("metadata")
     if isinstance(portable_metadata, dict):
         portable["metadata"] = {str(key): str(value) for key, value in portable_metadata.items()}
-    elif metadata.get("version") is not None:
-        portable["metadata"] = {"version": str(metadata["version"])}
 
     manifest = SkillManifest.model_validate(portable)
     dropped = tuple(sorted(set(metadata) - PORTABLE_FIELDS))
-    executable = _find_executable_fields(metadata)
     warnings: list[str] = []
-    if executable:
-        warnings.append("Executable metadata was removed: " + ", ".join(executable))
     if dropped:
         warnings.append("Non-standard front matter was omitted: " + ", ".join(dropped))
     target = _write_portable_skill(
@@ -288,17 +276,11 @@ def _read_source_skill(path: Path) -> tuple[dict[str, Any], str]:
 def _detect_format(metadata: dict[str, Any]) -> str:
     if set(metadata) <= PORTABLE_FIELDS and {"name", "description"} <= set(metadata):
         return "agent-skills"
-    if "schema_version" in metadata or "requested_tools" in metadata:
-        return "legacy-reporivet"
-    if "allowed-tools" in metadata or "allowed_tools" in metadata:
-        return "claude"
-    if "description" in metadata and "name" in metadata:
-        return "agent-skills-compatible"
-    return "generic-markdown"
+    return "markdown"
 
 
 def _source_name(metadata: dict[str, Any], source: Path) -> str:
-    candidate = str(metadata.get("id") or metadata.get("name") or source.parent.name)
+    candidate = str(metadata.get("name") or source.parent.name)
     normalized = re.sub(r"[^a-z0-9]+", "-", candidate.strip().lower()).strip("-")
     if not normalized:
         raise SkillValidationError("Could not derive a valid Skill name; pass --name explicitly")
@@ -306,28 +288,13 @@ def _source_name(metadata: dict[str, Any], source: Path) -> str:
 
 
 def _source_description(metadata: dict[str, Any], name: str) -> str:
-    value = str(metadata.get("description") or metadata.get("summary") or "").strip()
+    value = str(metadata.get("description") or "").strip()
     if value:
         return value[:1_024]
     return (
         f"Provide reusable guidance for {name}. Use when the user explicitly requests this "
         "workflow or the task clearly matches its purpose."
     )
-
-
-def _find_executable_fields(value: Any, *, prefix: str = "") -> list[str]:
-    found: set[str] = set()
-    if isinstance(value, dict):
-        for raw_key, nested in value.items():
-            key = str(raw_key)
-            path = f"{prefix}.{key}" if prefix else key
-            if key.lower() in EXECUTABLE_FIELDS:
-                found.add(path)
-            found.update(_find_executable_fields(nested, prefix=path))
-    elif isinstance(value, list):
-        for index, nested in enumerate(value):
-            found.update(_find_executable_fields(nested, prefix=f"{prefix}[{index}]"))
-    return sorted(found)
 
 
 def _starter_body(name: str) -> str:

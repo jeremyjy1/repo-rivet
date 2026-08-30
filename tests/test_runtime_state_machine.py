@@ -12,9 +12,9 @@ from repo_rivet.agent.phases import (
     WaitKind,
     WorkflowPhase,
 )
+from repo_rivet.agent.runtime import AgentRuntimeState
 from repo_rivet.agent.runtime_kernel import RuntimeKernel
-from repo_rivet.agent.runtime_state import AgentRuntimeState
-from repo_rivet.events.models import DomainEventKind, EffectKind
+from repo_rivet.events.models import DomainEventKind
 from repo_rivet.llm.base import ModelResponse
 from repo_rivet.memory.models import MemoryState, Message
 from tests.fakes import FakeModelClient, FakeToolRegistry
@@ -35,8 +35,6 @@ def action(runtime: AgentRuntimeState) -> ActionRecord:
     return ActionRecord(
         action_id="action-1",
         semantic_key="read:key",
-        session_id=runtime.session_id,
-        run_id=runtime.run_id,
         tool_call_id="call-1",
         tool_name="read_file",
         normalized_arguments={"path": "app.py"},
@@ -68,7 +66,6 @@ def test_model_call_is_an_explicit_wait_and_rejects_concurrent_action() -> None:
     assert kernel.state.status == RunStatus.WAITING
     assert kernel.state.wait is not None
     assert kernel.state.wait.kind == WaitKind.MODEL_RESPONSE
-    assert EffectKind.CALL_MODEL in {effect.kind for effect in kernel.last_effects}
     with pytest.raises(StateInvariantError):
         kernel.dispatch(
             DomainEventKind.ACTION_PROPOSED,
@@ -172,7 +169,7 @@ def test_observed_action_is_applied_after_restart_without_tool_reexecution() -> 
         correlation_id=record.action_id,
         payload={"result": ActionResultSnapshot(ok=True, output="content").model_dump(mode="json")},
     )
-    memory = MemoryState(session_id="session", runtime_v2=kernel.state)
+    memory = MemoryState(session_id="session", runtime=kernel.state)
     memory.messages.append(
         Message(
             role="assistant",
@@ -198,7 +195,7 @@ def test_observed_action_is_applied_after_restart_without_tool_reexecution() -> 
     assert result.status == "success"
     assert tools.calls == []
     assert record.action_id in memory.applied_action_ids
-    assert memory.runtime_v2 is not None
-    recovered = memory.runtime_v2.actions[record.action_id]
+    assert memory.runtime is not None
+    recovered = memory.runtime.actions[record.action_id]
     assert recovered.status == ActionStatus.SUCCEEDED
     assert recovered.result_delivered_to_model

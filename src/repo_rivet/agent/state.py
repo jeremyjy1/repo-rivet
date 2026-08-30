@@ -4,11 +4,10 @@ import hashlib
 import json
 import time
 from dataclasses import dataclass, field
-from enum import StrEnum
 from typing import Any, Literal
 
-from repo_rivet.agent.runtime_state import AgentRuntimeState
-from repo_rivet.llm.base import ModelResponse, ReasoningEffort
+from repo_rivet.agent.runtime import AgentRuntimeState
+from repo_rivet.llm.base import ModelResponse
 from repo_rivet.planning.models import WorkflowMode
 from repo_rivet.reasoning.models import ReasoningEvent
 from repo_rivet.tools.base import ToolCall, ToolResult
@@ -23,28 +22,12 @@ _FILE_MODIFICATION_TOOLS = frozenset({"delete_path", "edit_file", "write_file"})
 _PROGRESS_NEUTRAL_TOOLS = frozenset({"record_decision"})
 
 
-class AgentStatus(StrEnum):
-    PLANNING = "planning"
-    PLAN_READY = "plan_ready"
-    EXECUTING = "executing"
-    RUNNING = "running"
-    VERIFYING = "verifying"
-    FINALIZING = "finalizing"
-    AWAITING_VERIFICATION_PLAN = "awaiting_verification_plan"
-    COMPLETED = "completed"
-    INCOMPLETE = "incomplete"
-    BLOCKED = "blocked"
-    STOPPED = "stopped"
-    ERROR = "error"
-
-
 @dataclass(slots=True)
 class SessionState:
     """Track conversation progress and safety-relevant counters."""
 
     task: str
     runtime: AgentRuntimeState | None = None
-    status: AgentStatus = AgentStatus.RUNNING
     workflow_mode: WorkflowMode = WorkflowMode.EXECUTE
     messages: list[dict[str, Any]] = field(default_factory=list)
     step_count: int = 0
@@ -79,13 +62,10 @@ class SessionState:
     consecutive_protocol_failures: int = 0
     recent_errors: list[str] = field(default_factory=list)
     started_at: float = field(default_factory=time.monotonic)
-    interrupted: bool = False
     reasoning_only_turns: int = 0
-    reflection_required: bool = False
     pending_decision: ReasoningEvent | None = None
     reasoning_max_calls: int = 0
     reasoning_xhigh_calls: int = 0
-    current_reasoning_effort: ReasoningEffort | None = None
     current_reasoning_phase: str | None = None
     current_reasoning_reason: str | None = None
 
@@ -257,7 +237,7 @@ class SessionState:
             else "none"
         )
         return (
-            f"Agent status: {self.status.value}.\n"
+            f"Runtime status: {self.runtime.status.value if self.runtime else 'initializing'}.\n"
             f"Workflow mode: {self.workflow_mode.value}.\n"
             f"Model steps: {self.step_count}. Next progress checkpoint: "
             f"{self.step_limit or '?'}. "

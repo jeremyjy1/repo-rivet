@@ -3,7 +3,8 @@ from pathlib import Path
 from typing import cast
 
 from repo_rivet.agent.controller import AgentController
-from repo_rivet.agent.runtime_state import AgentRuntimeState
+from repo_rivet.agent.phases import WorkflowPhase
+from repo_rivet.agent.runtime import AgentRuntimeState
 from repo_rivet.agent.state import SessionState
 from repo_rivet.agent.termination import TerminationConfig, TerminationPolicy
 from repo_rivet.approval.models import ApprovalMode
@@ -220,7 +221,7 @@ def test_reasoning_effort_is_selected_by_task_phase_with_configured_ceiling() ->
         SessionState(task="design a refactor", workflow_mode=WorkflowMode.PLANNING)
     )
     recovery = agent._model_request_options(
-        SessionState(task="repair a failure", reflection_required=True)
+        SessionState(task="repair a failure", verification_plan_recovery_attempts=1)
     )
 
     assert routine and routine.reasoning_effort == "low"
@@ -763,11 +764,13 @@ def test_controller_saves_paused_session_when_approval_stops_run(tmp_path: Path)
     memory = MemoryState(session_id="verification-abort")
 
     class StatusInspectingRegistry(FakeToolRegistry):
-        status_at_verification: str | None = None
+        phase_at_verification: WorkflowPhase | None = None
 
         def execute(self, tool_call: ToolCall) -> ToolResult:
             if tool_call.name == "run_verification":
-                self.status_at_verification = memory.status
+                self.phase_at_verification = (
+                    memory.runtime.phase if memory.runtime is not None else None
+                )
             return super().execute(tool_call)
 
     tools = StatusInspectingRegistry(
@@ -797,7 +800,7 @@ def test_controller_saves_paused_session_when_approval_stops_run(tmp_path: Path)
     ).run("fix", memory=memory)
 
     assert result.status == "stopped"
-    assert tools.status_at_verification == "verifying"
+    assert tools.phase_at_verification == WorkflowPhase.EXECUTING_ACTION
     assert memory.verification_results["tests"].status.value == "error"
     assert memory.status == "paused"
     assert store.load_state().status == "paused"
@@ -1311,7 +1314,6 @@ def test_stale_edit_snapshot_is_refreshed_without_consuming_repetition_budget() 
         "end_line": 349,
     }
     assert state.consecutive_failures == 0
-    assert state.reflection_required is False
     assert memory.current_snapshots["src/Board.cpp"] == fresh_snapshot
     recovery = next(
         message

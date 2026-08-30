@@ -916,13 +916,13 @@ def _print_session_details(
     modified = ", ".join(sorted(memory.modified_files)) or "none"
     details.append(f"Modified:  {_terminal_text(modified)}\n")
     details.append(f"Verification: {_terminal_text(memory.summary.verification_status)}")
-    if memory.runtime_v2 is not None:
-        details.append(f"\nRuntime:   {memory.runtime_v2.status.value}")
-        details.append(f"\nPhase:     {memory.runtime_v2.phase.value}")
-        if memory.runtime_v2.wait is not None:
-            details.append(f"\nWaiting:   {memory.runtime_v2.wait.kind.value}")
-        if memory.runtime_v2.recovery is not None:
-            details.append(f"\nRecovery:  {_terminal_text(memory.runtime_v2.recovery.reason_code)}")
+    if memory.runtime is not None:
+        details.append(f"\nRuntime:   {memory.runtime.status.value}")
+        details.append(f"\nPhase:     {memory.runtime.phase.value}")
+        if memory.runtime.wait is not None:
+            details.append(f"\nWaiting:   {memory.runtime.wait.kind.value}")
+        if memory.runtime.recovery is not None:
+            details.append(f"\nRecovery:  {_terminal_text(memory.runtime.recovery.reason_code)}")
     if memory.active_skill is not None:
         details.append(
             f"\nGlobal Skill: {memory.active_skill.id}"
@@ -1512,7 +1512,10 @@ def _chat_loop(
                 return 0
             continue
 
-        if memory.workflow_mode == WorkflowMode.PLAN_READY:
+        if memory.plan_artifact is not None and memory.plan_artifact.status in {
+            PlanStatus.READY,
+            PlanStatus.STALE,
+        }:
             console.print(
                 "A plan is waiting for review. Use :execute, :revise, :inspect, or :cancel."
             )
@@ -1742,9 +1745,7 @@ def _print_plan_artifact(console: Console, plan: PlanArtifact) -> None:
 
 def _idle_session_status(memory: MemoryState) -> SessionStatus:
     plan = memory.plan_artifact
-    if memory.workflow_mode == WorkflowMode.PLAN_READY or (
-        plan is not None and plan.status in {PlanStatus.READY, PlanStatus.STALE}
-    ):
+    if plan is not None and plan.status in {PlanStatus.READY, PlanStatus.STALE}:
         return SessionStatus.PLAN_READY
     if plan is not None and plan.status == PlanStatus.EXECUTING:
         return SessionStatus.EXECUTING

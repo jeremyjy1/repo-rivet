@@ -225,20 +225,6 @@ def test_cli_lists_and_updates_selected_session_skill(
     assert not (tmp_path / "home" / "skills" / "global-review").exists()
 
 
-def test_loader_retains_unknown_metadata_without_treating_it_as_behavior(tmp_path: Path) -> None:
-    write_skill(
-        tmp_path / "system",
-        extra="hooks: [run.py]\nrequirements:\n  before_finish: [invented_check]\n",
-    )
-    bundle = registry_for(tmp_path).load("sample-skill")
-
-    assert bundle.manifest.model_extra == {
-        "hooks": ["run.py"],
-        "requirements": {"before_finish": ["invented_check"]},
-    }
-    assert bundle.script_files == ()
-
-
 def test_activation_pins_content_and_rejects_changed_session_skill(tmp_path: Path) -> None:
     path = write_skill(tmp_path / "global")
     registry = registry_for(tmp_path)
@@ -370,7 +356,6 @@ def test_plan_artifact_pins_skill_and_becomes_stale_after_skill_change(tmp_path:
                         "evidence_refs": ["obs-read"],
                         "operation": "verify",
                         "verification_ids": ["tests"],
-                        "depends_on": ["edit"],
                         "risk": "low",
                     },
                 ],

@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 
 from repo_rivet.memory.models import MemoryState
-from repo_rivet.planning.models import PlanStatus, WorkflowMode
+from repo_rivet.planning.models import PlanStatus
 from repo_rivet.skills.errors import SkillError, SkillStaleError, SkillValidationError
 from repo_rivet.skills.models import (
     ActiveSkillPin,
@@ -153,7 +153,6 @@ class SkillRuntime:
         }:
             return
         memory.plan_artifact.status = PlanStatus.STALE
-        memory.workflow_mode = WorkflowMode.PLAN_READY
 
 
 def _description_matches(description: str, task: str) -> bool:

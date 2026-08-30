@@ -36,7 +36,7 @@ export type Approval = {
 
 export type SessionDetail = SessionSummary & {
   messages: Array<{ role: string; content: string; name?: string; step: number }>;
-  workflow_mode: "execute" | "planning" | "plan_ready";
+  workflow_mode: "execute" | "planning";
   approval_mode: string | null;
   active_skill: { id: string; version: string } | null;
   plan: Record<string, any> | null;

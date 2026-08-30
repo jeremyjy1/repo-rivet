@@ -1,1 +1,1 @@
-"""Domain events and pure v2 state transitions."""
+"""Domain events and pure runtime state transitions."""

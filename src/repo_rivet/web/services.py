@@ -9,7 +9,7 @@ from repo_rivet.approval.models import ApprovalMode
 from repo_rivet.config import load_config
 from repo_rivet.editing.document import TextDocument
 from repo_rivet.llm.base import ReasoningEffort
-from repo_rivet.planning.models import WorkflowMode
+from repo_rivet.planning.models import PlanStatus, WorkflowMode
 from repo_rivet.planning.policy import AutoPlanMode
 from repo_rivet.planning.runtime import PlanRuntime
 from repo_rivet.reasoning.policy import ReasoningPolicyMode
@@ -108,30 +108,29 @@ class AgentQueryService:
             "workspace_revision": loaded.memory.workspace_revision,
             "runtime": (
                 {
-                    "run_id": loaded.memory.runtime_v2.run_id,
-                    "status": loaded.memory.runtime_v2.status.value,
-                    "phase": loaded.memory.runtime_v2.phase.value,
+                    "run_id": loaded.memory.runtime.run_id,
+                    "status": loaded.memory.runtime.status.value,
+                    "phase": loaded.memory.runtime.phase.value,
                     "wait": (
-                        loaded.memory.runtime_v2.wait.model_dump(mode="json")
-                        if loaded.memory.runtime_v2.wait is not None
+                        loaded.memory.runtime.wait.model_dump(mode="json")
+                        if loaded.memory.runtime.wait is not None
                         else None
                     ),
                     "current_action": (
-                        loaded.memory.runtime_v2.actions[
-                            loaded.memory.runtime_v2.current_action_id
+                        loaded.memory.runtime.actions[
+                            loaded.memory.runtime.current_action_id
                         ].model_dump(mode="json")
-                        if loaded.memory.runtime_v2.current_action_id is not None
-                        and loaded.memory.runtime_v2.current_action_id
-                        in loaded.memory.runtime_v2.actions
+                        if loaded.memory.runtime.current_action_id is not None
+                        and loaded.memory.runtime.current_action_id in loaded.memory.runtime.actions
                         else None
                     ),
                     "recovery": (
-                        loaded.memory.runtime_v2.recovery.model_dump(mode="json")
-                        if loaded.memory.runtime_v2.recovery is not None
+                        loaded.memory.runtime.recovery.model_dump(mode="json")
+                        if loaded.memory.runtime.recovery is not None
                         else None
                     ),
                 }
-                if loaded.memory.runtime_v2 is not None
+                if loaded.memory.runtime is not None
                 else None
             ),
             "last_event_seq": event_count,
@@ -293,7 +292,11 @@ class AgentCommandService:
         loaded = self.sessions.load(resolved_id)
         if loaded.metadata.name == "untitled" and not loaded.metadata.task_preview:
             self.sessions.rename(resolved_id, automatic_session_name(task))
-        if loaded.memory.workflow_mode == WorkflowMode.PLAN_READY and mode == WorkflowMode.EXECUTE:
+        if (
+            loaded.memory.plan_artifact is not None
+            and loaded.memory.plan_artifact.status in {PlanStatus.READY, PlanStatus.STALE}
+            and mode == WorkflowMode.EXECUTE
+        ):
             raise ValueError(
                 "A plan is waiting for review. Execute it through the plan approval action, "
                 "or revise, inspect, or cancel it first."
@@ -379,8 +382,8 @@ class AgentCommandService:
         loaded = self.sessions.load(session_id)
         previous_mode = loaded.memory.approval_mode_override
         loaded.memory.approval_mode_override = mode
-        if loaded.memory.runtime_v2 is not None and previous_mode != mode:
-            loaded.memory.runtime_v2.revisions.approval_policy += 1
+        if loaded.memory.runtime is not None and previous_mode != mode:
+            loaded.memory.runtime.revisions.approval_policy += 1
         loaded.store.save_state(loaded.memory, status=loaded.memory.status)
 
     def set_runtime_settings(
