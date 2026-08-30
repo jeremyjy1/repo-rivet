@@ -255,7 +255,6 @@ class MemoryState(BaseModel):
     verification_plan_revision_reason: str | None = Field(default=None, max_length=1_000)
     verification_plan_revision_guidance: str | None = Field(default=None, max_length=2_000)
     verification_plan_revision_attempts: int = Field(default=0, ge=0)
-    skill_completion_recovery_attempts: int = Field(default=0, ge=0)
     candidate_final_assessment: FinalAssessment | None = None
     last_model_error: ModelErrorRecord | None = None
     provider_requires_reasoning_content: bool = False
@@ -291,6 +290,27 @@ class MemoryState(BaseModel):
         if not isinstance(value, dict):
             return value
         migrated = dict(value)
+        migrated.pop("skill_completion_recovery_attempts", None)
+
+        def migrate_skill_pin(pin: Any) -> Any:
+            if not isinstance(pin, dict):
+                return pin
+            source = pin.get("source")
+            if source == "builtin":
+                source = "system"
+            elif source == "user":
+                source = "global"
+            name = str(pin.get("name") or pin.get("id") or "").split(":", 1)[-1]
+            qualified_id = str(pin.get("id") or name)
+            if ":" not in qualified_id and source in {"system", "global"}:
+                qualified_id = f"{source}:{qualified_id}"
+            return {
+                **pin,
+                "id": qualified_id,
+                "name": name,
+                "source": source,
+            }
+
         migrated.pop("last_file_change_step", None)
         migrated.pop("last_verification_step", None)
         migrated.pop("last_verification_success", None)
@@ -299,8 +319,11 @@ class MemoryState(BaseModel):
             source = active_skill.get("source")
             if source == "builtin":
                 migrated["active_skill"] = None
-            elif source == "user":
-                migrated["active_skill"] = {**active_skill, "source": "global"}
+            else:
+                migrated["active_skill"] = migrate_skill_pin(active_skill)
+        system_skills = migrated.get("system_skills")
+        if isinstance(system_skills, list):
+            migrated["system_skills"] = [migrate_skill_pin(item) for item in system_skills]
         plan_artifact = migrated.get("plan_artifact")
         if isinstance(plan_artifact, dict):
             plan_skill = plan_artifact.get("skill")
@@ -309,12 +332,18 @@ class MemoryState(BaseModel):
                 if source == "builtin":
                     plan_artifact = {**plan_artifact, "skill": None}
                     migrated["plan_artifact"] = plan_artifact
-                elif source == "user":
+                else:
                     plan_artifact = {
                         **plan_artifact,
-                        "skill": {**plan_skill, "source": "global"},
+                        "skill": migrate_skill_pin(plan_skill),
                     }
                     migrated["plan_artifact"] = plan_artifact
+            plan_system = plan_artifact.get("system_skills")
+            if isinstance(plan_system, list):
+                migrated["plan_artifact"] = {
+                    **plan_artifact,
+                    "system_skills": [migrate_skill_pin(item) for item in plan_system],
+                }
         if "workspace_revision" not in migrated and migrated.get("modified_files"):
             migrated["workspace_revision"] = 1
         return migrated
@@ -364,7 +393,6 @@ class MemoryState(BaseModel):
         self.verification_plan_revision_reason = None
         self.verification_plan_revision_guidance = None
         self.verification_plan_revision_attempts = 0
-        self.skill_completion_recovery_attempts = 0
         self.candidate_final_assessment = None
         self.last_model_error = None
         self.reflection_required = False

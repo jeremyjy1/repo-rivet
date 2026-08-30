@@ -210,41 +210,20 @@ def build_parser() -> argparse.ArgumentParser:
         "clear", help="Clear the selected global Skill from the current session"
     )
     skill_clear.add_argument("--workspace", type=Path, default=Path.cwd())
-    skill_init = skill_commands.add_parser("init", help="Generate a native Skill draft")
+    skill_init = skill_commands.add_parser("init", help="Generate a portable Agent Skill draft")
     skill_init.add_argument("skill_id")
-    skill_init.add_argument("--name")
-    skill_init.add_argument("--summary")
+    skill_init.add_argument("--description")
     skill_init.add_argument("--output", type=Path, default=Path("reporivet-skills"))
-    skill_init.add_argument("--tool", action="append", dest="tools")
-    skill_init.add_argument("--mode", action="append", choices=["plan", "execute"])
-    skill_init.add_argument(
-        "--before-edit",
-        action="append",
-        choices=["target_snapshot_current", "target_range_seen", "plan_approved"],
-    )
-    skill_init.add_argument(
-        "--before-finish",
-        action="append",
-        choices=[
-            "no_active_processes",
-            "required_build_passed",
-            "required_tests_passed",
-            "required_behavior_checks_passed",
-            "no_stale_verification",
-            "git_diff_reviewed",
-        ],
-    )
     skill_validate = skill_commands.add_parser(
         "validate", help="Validate a native Skill without installing it"
     )
     skill_validate.add_argument("path", type=Path)
     skill_convert = skill_commands.add_parser(
-        "convert", help="Safely convert a Markdown Skill to RepoRivet format"
+        "convert", help="Normalize Markdown guidance to the portable Agent Skills format"
     )
     skill_convert.add_argument("source", type=Path)
-    skill_convert.add_argument("--id", dest="skill_id")
-    skill_convert.add_argument("--name")
-    skill_convert.add_argument("--summary")
+    skill_convert.add_argument("--name", dest="skill_id")
+    skill_convert.add_argument("--description")
     skill_convert.add_argument("--output", type=Path, default=Path("reporivet-skills"))
     skill_install = skill_commands.add_parser(
         "install", help="Install a validated Skill into the user-global scope"
@@ -615,44 +594,35 @@ def _skill_command(arguments: argparse.Namespace, console: Console) -> int:
         if arguments.skill_command == "show":
             _print_skill(console, registry, arguments.skill_id)
             return 0
-        known_tools = set(create_default_registry(Path.cwd()).names)
         if arguments.skill_command == "init":
             target = create_skill(
                 skill_id=arguments.skill_id,
                 output_root=arguments.output,
-                name=arguments.name,
-                summary=arguments.summary,
-                requested_tools=arguments.tools,
-                compatible_modes=arguments.mode,
-                before_edit=arguments.before_edit,
-                before_finish=arguments.before_finish,
-                known_tools=known_tools,
+                description=arguments.description,
             )
-            validate_skill(target, known_tools=known_tools)
+            validate_skill(target)
             console.print(f"Skill draft created and validated: {_terminal_text(str(target))}")
             return 0
         if arguments.skill_command == "validate":
-            report = validate_skill(arguments.path, known_tools=known_tools)
+            report = validate_skill(arguments.path)
             console.print(
-                f"Skill valid: {report.skill_id}@{report.version}\n"
+                f"Skill valid: {report.skill_id}@{report.version or 'unversioned'}\n"
                 f"Path: {_terminal_text(str(report.path))}\n"
                 f"Estimated body tokens: {report.estimated_prompt_tokens}\n"
-                f"Requested tools: {', '.join(report.requested_tools)}"
+                f"Resources: {len(report.resource_files)} references, "
+                f"{len(report.script_files)} scripts, {len(report.asset_files)} assets"
             )
             return 0
         if arguments.skill_command == "convert":
             report = convert_skill(
                 arguments.source,
                 output_root=arguments.output,
-                known_tools=known_tools,
                 skill_id=arguments.skill_id,
-                name=arguments.name,
-                summary=arguments.summary,
+                description=arguments.description,
             )
             details = [
                 f"Skill converted: {_terminal_text(str(report.target))}",
                 f"Detected format: {report.source_format}",
-                f"Mapped tools: {', '.join(report.mapped_tools)}",
             ]
             if report.dropped_fields:
                 details.append("Dropped fields: " + ", ".join(report.dropped_fields))
@@ -663,9 +633,7 @@ def _skill_command(arguments: argparse.Namespace, console: Console) -> int:
             target = install_skill(
                 arguments.source,
                 global_root=manager.root / "skills",
-                known_tools=known_tools,
                 replace=arguments.replace,
-                reserved_ids={item.manifest.id for item in registry.system_skills()},
             )
             action = "updated" if arguments.replace else "installed"
             console.print(f"Global Skill {action} after validation: " + _terminal_text(str(target)))
@@ -689,10 +657,7 @@ def _skill_command(arguments: argparse.Namespace, console: Console) -> int:
                 f"No selected session for workspace {workspace}. Create or select a session first."
             )
         loaded = manager.load(metadata.session_id)
-        runtime = SkillRuntime(
-            registry,
-            known_tools=known_tools,
-        )
+        runtime = SkillRuntime(registry)
         with manager.lock(metadata.session_id):
             if arguments.skill_command == "use":
                 if arguments.skill_id == "auto":
@@ -704,14 +669,14 @@ def _skill_command(arguments: argparse.Namespace, console: Console) -> int:
                 loaded.store.save_state(loaded.memory, status=loaded.memory.status)
                 loaded.store.log(
                     "skill_activated",
-                    skill_id=bundle.manifest.id,
-                    version=bundle.manifest.version,
+                    skill_id=bundle.qualified_id,
+                    version=bundle.version,
                     content_hash=bundle.content_hash,
                     activation=SkillActivation.EXPLICIT.value,
                 )
                 console.print(
                     f"Global Skill for session {metadata.short_id}: "
-                    f"{bundle.manifest.id}@{bundle.manifest.version}"
+                    f"{bundle.qualified_id}@{bundle.version or 'unversioned'}"
                 )
                 return 0
             if arguments.skill_command == "clear":
@@ -749,14 +714,14 @@ def _print_skill_list(console: Console, registry: SkillRegistry) -> None:
     table.add_column("Name")
     table.add_column("Version")
     table.add_column("Scope")
-    table.add_column("Summary")
+    table.add_column("Description", max_width=60)
     for item in skills:
         table.add_row(
-            item.manifest.id,
+            item.qualified_id,
             item.manifest.name,
-            item.manifest.version,
+            item.version or "unversioned",
             item.source.value,
-            _terminal_text(item.manifest.summary),
+            _terminal_text(_skill_description_preview(item.manifest.description)),
         )
     console.print(table)
     for key, error in errors:
@@ -767,23 +732,26 @@ def _print_skill(console: Console, registry: SkillRegistry, skill_id: str) -> No
     bundle = registry.load(skill_id)
     manifest = bundle.manifest
     details = Text()
-    details.append(f"ID: {manifest.id}\n")
+    details.append(f"ID: {bundle.qualified_id}\n")
     details.append(f"Name: {_terminal_text(manifest.name)}\n")
-    details.append(f"Version: {manifest.version}\n")
+    details.append(f"Version: {bundle.version or 'unversioned'}\n")
     details.append(f"Source: {bundle.source.value}\n")
-    details.append(f"Modes: {', '.join(sorted(manifest.compatible_modes))}\n")
-    details.append(f"Requested tools: {', '.join(sorted(manifest.requested_tools))}\n")
-    before_edit = ", ".join(manifest.requirements.before_edit) or "none"
-    before_finish = ", ".join(manifest.requirements.before_finish) or "none"
-    details.append(f"Before edit: {before_edit}\n")
-    details.append(f"Before finish: {before_finish}\n\n")
+    details.append(f"Description: {_terminal_text(manifest.description)}\n")
+    details.append(f"References: {len(bundle.resource_files)}\n")
+    details.append(f"Scripts: {len(bundle.script_files)} (never auto-run)\n")
+    details.append(f"Assets: {len(bundle.asset_files)}\n\n")
     details.append(_terminal_text(bundle.body))
     console.print(Panel(details, title="Skill"))
 
 
+def _skill_description_preview(description: str, limit: int = 160) -> str:
+    normalized = " ".join(description.split())
+    return normalized if len(normalized) <= limit else normalized[: limit - 1].rstrip() + "…"
+
+
 def _print_current_skill(console: Console, runtime: SkillRuntime) -> None:
     system = (
-        ", ".join(f"{bundle.manifest.id}@{bundle.manifest.version}" for bundle in runtime.system)
+        ", ".join(f"{item.qualified_id}@{item.version or 'unversioned'}" for item in runtime.system)
         or "none"
     )
     console.print(f"System Skills: {system}")
@@ -791,7 +759,7 @@ def _print_current_skill(console: Console, runtime: SkillRuntime) -> None:
     if bundle is None:
         console.print("Global Skill: none")
         return
-    console.print(f"Global Skill: {bundle.manifest.id}@{bundle.manifest.version}")
+    console.print(f"Global Skill: {bundle.qualified_id}@{bundle.version or 'unversioned'}")
 
 
 def _session_list(
@@ -937,7 +905,10 @@ def _print_session_details(
     details.append(f"Modified:  {_terminal_text(modified)}\n")
     details.append(f"Verification: {_terminal_text(memory.summary.verification_status)}")
     if memory.active_skill is not None:
-        details.append(f"\nGlobal Skill: {memory.active_skill.id}@{memory.active_skill.version}")
+        details.append(
+            f"\nGlobal Skill: {memory.active_skill.id}"
+            f"@{memory.active_skill.version or 'unversioned'}"
+        )
     if memory.plan_artifact is not None:
         details.append(f"\nPlan:      {memory.plan_artifact.status.value}")
         details.append(
@@ -1076,10 +1047,7 @@ def _build_runtime(
             event_logger=runtime_events,
             initial_workspace_revision=memory.workspace_revision,
         )
-        skill_runtime = SkillRuntime(
-            _create_skill_registry(session_manager),
-            known_tools=set(registry.names),
-        )
+        skill_runtime = SkillRuntime(_create_skill_registry(session_manager))
         previous_skill = memory.active_skill
         requested_skill = getattr(arguments, "skill", None)
         no_skills = bool(getattr(arguments, "no_skills", False))
@@ -1281,11 +1249,12 @@ def _token_budget_config(memory_config: MemoryConfig) -> TokenBudgetConfig:
 
 def _print_runtime(console: Console, workspace: Path, runtime: Runtime) -> None:
     system_skill_label = ", ".join(
-        f"{bundle.manifest.id}@{bundle.manifest.version}" for bundle in runtime.skill_runtime.system
+        f"{item.qualified_id}@{item.version or 'unversioned'}"
+        for item in runtime.skill_runtime.system
     )
     active_skill = runtime.skill_runtime.active
     global_skill_label = (
-        f"{active_skill.manifest.id}@{active_skill.manifest.version}"
+        f"{active_skill.qualified_id}@{active_skill.version or 'unversioned'}"
         if active_skill is not None
         else "none"
     )
@@ -1390,13 +1359,14 @@ def _chat_loop(
                     console.print(f"[bold yellow]Skill error:[/bold yellow] {error}")
                     continue
                 console.print(
-                    f"Global Skill: {bundle.manifest.id}@{bundle.manifest.version}. Session saved."
+                    f"Global Skill: {bundle.qualified_id}"
+                    f"@{bundle.version or 'unversioned'}. Session saved."
                 )
                 if memory_store is not None:
                     memory_store.log(
                         "skill_activated",
-                        skill_id=bundle.manifest.id,
-                        version=bundle.manifest.version,
+                        skill_id=bundle.qualified_id,
+                        version=bundle.version,
                         content_hash=bundle.content_hash,
                         activation=SkillActivation.EXPLICIT.value,
                     )

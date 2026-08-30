@@ -1,34 +1,8 @@
 ---
-schema_version: 1
-id: test-failure-fix
-name: Test Failure Fix
-version: 1.1.1
-summary: Diagnose a concrete failing test, make a minimal snapshot-anchored repair, and verify it.
-category: workflow
-activation:
-  explicit: false
-  automatic: true
-triggers:
-  task_types: [fix-test]
-  keywords: [failing test, test failure, test regression, 测试失败, 修复测试, 测试回归]
-compatible_modes: [plan, execute]
-requested_tools:
-  - list_files
-  - read_file
-  - search_text
-  - edit_file
-  - write_file
-  - run_command
-  - run_verification
-  - git_status
-  - git_diff
-requirements:
-  before_edit: []
-  before_finish: []
-verification_profiles: []
-limits:
-  max_prompt_tokens: 1400
-  max_active_support_skills: 0
+name: test-failure-fix
+description: Diagnose a concrete failing test, make a minimal evidence-based repair, and verify the regression. Use for failing test, test failure, test regression, pytest failure, 测试失败, 修复测试, or 测试回归 tasks.
+metadata:
+  version: "2.0.0"
 ---
 
 # Objective

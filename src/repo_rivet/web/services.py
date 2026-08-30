@@ -145,10 +145,10 @@ class AgentQueryService:
         )
         return [
             {
-                "id": item.manifest.id,
+                "id": item.qualified_id,
                 "name": item.manifest.name,
-                "description": item.manifest.summary,
-                "version": item.manifest.version,
+                "description": item.manifest.description,
+                "version": item.version,
                 "source": item.source.value,
             }
             for item in registry.discover()

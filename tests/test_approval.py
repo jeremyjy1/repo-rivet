@@ -1562,7 +1562,7 @@ def test_trusted_reporivet_skill_generation_is_auto_approved_only_for_new_worksp
         tool_name="run_command",
         arguments={
             "command": (
-                "reporivet skill convert foreign/SKILL.md --id converted-skill --output drafts"
+                "reporivet skill convert foreign/SKILL.md --name converted-skill --output drafts"
             ),
             "cwd": ".",
         },

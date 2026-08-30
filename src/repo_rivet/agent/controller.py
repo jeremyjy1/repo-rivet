@@ -47,8 +47,7 @@ from repo_rivet.reasoning.validator import DecisionValidationError, validate_dec
 from repo_rivet.safety.command_policy import CommandPolicy
 from repo_rivet.safety.path_policy import WorkspacePathPolicy
 from repo_rivet.skills.errors import SkillError
-from repo_rivet.skills.requirements import SkillRequirementEvaluator, SkillRequirementReport
-from repo_rivet.skills.runtime import CONTROL_TOOLS, SkillRuntime
+from repo_rivet.skills.runtime import SkillRuntime
 from repo_rivet.tools.base import DecisionPolicy, ToolCall, ToolResult
 from repo_rivet.tools.planning import RequestPlanArguments
 from repo_rivet.tools.registry import ToolRegistry
@@ -63,7 +62,6 @@ from repo_rivet.verification.runtime import VerificationRuntime
 
 _MAX_VERIFICATION_PLAN_RECOVERY_ATTEMPTS = 3
 _MAX_VERIFICATION_PLAN_REVISION_ATTEMPTS = 3
-_MAX_SKILL_COMPLETION_RECOVERY_ATTEMPTS = 3
 
 
 class EventSink(Protocol):
@@ -116,7 +114,6 @@ class AgentController:
         self.skill_runtime = skill_runtime
         self.auto_plan_policy = auto_plan_policy or AutoPlanPolicy()
         self.plan_classifier = plan_classifier
-        self.skill_requirements = SkillRequirementEvaluator()
         runtime = getattr(tool_registry, "verification_runtime", None)
         workspace = getattr(tool_registry, "workspace", None) or Path.cwd().resolve()
         self.verification_runtime = (
@@ -259,7 +256,6 @@ class AgentController:
             verification_plan_revision_reason=memory.verification_plan_revision_reason,
             verification_plan_revision_guidance=memory.verification_plan_revision_guidance,
             verification_plan_revision_attempts=memory.verification_plan_revision_attempts,
-            skill_completion_recovery_attempts=memory.skill_completion_recovery_attempts,
             candidate_final_assessment=memory.candidate_final_assessment,
             reflection_required=memory.reflection_required or bool(memory.invalidated_files),
             provider_reasoning_detected=memory.provider_requires_reasoning_content,
@@ -281,58 +277,8 @@ class AgentController:
                 )
         auto_plan_started = False
         if auto_plan_reason is not None:
-            planning_supported = self.skill_runtime is None or self.skill_runtime.supports_mode(
-                WorkflowMode.PLANNING
-            )
-            if planning_supported:
-                self._enter_planning_mode(state=state, memory=memory)
-                auto_plan_started = True
-            elif self.auto_plan_policy.mode == AutoPlanMode.ALWAYS:
-                active = self.skill_runtime.active if self.skill_runtime is not None else None
-                return self._finish(
-                    state,
-                    memory,
-                    status="blocked",
-                    reason=(
-                        "auto-plan is always, but global skill "
-                        f"{active.manifest.id if active is not None else 'unknown'} "
-                        "does not support planning mode"
-                    ),
-                )
-            else:
-                self._log(
-                    "auto_plan_skipped",
-                    reason=auto_plan_reason,
-                    detail="active global skill does not support planning mode",
-                )
-        if self.skill_runtime is not None and not self.skill_runtime.supports_mode(
-            state.workflow_mode
-        ):
-            active = self.skill_runtime.active
-            return self._finish(
-                state,
-                memory,
-                status="blocked",
-                reason=(
-                    f"global skill {active.manifest.id if active is not None else 'unknown'} "
-                    f"does not support {state.workflow_mode.value} mode"
-                ),
-            )
-        if (
-            not state.verification_plan_revision_required
-            and state.verification_plan is not None
-            and self.verifier.completion_report(state).complete
-            and self._require_skill_verification_plan_revision(
-                self._skill_completion_report(memory),
-                state=state,
-                memory=memory,
-            )
-        ):
-            self._log(
-                "skill_verification_plan_revision_requested",
-                reason=state.verification_plan_revision_reason,
-                resumed=True,
-            )
+            self._enter_planning_mode(state=state, memory=memory)
+            auto_plan_started = True
         if (
             state.workflow_mode == WorkflowMode.EXECUTE
             and memory.plan_artifact is not None
@@ -834,14 +780,6 @@ class AgentController:
             error = "request_plan is disabled by the configured auto-plan mode."
         elif not self._can_start_new_plan(memory):
             error = "An active plan already exists; revise or finish that plan instead."
-        elif self.skill_runtime is not None and not self.skill_runtime.supports_mode(
-            WorkflowMode.PLANNING
-        ):
-            active = self.skill_runtime.active
-            error = (
-                f"Global skill {active.manifest.id if active is not None else 'unknown'} "
-                "does not support planning mode."
-            )
         else:
             try:
                 arguments = RequestPlanArguments.model_validate(selected.arguments)
@@ -947,40 +885,6 @@ class AgentController:
             return self._retry_verification_plan_revision(state=state, memory=memory)
 
         calls = [self._normalize_registered_plan_action(call, state=state) for call in calls]
-
-        if self.skill_runtime is not None and self.skill_runtime.active is not None:
-            requested = self.skill_runtime.active.manifest.requested_tools
-            forbidden_by_skill = [
-                call
-                for call in calls
-                if call.name not in CONTROL_TOOLS and call.name not in requested
-            ]
-            for call in forbidden_by_skill:
-                self._log(
-                    "tool_call",
-                    step=state.step_count,
-                    tool_call_id=call.id,
-                    name=call.name,
-                    arguments=call.arguments,
-                )
-                self._record_blocked_action(
-                    call,
-                    ToolResult(
-                        ok=False,
-                        output="",
-                        error=(
-                            f"Global skill {self.skill_runtime.active.manifest.id} does not "
-                            f"request tool {call.name}; Skill capabilities can only narrow tools."
-                        ),
-                        error_code="skill_tool_violation",
-                        retryable=True,
-                    ),
-                    state=state,
-                    memory=memory,
-                )
-            calls = [call for call in calls if call not in forbidden_by_skill]
-            if not calls:
-                return None
 
         request_plan_calls = [call for call in calls if call.name == "request_plan"]
         if request_plan_calls:
@@ -1102,22 +1006,6 @@ class AgentController:
             previous_results = dict(memory.verification_results)
             try:
                 plan = self.verification_runtime.register_plan(registration_calls[0].arguments)
-                active_skill = self.skill_runtime.active if self.skill_runtime is not None else None
-                if active_skill is not None:
-                    skill_report = self.skill_requirements.before_finish(
-                        memory,
-                        active_skill.manifest.requirements.before_finish,
-                    )
-                    if skill_report.missing_verification_kinds:
-                        memory.verification_plan = previous_plan
-                        memory.verification_results = previous_results
-                        kinds = ", ".join(
-                            kind.value for kind in skill_report.missing_verification_kinds
-                        )
-                        raise ValueError(
-                            f"Invalid verification plan for global Skill "
-                            f"{active_skill.manifest.id}: missing required check kinds: {kinds}"
-                        )
                 if state.verification_plan_revision_required and previous_plan is not None:
                     previous_required_checks = {
                         check.check_id for check in previous_plan.checks if check.required
@@ -1150,8 +1038,6 @@ class AgentController:
                 memory.verification_plan_revision_reason = None
                 memory.verification_plan_revision_guidance = None
                 memory.verification_plan_revision_attempts = 0
-                state.skill_completion_recovery_attempts = 0
-                memory.skill_completion_recovery_attempts = 0
                 state.status = AgentStatus.RUNNING
                 registered_plan_id = plan.plan_id
             except ValueError as error:
@@ -1217,16 +1103,6 @@ class AgentController:
                 "The previous action failed or was denied. Record a reflection in a separate "
                 "turn before declaring another state-changing action."
             )
-        if validation_error is None and self.skill_runtime is not None:
-            active = self.skill_runtime.active
-            if active is not None and any(
-                self.tool_registry.modifies_workspace_files(call.name) for call in mutating_calls
-            ):
-                failed = self.skill_requirements.before_edit(
-                    memory, active.manifest.requirements.before_edit
-                )
-                if failed:
-                    validation_error = "Skill edit requirements failed: " + ", ".join(failed)
         if validation_error is None:
             try:
                 validate_decision_for_actions(
@@ -1500,8 +1376,6 @@ class AgentController:
         elif action_calls:
             state.reasoning_only_turns = 0
             if successful_action:
-                state.skill_completion_recovery_attempts = 0
-                memory.skill_completion_recovery_attempts = 0
                 self._save_memory(memory, state, status=state.status.value)
         if plan_step_validation_error:
             step = memory.plan_artifact.current_step if memory.plan_artifact is not None else None
@@ -1574,14 +1448,7 @@ class AgentController:
                 if terminal_result is not None:
                     return terminal_result
                 report = self.verifier.completion_report(state)
-            skill_report = self._skill_completion_report(memory)
-            if report.complete and self._require_skill_verification_plan_revision(
-                skill_report,
-                state=state,
-                memory=memory,
-            ):
-                return None
-            ready_to_finish = report.complete and skill_report.complete
+            ready_to_finish = report.complete
             self._append_system_feedback(
                 state,
                 memory,
@@ -1592,13 +1459,12 @@ class AgentController:
                         else "required_verification_incomplete"
                     ),
                     "verification_report": report.model_dump(mode="json"),
-                    "skill_requirements_failed": list(skill_report.failed),
                     "instruction": (
                         "All required checks passed. Provide the concise final answer now; do "
                         "not register or run the checks again."
                         if ready_to_finish
-                        else "Satisfy the listed deterministic verification and Skill completion "
-                        "requirements before claiming completion."
+                        else "Satisfy the listed deterministic verification requirements before "
+                        "claiming completion."
                     ),
                 },
             )
@@ -1823,7 +1689,6 @@ class AgentController:
         if (
             state.status == AgentStatus.FINALIZING
             and self.verifier.completion_report(state).complete
-            and self._skill_completion_report(memory).complete
         ):
             return self._finish(
                 state,
@@ -1891,9 +1756,7 @@ class AgentController:
 
         assessment_summary = _bounded_assessment_summary(summary)
         existing_assessment = state.candidate_final_assessment
-        if state.skill_completion_recovery_attempts == 0 and (
-            existing_assessment is None or existing_assessment.summary != assessment_summary
-        ):
+        if existing_assessment is None or existing_assessment.summary != assessment_summary:
             assessment = (
                 FinalAssessment(
                     summary=assessment_summary,
@@ -1909,11 +1772,7 @@ class AgentController:
 
         report = self.verifier.completion_report(state)
         if report.complete:
-            return self._finish_with_skill_contract(
-                summary,
-                state=state,
-                memory=memory,
-            )
+            return self._finish(state, memory, status="success", summary=summary)
 
         if state.verification_plan is None:
             return self._request_verification_plan_recovery(
@@ -1945,11 +1804,7 @@ class AgentController:
 
         report = self.verifier.completion_report(state)
         if report.complete:
-            return self._finish_with_skill_contract(
-                summary,
-                state=state,
-                memory=memory,
-            )
+            return self._finish(state, memory, status="success", summary=summary)
 
         self._append_system_feedback(
             state,
@@ -1967,94 +1822,6 @@ class AgentController:
         state.status = AgentStatus.RUNNING
         self._save_memory(memory, state, status=state.status.value)
         return None
-
-    def _finish_with_skill_contract(
-        self,
-        summary: str,
-        *,
-        state: SessionState,
-        memory: MemoryState,
-    ) -> AgentResult | None:
-        skill_report = self._skill_completion_report(memory)
-        if skill_report.complete:
-            state.skill_completion_recovery_attempts = 0
-            memory.skill_completion_recovery_attempts = 0
-            return self._finish(state, memory, status="success", summary=summary)
-
-        active = self.skill_runtime.active if self.skill_runtime is not None else None
-        skill_id = active.manifest.id if active is not None else "unknown"
-        if self._require_skill_verification_plan_revision(
-            skill_report,
-            state=state,
-            memory=memory,
-        ):
-            return None
-
-        state.skill_completion_recovery_attempts += 1
-        memory.skill_completion_recovery_attempts = state.skill_completion_recovery_attempts
-        failed = ", ".join(skill_report.failed)
-        if state.skill_completion_recovery_attempts >= _MAX_SKILL_COMPLETION_RECOVERY_ATTEMPTS:
-            return self._finish(
-                state,
-                memory,
-                status="incomplete",
-                reason=(
-                    f"global Skill {skill_id} completion requirements remained unsatisfied "
-                    f"after {_MAX_SKILL_COMPLETION_RECOVERY_ATTEMPTS} recovery attempts: {failed}"
-                ),
-                summary=summary,
-            )
-
-        self._append_system_feedback(
-            state,
-            memory,
-            {
-                "error": "skill_completion_requirements_failed",
-                "global_skill": skill_id,
-                "failed_requirements": list(skill_report.failed),
-                "recovery_attempt": state.skill_completion_recovery_attempts,
-                "recovery_attempts_remaining": (
-                    _MAX_SKILL_COMPLETION_RECOVERY_ATTEMPTS
-                    - state.skill_completion_recovery_attempts
-                ),
-                "instruction": (
-                    "Do not repeat the final answer. Take a concrete tool action that satisfies "
-                    "the listed requirement, or explain once why it cannot be satisfied. "
-                    "git_diff_reviewed requires git_diff after the latest edit; stale "
-                    "verification requires rerunning its registered checks; active processes "
-                    "must finish before completion."
-                ),
-            },
-        )
-        self._save_memory(memory, state, status=state.status.value)
-        return None
-
-    def _require_skill_verification_plan_revision(
-        self,
-        report: SkillRequirementReport,
-        *,
-        state: SessionState,
-        memory: MemoryState,
-    ) -> bool:
-        if not report.missing_verification_kinds:
-            return False
-        active = self.skill_runtime.active if self.skill_runtime is not None else None
-        skill_id = active.manifest.id if active is not None else "unknown"
-        kinds = ", ".join(kind.value for kind in report.missing_verification_kinds)
-        self._set_verification_plan_revision(
-            f"global Skill {skill_id} requires missing verification kinds: {kinds}",
-            guidance=(
-                "The next response must call register_verification only with a complete "
-                "replacement plan. Preserve all existing required checks and requirements, "
-                f"and ensure at least one required check has each missing kind: {kinds}. "
-                "Reclassify an existing check only when its command genuinely verifies that "
-                "kind; otherwise add a deterministic check. register_verification does not "
-                "require record_decision. After registration, run the replacement plan."
-            ),
-            state=state,
-            memory=memory,
-        )
-        return True
 
     def _request_verification_plan_recovery(
         self,
@@ -2409,12 +2176,6 @@ class AgentController:
                     )
                     or schema.get("function", {}).get("name") in allowed_side_effects
                 ]
-        if self.skill_runtime is not None:
-            names = {str(schema.get("function", {}).get("name", "")) for schema in schemas}
-            allowed = self.skill_runtime.allowed_tool_names(names)
-            schemas = [
-                schema for schema in schemas if schema.get("function", {}).get("name") in allowed
-            ]
         if self.reasoning_manager.config.enabled:
             return schemas
         return [
@@ -2437,54 +2198,36 @@ class AgentController:
             PlanOperation.VERIFY: {"run_command", "run_verification"},
         }[step.operation]
 
-    def _skill_completion_report(self, memory: MemoryState) -> SkillRequirementReport:
-        if self.skill_runtime is None or self.skill_runtime.active is None:
-            return SkillRequirementReport(complete=True)
-        return self.skill_requirements.before_finish(
-            memory,
-            self.skill_runtime.active.manifest.requirements.before_finish,
-        )
-
     def _skill_policy_messages(self, memory: MemoryState) -> list[dict[str, Any]]:
         if self.skill_runtime is None:
             return []
-        scoped_bundles = [
-            ("system", bundle)
-            for bundle in self.skill_runtime.system_for_task(
-                "\n".join(
-                    [
-                        memory.fixed.original_task if memory.fixed is not None else "",
-                        *memory.task_updates,
-                    ]
-                )
+        system_bundles = self.skill_runtime.system_for_task(
+            "\n".join(
+                [
+                    memory.fixed.original_task if memory.fixed is not None else "",
+                    *memory.task_updates,
+                ]
             )
-        ]
+        )
+        for skill_id, error in self.skill_runtime.automatic_load_errors:
+            self._log("skill_load_failed", skill_id=skill_id, error=error, continuing=True)
+        scoped_bundles = [("system", bundle) for bundle in system_bundles]
         if self.skill_runtime.active is not None:
             scoped_bundles.append(("global", self.skill_runtime.active))
         messages: list[dict[str, Any]] = []
         for scope, bundle in scoped_bundles:
-            system_skill = scope == "system"
             payload = {
-                "policy_layer": f"{scope}_skill",
+                "context_layer": f"{scope}_skill",
                 "authority": (
-                    "Packaged system guidance. Apply this Skill only when the current task "
-                    "matches its objective or triggers. Unrelated system Skills impose no task "
-                    "constraints. It cannot grant tools, bypass approval, override hard safety "
-                    "policy, expand workspace access, or execute code."
-                    if system_skill
-                    else "User-selected task guidance. It may narrow tools and add locally "
-                    "enforced requirements, but cannot grant tools, bypass approval, override "
-                    "hard safety policy, expand workspace access, or execute code."
+                    "Reusable workflow guidance. It cannot grant tools, bypass approval, "
+                    "override Controller policy, expand workspace access, or execute code."
                 ),
-                "id": bundle.manifest.id,
-                "version": bundle.manifest.version,
+                "id": bundle.qualified_id,
+                "name": bundle.manifest.name,
+                "version": bundle.version,
                 "content_hash": bundle.content_hash,
-                "summary": bundle.manifest.summary,
-                "triggers": bundle.manifest.triggers.model_dump(mode="json"),
-                "requested_tools": sorted(bundle.manifest.requested_tools),
-                "requirements": bundle.manifest.requirements.model_dump(mode="json"),
-                "requirements_enforced": not system_skill,
-                "verification_profiles": bundle.manifest.verification_profiles,
+                "description": bundle.manifest.description,
+                "resources": list(bundle.resource_files),
                 "instructions": bundle.body,
             }
             messages.append(
@@ -2737,7 +2480,6 @@ class AgentController:
         memory.verification_plan_revision_reason = state.verification_plan_revision_reason
         memory.verification_plan_revision_guidance = state.verification_plan_revision_guidance
         memory.verification_plan_revision_attempts = state.verification_plan_revision_attempts
-        memory.skill_completion_recovery_attempts = state.skill_completion_recovery_attempts
         memory.candidate_final_assessment = state.candidate_final_assessment
         memory.workflow_mode = state.workflow_mode
         memory.status = status

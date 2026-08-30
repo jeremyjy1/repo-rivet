@@ -1,30 +1,8 @@
 ---
-schema_version: 1
-id: repository-onboarding
-name: Repository Onboarding
-version: 1.1.1
-summary: Inspect an unfamiliar repository and produce a bounded, evidence-based architecture overview.
-category: workflow
-activation:
-  explicit: false
-  automatic: true
-triggers:
-  task_types: [onboard, architecture-review]
-  keywords: [repository overview, architecture overview, understand repository, project structure, 项目概览, 架构概览, 理解项目, 项目结构]
-compatible_modes: [plan, execute]
-requested_tools:
-  - list_files
-  - read_file
-  - search_text
-  - git_status
-  - git_diff
-requirements:
-  before_edit: []
-  before_finish: []
-verification_profiles: []
-limits:
-  max_prompt_tokens: 1000
-  max_active_support_skills: 0
+name: repository-onboarding
+description: Inspect an unfamiliar repository and produce a bounded, evidence-based architecture overview. Use for repository overview, architecture overview, project structure, onboarding, 项目概览, 架构概览, 理解项目, or 项目结构 requests; do not use for implementation tasks.
+metadata:
+  version: "2.0.0"
 ---
 
 # Objective

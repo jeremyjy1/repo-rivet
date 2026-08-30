@@ -31,19 +31,9 @@ _GENERATORS = frozenset({"protoc"})
 _STATIC_CHECKERS = frozenset({"clang-tidy", "eslint", "mypy", "pyright", "ruff"})
 _TEST_RUNNERS = frozenset({"ctest", "pytest"})
 _REPORIVET_CLI = "reporivet"
-_SKILL_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{1,63}$")
-_SKILL_INIT_VALUE_FLAGS = frozenset(
-    {
-        "--name",
-        "--summary",
-        "--output",
-        "--tool",
-        "--mode",
-        "--before-edit",
-        "--before-finish",
-    }
-)
-_SKILL_CONVERT_VALUE_FLAGS = frozenset({"--id", "--name", "--summary", "--output"})
+_SKILL_ID_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+_SKILL_INIT_VALUE_FLAGS = frozenset({"--description", "--output"})
+_SKILL_CONVERT_VALUE_FLAGS = frozenset({"--name", "--description", "--output"})
 _PACKAGE_MANAGERS = frozenset({"npm", "pnpm", "yarn"})
 _INSTALL_ACTIONS = frozenset({"add", "install", "sync", "update", "upgrade"})
 _DELETE_PROGRAMS = frozenset({"rm", "rmdir", "unlink"})
@@ -737,7 +727,7 @@ def _classify_reporivet_skill_command(
         parsed = _parse_skill_options(args[2:], _SKILL_CONVERT_VALUE_FLAGS)
         if parsed is not None:
             positionals, options = parsed
-            skill_id = options.get("--id", [None])[-1]
+            skill_id = options.get("--name", [None])[-1]
             if (
                 len(positionals) == 1
                 and not positionals[0].startswith("-")
@@ -773,7 +763,7 @@ def _reporivet_skill_paths(args: list[str], cwd: Path) -> tuple[list[str], list[
         if parsed is None:
             return [], []
         positionals, options = parsed
-        skill_id = options.get("--id", [None])[-1]
+        skill_id = options.get("--name", [None])[-1]
         if len(positionals) != 1 or not isinstance(skill_id, str):
             return [], []
         output_root = options.get("--output", ["reporivet-skills"])[-1]
@@ -822,7 +812,7 @@ def _parse_skill_options(
 
 
 def _valid_skill_id(value: str) -> bool:
-    return _SKILL_ID_PATTERN.fullmatch(value) is not None
+    return len(value) <= 64 and _SKILL_ID_PATTERN.fullmatch(value) is not None
 
 
 def _git_writes(args: list[str]) -> bool:

@@ -1,65 +1,71 @@
-"""Session activation, capability narrowing, and pinned-content validation."""
+"""Session activation, lazy routing, and content pinning for portable Skills."""
 
 from __future__ import annotations
 
-import fnmatch
 import re
 
 from repo_rivet.memory.models import MemoryState
 from repo_rivet.planning.models import PlanStatus, WorkflowMode
 from repo_rivet.skills.errors import SkillError, SkillStaleError, SkillValidationError
-from repo_rivet.skills.models import ActiveSkillPin, SkillActivation, SkillBundle, SkillSource
+from repo_rivet.skills.models import (
+    ActiveSkillPin,
+    SkillActivation,
+    SkillBundle,
+    SkillMetadata,
+    SkillSource,
+)
 from repo_rivet.skills.registry import SkillRegistry
 
-CONTROL_TOOLS = frozenset(
-    {
-        "record_decision",
-        "register_verification",
-        "request_plan",
-        "submit_plan",
-        "update_plan",
-    }
-)
-# These are Controller protocol tools rather than task capabilities. Keeping the mode-valid
-# subset prevents a narrowed Skill from deadlocking decision, verification, or Plan workflows.
+_ROUTING_STOP_WORDS = {
+    "agent",
+    "and",
+    "for",
+    "from",
+    "tasks",
+    "that",
+    "the",
+    "this",
+    "use",
+    "when",
+    "with",
+}
 
 
 class SkillRuntime:
-    def __init__(self, registry: SkillRegistry, *, known_tools: set[str]) -> None:
+    def __init__(self, registry: SkillRegistry) -> None:
         self.registry = registry
-        self.known_tools = known_tools
-        system: list[SkillBundle] = []
-        for item in registry.system_skills():
-            bundle = self._validate_bundle(registry.load(item.manifest.id))
-            if not bundle.manifest.activation.automatic:
-                raise SkillValidationError(
-                    f"System Skill {bundle.manifest.id} must declare automatic activation"
-                )
-            system.append(bundle)
-        self._system = tuple(system)
+        self._system = registry.system_skills()
+        self._system_cache: dict[str, SkillBundle] = {}
+        self._system_failures: dict[str, str] = {}
         self._active: SkillBundle | None = None
+        self._automatic_load_errors: list[tuple[str, str]] = []
 
     @property
-    def system(self) -> tuple[SkillBundle, ...]:
-        """Packaged system Skills, eagerly loaded for every runtime."""
+    def system(self) -> tuple[SkillMetadata, ...]:
+        """Indexed system descriptors; their instruction bodies remain unloaded."""
         return self._system
 
     @property
     def active(self) -> SkillBundle | None:
         return self._active
 
-    def sync_system(self, memory: MemoryState) -> tuple[ActiveSkillPin, ...]:
-        """Persist the exact packaged Skill set used by this runtime."""
-        pins = tuple(
-            ActiveSkillPin(
-                id=bundle.manifest.id,
-                version=bundle.manifest.version,
-                content_hash=bundle.content_hash,
-                source=SkillSource.SYSTEM,
-                activation=SkillActivation.SYSTEM,
-            )
-            for bundle in self._system
+    @property
+    def automatic_load_errors(self) -> tuple[tuple[str, str], ...]:
+        return tuple(self._automatic_load_errors)
+
+    @staticmethod
+    def _pin(metadata: SkillMetadata, activation: SkillActivation) -> ActiveSkillPin:
+        return ActiveSkillPin(
+            id=metadata.qualified_id,
+            name=metadata.manifest.name,
+            version=metadata.version,
+            content_hash=metadata.manifest_hash,
+            source=metadata.source,
+            activation=activation,
         )
+
+    def sync_system(self, memory: MemoryState) -> tuple[ActiveSkillPin, ...]:
+        pins = tuple(self._pin(item, SkillActivation.SYSTEM) for item in self._system)
         previous = tuple(memory.system_skills)
         memory.system_skills = list(pins)
         if previous and previous != pins:
@@ -73,26 +79,17 @@ class SkillRuntime:
         *,
         activation: SkillActivation = SkillActivation.EXPLICIT,
     ) -> SkillBundle:
-        bundle = self._validate_bundle(self.registry.load(skill_id))
+        bundle = self.registry.load(skill_id)
         if bundle.source != SkillSource.GLOBAL:
             raise SkillValidationError(
-                f"System Skill {skill_id} is already loaded and cannot be selected as the "
-                "session's global Skill"
+                f"System Skill {bundle.qualified_id} is automatically routed and cannot be "
+                "selected as the session's global Skill"
             )
-        if not bundle.manifest.activation.explicit:
-            raise SkillValidationError(f"Global Skill {skill_id} does not allow explicit selection")
-        pin = ActiveSkillPin(
-            id=bundle.manifest.id,
-            version=bundle.manifest.version,
-            content_hash=bundle.content_hash,
-            source=bundle.source,
-            activation=activation,
-        )
+        pin = self._pin(bundle, activation)
         changed = memory.active_skill != pin
         memory.active_skill = pin
         self._active = bundle
         if changed:
-            memory.skill_completion_recovery_attempts = 0
             self._invalidate_plan(memory)
         return bundle
 
@@ -103,7 +100,7 @@ class SkillRuntime:
             self._active = None
             return None
         try:
-            bundle = self._validate_bundle(self.registry.load(pin.id))
+            bundle = self.registry.load(pin.id)
         except SkillError as error:
             self._invalidate_plan(memory)
             raise SkillStaleError(
@@ -111,15 +108,8 @@ class SkillRuntime:
             ) from None
         if bundle.source != SkillSource.GLOBAL:
             self._invalidate_plan(memory)
-            raise SkillStaleError(
-                f"Pinned skill {pin.id} is now a system Skill and is already loaded; clear the "
-                "session's global Skill selection"
-            )
-        if (
-            bundle.source != pin.source
-            or bundle.manifest.version != pin.version
-            or bundle.content_hash != pin.content_hash
-        ):
+            raise SkillStaleError(f"Pinned skill {pin.id} is no longer a global Skill")
+        if self._pin(bundle, pin.activation) != pin:
             self._invalidate_plan(memory)
             raise SkillStaleError(
                 f"Pinned skill {pin.id} changed after activation; select it again or clear it"
@@ -127,39 +117,33 @@ class SkillRuntime:
         self._active = bundle
         return bundle
 
-    def _validate_bundle(self, bundle: SkillBundle) -> SkillBundle:
-        unknown = bundle.manifest.requested_tools - self.known_tools
-        if unknown:
-            raise SkillValidationError(
-                f"Skill {bundle.manifest.id} requests unknown tools: " + ", ".join(sorted(unknown))
-            )
-        return bundle
-
     def clear(self, memory: MemoryState) -> None:
         if memory.active_skill is not None:
             self._invalidate_plan(memory)
         memory.active_skill = None
-        memory.skill_completion_recovery_attempts = 0
         self._active = None
 
-    def supports_mode(self, mode: WorkflowMode) -> bool:
-        if self._active is None:
-            return True
-        mode_name = "plan" if mode == WorkflowMode.PLANNING else "execute"
-        return mode_name in self._active.manifest.compatible_modes
-
-    def allowed_tool_names(self, mode_tools: set[str]) -> set[str]:
-        if self._active is None:
-            return mode_tools
-        return {
-            name
-            for name in mode_tools
-            if name in CONTROL_TOOLS or name in self._active.manifest.requested_tools
-        }
-
     def system_for_task(self, task: str) -> tuple[SkillBundle, ...]:
-        """Return loaded system guidance whose declared triggers match the task."""
-        return tuple(bundle for bundle in self._system if _matches_task(bundle, task))
+        """Match standard descriptions, then lazily load only selected instructions."""
+        bundles: list[SkillBundle] = []
+        self._automatic_load_errors.clear()
+        for metadata in self._system:
+            if not _description_matches(metadata.manifest.description, task):
+                continue
+            if metadata.qualified_id in self._system_cache:
+                bundles.append(self._system_cache[metadata.qualified_id])
+                continue
+            if metadata.qualified_id in self._system_failures:
+                continue
+            try:
+                bundle = self.registry.load(metadata.qualified_id)
+                self._system_cache[metadata.qualified_id] = bundle
+                bundles.append(bundle)
+            except SkillError as error:
+                rendered = str(error)
+                self._system_failures[metadata.qualified_id] = rendered
+                self._automatic_load_errors.append((metadata.qualified_id, rendered))
+        return tuple(bundles)
 
     @staticmethod
     def _invalidate_plan(memory: MemoryState) -> None:
@@ -172,42 +156,16 @@ class SkillRuntime:
         memory.workflow_mode = WorkflowMode.PLAN_READY
 
 
-def _matches_task(bundle: SkillBundle, task: str) -> bool:
-    triggers = bundle.manifest.triggers
-    if not any(
-        (
-            triggers.task_types,
-            triggers.file_globs,
-            triggers.project_markers,
-            triggers.keywords,
-        )
-    ):
-        return True
-
-    normalized = " ".join(task.casefold().replace("_", " ").replace("-", " ").split())
-    phrases = [*triggers.task_types, *triggers.keywords]
-    if any(
-        " ".join(phrase.casefold().replace("_", " ").replace("-", " ").split()) in normalized
-        for phrase in phrases
-        if phrase.strip()
-    ):
-        return True
-
-    path_candidates = {
-        value.strip("'\"`()[]{}<>,:;").replace("\\", "/") for value in re.findall(r"[^\s]+", task)
+def _description_matches(description: str, task: str) -> bool:
+    normalized_task = " ".join(task.casefold().replace("_", " ").replace("-", " ").split())
+    english_terms = {
+        term
+        for term in re.findall(r"[a-z0-9][a-z0-9+.#-]{2,}", description.casefold())
+        if term not in _ROUTING_STOP_WORDS
     }
-    path_candidates.discard("")
-    for pattern in triggers.file_globs:
-        normalized_pattern = pattern.replace("\\", "/")
-        short_pattern = (
-            normalized_pattern[3:] if normalized_pattern.startswith("**/") else normalized_pattern
-        )
-        if any(
-            fnmatch.fnmatch(candidate, normalized_pattern)
-            or fnmatch.fnmatch(candidate, short_pattern)
-            for candidate in path_candidates
-        ):
-            return True
-
-    basenames = {candidate.rsplit("/", 1)[-1].casefold() for candidate in path_candidates}
-    return any(marker.casefold() in basenames for marker in triggers.project_markers)
+    if sum(term in normalized_task for term in english_terms) >= 2:
+        return True
+    # Descriptions may include comma-separated CJK routing terms. Keeping those terms explicit in
+    # the portable description makes routing useful without a private trigger schema.
+    cjk_terms = re.findall(r"[\u3400-\u9fff]{2,8}", description)
+    return any(term in task for term in cjk_terms)
