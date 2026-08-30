@@ -38,6 +38,7 @@ _APPROVAL_FAILURE_CODES = {
     "hard_policy_denied",
 }
 _TOOL_PROGRESS_LABELS = {
+    "delete_path": "deleting path",
     "edit_file": "applying edits",
     "git_diff": "inspecting Git changes",
     "git_status": "inspecting Git status",

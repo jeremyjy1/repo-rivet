@@ -113,6 +113,106 @@ def test_plan_draft_rejects_cycles_and_missing_verify_steps() -> None:
         PlanDraft.model_validate(payload)
 
 
+def test_plan_runtime_executes_snapshot_bound_directory_delete_step(tmp_path: Path) -> None:
+    directory = tmp_path / "generated"
+    directory.mkdir()
+    (directory / "artifact.txt").write_text("generated", encoding="utf-8")
+    memory = MemoryState(session_id="plan-test")
+    listed = observation().model_copy(
+        update={
+            "tool_name": "list_files",
+            "result_summary": "Listed generated.",
+            "affected_paths": ["generated"],
+        }
+    )
+    memory.observation_events.append(listed)
+    runtime = PlanRuntime(WorkspacePathPolicy(tmp_path))
+    runtime.bind(memory)
+    artifact = runtime.submit({"plan": plan_payload(operation="delete", target="generated")})
+    runtime.approve()
+    call = ToolCall(
+        id="delete-1",
+        name="delete_path",
+        arguments={"path": "generated", "recursive": True},
+    )
+
+    assert artifact.snapshots["generated"]
+    assert runtime.validate_action(call) is None
+    runtime.start_action()
+    memory.workspace_revision = 1
+    runtime.observe_action(
+        call,
+        ToolResult(
+            ok=True,
+            output="Deleted directory generated",
+            metadata={"path": "generated", "workspace_revision": 1, "deleted": True},
+        ),
+        evidence_ref="obs-delete",
+    )
+
+    assert artifact.steps[0].status == PlanStepStatus.COMPLETED
+    assert "generated" not in artifact.execution_snapshots
+
+
+def test_approved_delete_step_uses_plan_as_decision_record(tmp_path: Path) -> None:
+    memory = inspected_memory(tmp_path)
+    registry = create_default_registry(tmp_path)
+    registry.plan_runtime.bind(memory)
+    artifact = registry.plan_runtime.submit(
+        {"plan": plan_payload(operation="delete", target="app.py")}
+    )
+    registry.plan_runtime.approve()
+    registry.verification_runtime.bind(memory)
+    registry.verification_runtime.register_plan(
+        {
+            "requirements": ["tests"],
+            "checks": [
+                {
+                    "check_id": "tests",
+                    "title": "Confirm workspace remains valid",
+                    "kind": "test",
+                    "command": {"program": "true", "args": [], "cwd": "."},
+                    "criteria": {"expected_exit_codes": [0]},
+                    "required": True,
+                    "provenance": "model",
+                }
+            ],
+        }
+    )
+    delete = ToolCall(
+        id="delete-with-plan",
+        name="delete_path",
+        arguments={"path": "app.py"},
+    )
+    model = FakeModelClient(
+        [
+            ModelResponse(tool_calls=[delete]),
+            ModelResponse(content="Deleted the planned file and verified the workspace."),
+        ]
+    )
+    events: list[tuple[str, dict[str, object]]] = []
+
+    class RecordingSink:
+        def log(self, event_type: str, **data: object) -> None:
+            events.append((event_type, data))
+
+    result = AgentController(
+        model_client=model,
+        tool_registry=registry,
+        event_logger=RecordingSink(),
+    ).run("Execute the approved deletion plan", memory=memory)
+
+    assert result.status == "success"
+    assert not (tmp_path / "app.py").exists()
+    assert artifact.status == PlanStatus.COMPLETED
+    assert not any(event.phase.value == "decision" for event in memory.reasoning_events)
+    authorized = next(data for name, data in events if name == "plan_authorized_action")
+    assert authorized["tool"] == "delete_path"
+    assert authorized["plan_id"] == artifact.plan_id
+    assert authorized["plan_step_id"] == "change"
+    assert authorized["authority"] == "approved_implementation_plan"
+
+
 def test_plan_tool_schema_does_not_expose_controller_owned_progress() -> None:
     schema = SubmitPlanTool().schema
     serialized = str(schema)

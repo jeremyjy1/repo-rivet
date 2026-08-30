@@ -17,6 +17,7 @@ class DecisionPolicy(StrEnum):
     MUTATION = "mutation"
     COMMAND = "command"
     REGISTERED_PLAN = "registered_plan"
+    APPROVAL_GATED = "approval_gated"
 
 
 @dataclass(frozen=True, slots=True)

@@ -158,7 +158,6 @@ class MemoryStore:
                 add_unique(memory.summary.unresolved_issues, issue)
         if changed:
             memory.context_checkpoint = None
-            memory.reflection_required = True
             memory.workspace_revision += 1
             for check_id, result in list(memory.verification_results.items()):
                 if result.status != VerificationStatus.STALE:

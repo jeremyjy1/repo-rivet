@@ -148,6 +148,7 @@ class ApprovalFactAnalyzer:
         operation = OperationClass.UNKNOWN
         read_paths: list[str] = []
         write_paths: list[str] = []
+        delete_paths: list[str] = []
         effects: set[str] = set()
         constraints = {"typed_tool"}
         if request.tool_name in {
@@ -166,12 +167,20 @@ class ApprovalFactAnalyzer:
             write_paths = paths
             effects.add("filesystem_write")
             constraints.update({"workspace_path_policy", "snapshot_precondition"})
-        scope = effect_scope(write_paths or read_paths, Path(request.workspace))
+        elif request.tool_name == "delete_path":
+            operation = OperationClass.DELETE
+            delete_paths = paths
+            effects.add("filesystem_delete")
+            constraints.update(
+                {"workspace_path_policy", "approval_time_precondition", "explicit_recursive"}
+            )
+        scope = effect_scope(delete_paths or write_paths or read_paths, Path(request.workspace))
         return ApprovalFacts(
             operation_class=operation,
             analysis_level=AnalysisLevel.EXACT,
             read_paths=read_paths,
             write_paths=write_paths,
+            delete_paths=delete_paths,
             path_classes=path_classes,
             effect_scope=scope,
             explicit_effects=effects,

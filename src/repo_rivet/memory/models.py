@@ -496,9 +496,23 @@ class MemoryState(BaseModel):
                     self.current_snapshots.pop(path, None)
                     self.current_snapshots[path] = snapshot_id
 
-        elif call.name in {"write_file", "edit_file"} and result.ok and isinstance(path, str):
-            self.file_memories.pop(path, None)
-            self.invalidated_files.add(path)
+        elif (
+            call.name in {"write_file", "edit_file", "delete_path"}
+            and result.ok
+            and isinstance(path, str)
+        ):
+            invalidated_paths = [path]
+            if call.name == "delete_path" and metadata.get("path_type") == "directory":
+                prefix = f"{path.rstrip('/')}/"
+                invalidated_paths.extend(
+                    candidate
+                    for candidate in {*self.file_memories, *self.current_snapshots}
+                    if candidate.startswith(prefix)
+                )
+            for invalidated_path in invalidated_paths:
+                self.file_memories.pop(invalidated_path, None)
+                self.current_snapshots.pop(invalidated_path, None)
+                self.invalidated_files.add(invalidated_path)
             self.modified_files.add(path)
             self.workspace_revision += 1
             for check_id, verification in list(self.verification_results.items()):
@@ -512,14 +526,20 @@ class MemoryState(BaseModel):
             add_unique(self.summary.completed_actions, f"Modified {path} with {call.name}")
             add_unique(self.working.recent_modified_files, path, limit=20)
             snapshot_id = metadata.get("new_snapshot_id") or metadata.get("snapshot_id")
-            if isinstance(snapshot_id, str):
+            if call.name == "delete_path":
+                self.current_snapshots.pop(path, None)
+                context_output = (
+                    f"{context_output}\nThe path no longer exists. Do not reuse its prior "
+                    "snapshot or assume its children remain available."
+                )
+            elif isinstance(snapshot_id, str):
                 self.current_snapshots.pop(path, None)
                 self.current_snapshots[path] = snapshot_id
-            context_output = (
-                f"{context_output}\nThe previous snapshot for {path} is invalid. "
-                "Use the returned new snapshot only for displayed changed ranges; reread other "
-                "ranges before editing them."
-            )
+                context_output = (
+                    f"{context_output}\nThe previous snapshot for {path} is invalid. "
+                    "Use the returned new snapshot only for displayed changed ranges; reread "
+                    "other ranges before editing them."
+                )
 
         elif call.name in {"run_command", "run_verification"}:
             command = call.arguments.get("command") or metadata.get("command")

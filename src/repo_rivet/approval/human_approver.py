@@ -308,6 +308,8 @@ def _request_rows(request: ApprovalRequest) -> list[tuple[str, str]]:
         path_label = (
             "Directory"
             if request.tool_name in {"git_diff", "git_status", "list_files", "search_text"}
+            else "Path"
+            if request.tool_name == "delete_path"
             else "File"
         )
         rows.append((path_label, _display_value(path)))

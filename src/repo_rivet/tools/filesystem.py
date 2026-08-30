@@ -1,8 +1,13 @@
-"""Workspace-confined file listing, search, read, and edit tools."""
+"""Workspace-confined file listing, search, read, edit, and deletion tools."""
 
+import hashlib
+import json
 import re
+import shutil
+import stat
+from dataclasses import dataclass
 from pathlib import Path
-from typing import ClassVar
+from typing import Any, ClassVar
 
 from pydantic import Field, model_validator
 
@@ -11,7 +16,7 @@ from repo_rivet.editing.atomic_writer import atomic_create_bytes
 from repo_rivet.editing.document import MAX_TEXT_FILE_BYTES, TextDocument
 from repo_rivet.editing.runtime import EditingRuntime
 from repo_rivet.safety.path_policy import PathPolicyError, WorkspacePathPolicy
-from repo_rivet.tools.base import BaseTool, ToolArguments, ToolResult
+from repo_rivet.tools.base import BaseTool, DecisionPolicy, ToolArguments, ToolResult
 
 MAX_READ_LINES = 300
 MAX_READ_CHARS = 20_000
@@ -53,6 +58,26 @@ class ReadFileArguments(ToolArguments):
 class WriteFileArguments(ToolArguments):
     path: str
     content: str
+
+
+class DeletePathArguments(ToolArguments):
+    path: str
+    recursive: bool = Field(
+        default=False,
+        description="Must be true to delete a non-empty directory.",
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedDeletion:
+    key: str
+    path: Path
+    relative_path: str
+    entry_type: str
+    entry_count: int
+    total_bytes: int
+    fingerprint: str
+    protected_entries: tuple[str, ...]
 
 
 class WorkspaceTool(BaseTool[ToolArguments]):
@@ -358,6 +383,167 @@ class WriteFileTool(WorkspaceTool):
                 "workspace_revision": workspace_revision,
             },
             raw_output=arguments.content,
+        )
+
+
+class DeletePathTool(WorkspaceTool):
+    name = "delete_path"
+    description = (
+        "Delete one workspace file, symlink, or directory. Set recursive=true explicitly for "
+        "a non-empty directory. The workspace root and protected repository metadata cannot "
+        "be deleted."
+    )
+    arguments_type = DeletePathArguments
+    capabilities = frozenset({Capability.FILESYSTEM_DELETE})
+    decision_policy = DecisionPolicy.APPROVAL_GATED
+
+    def __init__(
+        self,
+        path_policy: WorkspacePathPolicy,
+        editing_runtime: EditingRuntime | None = None,
+    ) -> None:
+        super().__init__(path_policy)
+        self.editing_runtime = editing_runtime or EditingRuntime(path_policy)
+        self._prepared: dict[str, PreparedDeletion] = {}
+
+    def approval_arguments(self, arguments: DeletePathArguments) -> dict[str, Any] | ToolResult:
+        try:
+            prepared = self._prepare(arguments)
+        except (OSError, ValueError) as error:
+            return ToolResult(
+                ok=False,
+                output="",
+                error=str(error),
+                error_code="invalid_delete_target",
+                retryable=False,
+            )
+        return {
+            "path": prepared.relative_path,
+            "recursive": arguments.recursive,
+            "entry_type": prepared.entry_type,
+            "entry_count": prepared.entry_count,
+            "total_bytes": prepared.total_bytes,
+            "_prepared_fingerprint": prepared.fingerprint,
+        }
+
+    def run(self, arguments: DeletePathArguments) -> ToolResult:
+        prepared = self._prepare(arguments)
+        current = self._inspect(prepared.path, prepared.key)
+        if current.fingerprint != prepared.fingerprint:
+            self._prepared.pop(prepared.key, None)
+            raise ValueError(
+                "Deletion target changed during approval; inspect it again before deleting"
+            )
+
+        if prepared.entry_type == "directory":
+            if arguments.recursive:
+                shutil.rmtree(prepared.path)
+            else:
+                prepared.path.rmdir()
+        else:
+            prepared.path.unlink()
+        self._prepared.pop(prepared.key, None)
+        workspace_revision = self.editing_runtime.record_deleted_path()
+        return ToolResult(
+            ok=True,
+            output=f"Deleted {prepared.entry_type} {prepared.relative_path}",
+            metadata={
+                "path": prepared.relative_path,
+                "deleted": True,
+                "path_type": prepared.entry_type,
+                "entry_count": prepared.entry_count,
+                "bytes": prepared.total_bytes,
+                "workspace_revision": workspace_revision,
+            },
+        )
+
+    def _prepare(self, arguments: DeletePathArguments) -> PreparedDeletion:
+        key = json.dumps(arguments.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+        cached = self._prepared.get(key)
+        if cached is not None:
+            return cached
+        path = self.path_policy.resolve_entry(arguments.path)
+        if path == self.path_policy.workspace:
+            raise ValueError("The workspace root cannot be deleted")
+        relative = path.relative_to(self.path_policy.workspace).as_posix()
+        if relative == ".git" or relative.startswith(".git/"):
+            raise ValueError("Git repository metadata cannot be deleted")
+        if _is_sensitive_path(relative):
+            raise ValueError(f"Sensitive configuration files cannot be deleted: {relative}")
+        prepared = self._inspect(path, key)
+        if prepared.protected_entries:
+            preview = ", ".join(prepared.protected_entries[:3])
+            raise ValueError(
+                f"Protected repository or configuration entries cannot be deleted: {preview}"
+            )
+        if (
+            prepared.entry_type == "directory"
+            and prepared.entry_count > 0
+            and not arguments.recursive
+        ):
+            raise ValueError("Directory is not empty; set recursive=true to delete its contents")
+        self._prepared[key] = prepared
+        return prepared
+
+    def _inspect(self, path: Path, key: str) -> PreparedDeletion:
+        try:
+            root_stat = path.lstat()
+        except FileNotFoundError:
+            raise ValueError(f"Path does not exist: {path.name}") from None
+
+        if stat.S_ISLNK(root_stat.st_mode):
+            entry_type = "symlink"
+            entries = [(".", root_stat)]
+        elif stat.S_ISREG(root_stat.st_mode):
+            entry_type = "file"
+            entries = [(".", root_stat)]
+        elif stat.S_ISDIR(root_stat.st_mode):
+            entry_type = "directory"
+            entries = []
+            pending = [path]
+            while pending:
+                directory = pending.pop()
+                for child in sorted(directory.iterdir(), key=lambda item: item.name):
+                    child_stat = child.lstat()
+                    entries.append((child.relative_to(path).as_posix(), child_stat))
+                    if stat.S_ISDIR(child_stat.st_mode) and not stat.S_ISLNK(child_stat.st_mode):
+                        pending.append(child)
+        else:
+            raise ValueError("Only regular files, symlinks, and directories can be deleted")
+
+        digest = hashlib.sha256()
+        total_bytes = 0
+        for relative, entry_stat in sorted(entries, key=lambda item: item[0]):
+            total_bytes += entry_stat.st_size if stat.S_ISREG(entry_stat.st_mode) else 0
+            digest.update(
+                json.dumps(
+                    [
+                        relative,
+                        stat.S_IFMT(entry_stat.st_mode),
+                        entry_stat.st_size,
+                        entry_stat.st_mtime_ns,
+                        entry_stat.st_ino,
+                    ],
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            )
+        relative_path = path.relative_to(self.path_policy.workspace).as_posix()
+        protected_entries: list[str] = []
+        for relative, _ in entries:
+            full_relative = (
+                relative_path if relative == "." else (Path(relative_path) / relative).as_posix()
+            )
+            if ".git" in Path(full_relative).parts or _is_sensitive_path(full_relative):
+                protected_entries.append(full_relative)
+        return PreparedDeletion(
+            key=key,
+            path=path,
+            relative_path=relative_path,
+            entry_type=entry_type,
+            entry_count=(len(entries) if entry_type == "directory" else 1),
+            total_bytes=total_bytes,
+            fingerprint=digest.hexdigest(),
+            protected_entries=tuple(protected_entries),
         )
 
 

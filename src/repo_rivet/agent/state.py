@@ -18,7 +18,7 @@ from repo_rivet.verification.models import (
     VerificationStatus,
 )
 
-_FILE_MODIFICATION_TOOLS = frozenset({"edit_file", "write_file"})
+_FILE_MODIFICATION_TOOLS = frozenset({"delete_path", "edit_file", "write_file"})
 _PROGRESS_NEUTRAL_TOOLS = frozenset({"record_decision"})
 
 

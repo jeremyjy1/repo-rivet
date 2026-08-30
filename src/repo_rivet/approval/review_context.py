@@ -75,7 +75,7 @@ def build_review_payload(request: ApprovalRequest) -> dict[str, Any]:
 
 
 def _execution_plan(request: ApprovalRequest) -> dict[str, Any]:
-    if request.tool_name in {"write_file", "edit_file"}:
+    if request.tool_name in {"write_file", "edit_file", "delete_path"}:
         return _file_change_plan(request)
     command = request.normalized_arguments.get("command")
     if not isinstance(command, dict):
@@ -111,7 +111,13 @@ def _file_change_plan(request: ApprovalRequest) -> dict[str, Any]:
     target = resolved_paths.get("path") if isinstance(resolved_paths, dict) else None
     plan: dict[str, Any] = {
         "tool": request.tool_name,
-        "operation": "create" if request.tool_name == "write_file" else "edit",
+        "operation": (
+            "create"
+            if request.tool_name == "write_file"
+            else "delete"
+            if request.tool_name == "delete_path"
+            else "edit"
+        ),
         "target": target,
         "overwrites_existing_file": request.facts.overwrites_existing,
         "constraints": sorted(request.facts.constraints),
@@ -123,6 +129,13 @@ def _file_change_plan(request: ApprovalRequest) -> dict[str, Any]:
                 "characters": len(content),
                 "lines": len(content.splitlines()),
             }
+        return plan
+
+    if request.tool_name == "delete_path":
+        plan["recursive"] = bool(normalized.get("recursive"))
+        plan["entry_type"] = normalized.get("entry_type")
+        plan["entry_count"] = normalized.get("entry_count")
+        plan["total_bytes"] = normalized.get("total_bytes")
         return plan
 
     operations = normalized.get("operations")

@@ -66,3 +66,13 @@ def test_only_new_successful_tool_observations_count_as_progress() -> None:
     state.renew_step_checkpoint(30)
     assert state.step_limit == 60
     assert not state.made_progress_since_checkpoint
+
+
+def test_delete_path_counts_as_a_workspace_modification() -> None:
+    state = SessionState(task="task")
+    call = ToolCall(id="delete-1", name="delete_path", arguments={"path": "generated"})
+
+    state.record_tool_result(call, ToolResult(ok=True, output="Deleted directory generated"))
+
+    assert state.modified_files == {"generated"}
+    assert state.workspace_revision == 1

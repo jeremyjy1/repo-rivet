@@ -198,6 +198,12 @@ class ReasoningManager:
                 )
                 return f"Committed snapshot-anchored edits at {rendered}."
             return f"Committed snapshot-anchored edits in {path}."
+        if call.name == "delete_path":
+            path = metadata.get("path") or call.arguments.get("path", "path")
+            path_type = metadata.get("path_type", "path")
+            count = metadata.get("entry_count")
+            suffix = f" ({count} entries)" if isinstance(count, int) and count > 1 else ""
+            return f"Deleted {path_type} {path}{suffix}."
         if call.name in {"run_command", "run_verification"}:
             return f"Command finished with exit code {metadata.get('exit_code', 'unknown')}."
         if call.name == "git_diff":

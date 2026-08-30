@@ -33,6 +33,7 @@ from repo_rivet.memory.store import MemoryStore
 from repo_rivet.planning.classifier import PlanClassifier, summarize_workspace
 from repo_rivet.planning.errors import PlanModeViolation
 from repo_rivet.planning.models import (
+    PlanArtifact,
     PlanOperation,
     PlanStatus,
     PlanStep,
@@ -231,6 +232,9 @@ class AgentController:
         approval_engine = getattr(self.tool_registry, "approval_engine", None)
         if approval_engine is not None:
             approval_engine.sync_memory_rule()
+        # Reflection is an immediate control-flow gate inside one agent run. A new user run
+        # starts from the recorded observations and does not inherit an unfinished meta turn.
+        memory.reflection_required = False
         state = SessionState(
             task=task.strip(),
             status=(
@@ -255,7 +259,7 @@ class AgentController:
             verification_plan_revision_guidance=memory.verification_plan_revision_guidance,
             verification_plan_revision_attempts=memory.verification_plan_revision_attempts,
             candidate_final_assessment=memory.candidate_final_assessment,
-            reflection_required=memory.reflection_required or bool(memory.invalidated_files),
+            reflection_required=False,
             provider_reasoning_detected=memory.provider_requires_reasoning_content,
             sanitize_unreplayable_provider_history=(
                 self._history_requires_reasoning_checkpoint(memory)
@@ -743,7 +747,7 @@ class AgentController:
                     f"Plan Artifact with {plan_tool} when it is ready for user review. "
                     "Each create step must name one new file exactly once; write_file creates "
                     "parent directories automatically, so never add a separate directory-creation "
-                    "step. "
+                    "step. Use a delete step with one exact existing target for delete_path. "
                     "When updating, retain the exact IDs and specifications of completed "
                     "steps that remain valid; the Controller carries their progress forward. "
                     "Do not reintroduce work already completed outside the remaining plan. "
@@ -1282,7 +1286,20 @@ class AgentController:
                 tool=call.name,
                 argument_summary=self._action_summary(call),
             )
-            if self.tool_registry.decision_policy(call.name) == DecisionPolicy.REGISTERED_PLAN:
+            implementation_plan = self._matching_active_plan(call)
+            if implementation_plan is not None:
+                artifact, step = implementation_plan
+                self._log(
+                    "plan_authorized_action",
+                    step=state.step_count,
+                    tool_call_id=call.id,
+                    tool=call.name,
+                    plan_id=artifact.plan_id,
+                    plan_step_id=step.step_id,
+                    requested_by="model",
+                    authority="approved_implementation_plan",
+                )
+            elif self.tool_registry.decision_policy(call.name) == DecisionPolicy.REGISTERED_PLAN:
                 self._log(
                     "plan_authorized_action",
                     step=state.step_count,
@@ -1613,7 +1630,7 @@ class AgentController:
             )
             if plan_step is not None:
                 self._log_plan_step("plan_step_finished", memory, plan_step)
-        if not result.ok:
+        if self._failure_requires_reflection(call, result):
             state.reflection_required = True
             memory.reflection_required = True
         if append_to_conversation:
@@ -1671,6 +1688,15 @@ class AgentController:
         if reason:
             return self._finish(state, memory, status="stopped", reason=reason)
         return None
+
+    def _failure_requires_reflection(self, call: ToolCall, result: ToolResult) -> bool:
+        """Require reflection only after a failed side-effect attempt or explicit denial."""
+        if result.ok or not self._is_state_changing(call.name):
+            return False
+        metadata = result.metadata or {}
+        if metadata.get("execution_attempted") is not False:
+            return True
+        return result.error_code in {"approval_denied", "hard_policy_denied"}
 
     def _check_termination(
         self,
@@ -2190,6 +2216,7 @@ class AgentController:
         return {
             PlanOperation.EDIT: {"edit_file"},
             PlanOperation.CREATE: {"write_file"},
+            PlanOperation.DELETE: {"delete_path"},
             PlanOperation.COMMAND: {"run_command", "run_verification"},
             # run_command remains an input alias here because exact registered commands are
             # canonicalized to run_verification before validation and execution.
@@ -2240,18 +2267,37 @@ class AgentController:
         checker = getattr(self.tool_registry, "is_state_changing", None)
         if callable(checker):
             return bool(checker(tool_name))
-        return tool_name in {"edit_file", "run_command", "write_file"}
+        return tool_name in {"delete_path", "edit_file", "run_command", "write_file"}
 
     def _requires_decision(self, call: ToolCall) -> bool:
         config = self.reasoning_manager.config
         if not config.enabled:
             return False
+        if self._matching_active_plan(call) is not None:
+            # The user-reviewed Plan Artifact already records intent, evidence, target scope,
+            # risk, and expected verification for this exact action. Approval remains a
+            # separate gate, so another provider-authored decision adds no authority.
+            return False
         policy = self.tool_registry.decision_policy(call.name)
         if policy == DecisionPolicy.REGISTERED_PLAN:
             return False
+        if policy == DecisionPolicy.APPROVAL_GATED:
+            # The normalized request and approval outcome form the auditable decision. Keep
+            # requiring a provider decision only in runtimes that removed the approval layer.
+            return self.tool_registry.approval_engine is None
         if policy == DecisionPolicy.COMMAND:
             return config.require_for_commands
         return config.require_for_mutating_tools
+
+    def _matching_active_plan(self, call: ToolCall) -> tuple[PlanArtifact, PlanStep] | None:
+        memory = self.plan_runtime.memory
+        artifact = memory.plan_artifact if memory is not None else None
+        if artifact is None or artifact.status != PlanStatus.EXECUTING:
+            return None
+        step = artifact.current_step
+        if step is None or self.plan_runtime.validate_action(call) is not None:
+            return None
+        return artifact, step
 
     @staticmethod
     def _action_summary(call: ToolCall) -> str:

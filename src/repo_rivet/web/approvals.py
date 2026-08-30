@@ -188,12 +188,16 @@ _DETAIL_LABELS = {
     "check_id": "Verification check",
     "cwd": "Working directory",
     "end_line": "End line",
+    "entry_count": "Contained entries",
+    "entry_type": "Target type",
     "max_depth": "Maximum depth",
     "path": "Target",
     "query": "Search query",
     "regex": "Regular expression",
+    "recursive": "Recursive deletion",
     "start_line": "Start line",
     "timeout_seconds": "Timeout",
+    "total_bytes": "Contained bytes",
 }
 _HIDDEN_ARGUMENTS = {
     "_outside_workspace_paths",

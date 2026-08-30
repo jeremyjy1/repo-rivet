@@ -168,6 +168,8 @@ class RiskAnalyzer:
 
     @staticmethod
     def _default_reasons(capabilities: set[Capability]) -> list[str]:
+        if Capability.FILESYSTEM_DELETE in capabilities:
+            return ["request deletes a workspace path"]
         if Capability.FILESYSTEM_WRITE in capabilities:
             return ["request modifies workspace files"]
         if Capability.FILESYSTEM_READ in capabilities:

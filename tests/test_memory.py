@@ -9,7 +9,7 @@ from pydantic import ValidationError
 from repo_rivet.editing.runtime import EditingRuntime
 from repo_rivet.editing.tools import EditFileTool
 from repo_rivet.memory.context_manager import SYSTEM_PROMPT
-from repo_rivet.memory.models import MemoryConfig, MemoryState, Message
+from repo_rivet.memory.models import FileMemory, MemoryConfig, MemoryState, Message
 from repo_rivet.memory.store import MemoryStore
 from repo_rivet.safety.path_policy import WorkspacePathPolicy
 from repo_rivet.tools.base import ToolCall, ToolResult
@@ -243,6 +243,50 @@ def test_new_modification_invalidates_passed_verification() -> None:
     memory.record_tool_result(write, ToolResult(ok=True, output="written"), step=2)
 
     assert memory.workspace_revision == 1
+    assert memory.verification_results["tests"].status == VerificationStatus.STALE
+
+
+def test_deleted_path_invalidates_snapshots_and_passed_verification() -> None:
+    memory = make_memory()
+    memory.current_snapshots["old.py"] = "snapshot-old"
+    memory.current_snapshots["old.py/nested.py"] = "snapshot-child"
+    memory.file_memories["old.py"] = FileMemory(
+        path="old.py",
+        sha256="abc",
+        last_read_step=1,
+    )
+    memory.file_memories["old.py/nested.py"] = FileMemory(
+        path="old.py/nested.py",
+        sha256="def",
+        last_read_step=1,
+    )
+    memory.verification_plan = verification_plan()
+    memory.verification_results["tests"] = verification_result(
+        VerificationStatus.PASSED,
+        revision=0,
+    )
+    delete = ToolCall(id="delete-1", name="delete_path", arguments={"path": "old.py"})
+
+    memory.record_tool_result(
+        delete,
+        ToolResult(
+            ok=True,
+            output="Deleted file old.py",
+            metadata={
+                "path": "old.py",
+                "path_type": "directory",
+                "workspace_revision": 1,
+            },
+        ),
+        step=2,
+    )
+
+    assert memory.workspace_revision == 1
+    assert "old.py" not in memory.current_snapshots
+    assert "old.py/nested.py" not in memory.current_snapshots
+    assert "old.py" not in memory.file_memories
+    assert "old.py/nested.py" not in memory.file_memories
+    assert "old.py" in memory.modified_files
     assert memory.verification_results["tests"].status == VerificationStatus.STALE
 
 

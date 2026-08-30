@@ -1,5 +1,9 @@
 """Local validation, version binding, and execution progress for plan artifacts."""
 
+import hashlib
+import json
+import stat
+from pathlib import Path
 from uuid import uuid4
 
 from repo_rivet.editing.document import TextDocument
@@ -137,13 +141,13 @@ class PlanRuntime:
             value.execution_snapshots if value.status == PlanStatus.EXECUTING else value.snapshots
         )
         for path, expected in expected_snapshots.items():
-            resolved = self.path_policy.resolve(path)
-            if not resolved.exists():
+            resolved = self.path_policy.resolve_entry(path)
+            if not resolved.exists() and not resolved.is_symlink():
                 reasons.append(f"{path} no longer exists")
                 continue
             try:
-                actual = TextDocument.load(resolved).to_snapshot(relative_path=path).snapshot_id
-            except ValueError as error:
+                actual = _path_revision(resolved, path)
+            except (OSError, ValueError) as error:
                 reasons.append(f"{path} cannot be validated: {error}")
                 continue
             if actual != expected:
@@ -158,6 +162,7 @@ class PlanRuntime:
         expected_tools = {
             PlanOperation.EDIT: {"edit_file"},
             PlanOperation.CREATE: {"write_file"},
+            PlanOperation.DELETE: {"delete_path"},
             PlanOperation.COMMAND: {"run_command"},
             PlanOperation.VERIFY: {"run_verification"},
         }[step.operation]
@@ -173,7 +178,12 @@ class PlanRuntime:
             )
         path = call.arguments.get("path")
         if isinstance(path, str) and step.target_files:
-            normalized = self.path_policy.relative(path).as_posix()
+            resolved = (
+                self.path_policy.resolve_entry(path)
+                if step.operation == PlanOperation.DELETE
+                else self.path_policy.resolve(path)
+            )
+            normalized = resolved.relative_to(self.path_policy.workspace).as_posix()
             if normalized not in step.target_files:
                 return f"{normalized} is outside current plan step {step.step_id}."
         if call.name == "run_verification":
@@ -200,7 +210,7 @@ class PlanRuntime:
             return
         passed = result.ok
         metadata = result.metadata or {}
-        if step.operation in {PlanOperation.EDIT, PlanOperation.CREATE}:
+        if step.operation in {PlanOperation.EDIT, PlanOperation.CREATE, PlanOperation.DELETE}:
             result_path = metadata.get("path")
             passed = (
                 passed
@@ -229,11 +239,14 @@ class PlanRuntime:
             revision = metadata.get("workspace_revision")
             if isinstance(revision, int):
                 artifact.execution_workspace_revision = revision
-            if step.operation in {PlanOperation.EDIT, PlanOperation.CREATE}:
+            if step.operation in {PlanOperation.EDIT, PlanOperation.CREATE, PlanOperation.DELETE}:
                 path = metadata.get("path")
-                snapshot_id = metadata.get("new_snapshot_id") or metadata.get("snapshot_id")
-                if isinstance(path, str) and isinstance(snapshot_id, str):
-                    artifact.execution_snapshots[path] = snapshot_id
+                if step.operation == PlanOperation.DELETE and isinstance(path, str):
+                    artifact.execution_snapshots.pop(path, None)
+                else:
+                    snapshot_id = metadata.get("new_snapshot_id") or metadata.get("snapshot_id")
+                    if isinstance(path, str) and isinstance(snapshot_id, str):
+                        artifact.execution_snapshots[path] = snapshot_id
             if call.name == "run_verification":
                 check_id = call.arguments.get("check_id")
                 if isinstance(check_id, str):
@@ -295,14 +308,25 @@ class PlanRuntime:
         for step in draft.steps:
             normalized_targets: list[str] = []
             for target in step.target_files:
-                normalized = self.path_policy.relative(target).as_posix()
+                resolved = (
+                    self.path_policy.resolve_entry(target)
+                    if step.operation == PlanOperation.DELETE
+                    else self.path_policy.resolve(target)
+                )
+                normalized = resolved.relative_to(self.path_policy.workspace).as_posix()
                 normalized_targets.append(normalized)
                 if normalized not in affected:
                     affected.append(normalized)
-                resolved = self.path_policy.resolve(normalized)
-                if resolved.exists():
+                if resolved.exists() or resolved.is_symlink():
+                    if step.operation == PlanOperation.DELETE and resolved.is_dir():
+                        if not self._directory_was_inspected(step, normalized):
+                            raise ValueError(
+                                f"target directory was not inspected with list_files: {normalized}"
+                            )
+                        snapshots[normalized] = _path_revision(resolved, normalized)
+                        continue
                     if (
-                        step.operation == PlanOperation.EDIT
+                        step.operation in {PlanOperation.EDIT, PlanOperation.DELETE}
                         and normalized in memory.invalidated_files
                     ):
                         raise ValueError(
@@ -311,11 +335,7 @@ class PlanRuntime:
                     snapshot_id = memory.current_snapshots.get(normalized)
                     if snapshot_id is None:
                         raise ValueError(f"target file was not inspected: {normalized}")
-                    current = (
-                        TextDocument.load(resolved)
-                        .to_snapshot(relative_path=normalized)
-                        .snapshot_id
-                    )
+                    current = _path_revision(resolved, normalized)
                     if current != snapshot_id:
                         raise ValueError(
                             f"target file changed; reread before planning: {normalized}"
@@ -335,6 +355,21 @@ class PlanRuntime:
                     )
                 create_steps[target] = step.step_id
         return affected, snapshots
+
+    def _directory_was_inspected(self, step: PlanStepSpec, normalized: str) -> bool:
+        events = {event.event_id: event for event in self._memory().observation_events}
+        for reference in step.evidence_refs:
+            event = events.get(reference)
+            if event is None or not event.ok or event.tool_name != "list_files":
+                continue
+            for affected in event.affected_paths:
+                try:
+                    inspected = self.path_policy.relative(affected).as_posix()
+                except ValueError:
+                    continue
+                if inspected == normalized:
+                    return True
+        return False
 
     @classmethod
     def _merge_step_progress(
@@ -402,3 +437,31 @@ class PlanRuntime:
         if self.memory is None:
             raise RuntimeError("Plan runtime is not bound to session memory")
         return self.memory
+
+
+def _path_revision(path: Path, relative_path: str) -> str:
+    """Return a stable revision for a text file, symlink, or directory tree."""
+    if path.is_file() and not path.is_symlink():
+        return TextDocument.load(path).to_snapshot(relative_path=relative_path).snapshot_id
+
+    digest = hashlib.sha256()
+    pending = [path]
+    while pending:
+        current = pending.pop()
+        current_stat = current.lstat()
+        relative = "." if current == path else current.relative_to(path).as_posix()
+        digest.update(
+            json.dumps(
+                [
+                    relative,
+                    stat.S_IFMT(current_stat.st_mode),
+                    current_stat.st_size,
+                    current_stat.st_mtime_ns,
+                    current_stat.st_ino,
+                ],
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        if stat.S_ISDIR(current_stat.st_mode) and not stat.S_ISLNK(current_stat.st_mode):
+            pending.extend(sorted(current.iterdir(), key=lambda item: item.name, reverse=True))
+    return digest.hexdigest()

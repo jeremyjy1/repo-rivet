@@ -35,7 +35,10 @@ class HardSafetyPolicy:
             reason = "device access is prohibited"
         elif self.settings.deny_secret_access and Capability.SECRET_READ in capabilities:
             reason = "credential and sensitive configuration reads are prohibited"
-        elif request.assessment.sensitive_paths and Capability.FILESYSTEM_WRITE in capabilities:
+        elif request.assessment.sensitive_paths and capabilities & {
+            Capability.FILESYSTEM_WRITE,
+            Capability.FILESYSTEM_DELETE,
+        }:
             reason = "modification of sensitive or agent configuration files is prohibited"
         elif (
             self.settings.deny_outside_workspace_write

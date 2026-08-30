@@ -15,7 +15,8 @@ class SubmitPlanTool(BaseTool[SubmitPlanArguments]):
     description = (
         "Submit a structured, evidence-backed implementation plan for local validation and user "
         "review. Each create step names one new file exactly once; write_file creates its parent "
-        "directories automatically. This does not authorize or execute any action."
+        "directories automatically. Each delete step names one exact existing file or directory. "
+        "This does not authorize or execute any action."
     )
     arguments_type = SubmitPlanArguments
 

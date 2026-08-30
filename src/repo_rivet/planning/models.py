@@ -32,6 +32,7 @@ class PlanStepStatus(StrEnum):
 class PlanOperation(StrEnum):
     EDIT = "edit"
     CREATE = "create"
+    DELETE = "delete"
     COMMAND = "command"
     VERIFY = "verify"
 
@@ -56,8 +57,9 @@ class PlanStepSpec(BaseModel):
         default_factory=list,
         max_length=50,
         description=(
-            "Exact workspace files affected by this step. Create steps represent one new file; "
-            "parent directories are implicit and a create target must not be repeated."
+            "Exact workspace paths affected by this step. Create steps represent one new file; "
+            "delete steps represent one existing file or directory; parent directories are "
+            "implicit and a create target must not be repeated."
         ),
     )
     verification_ids: list[str] = Field(default_factory=list, max_length=50)
@@ -67,10 +69,10 @@ class PlanStepSpec(BaseModel):
     @model_validator(mode="after")
     def validate_operation_shape(self) -> "PlanStepSpec":
         if (
-            self.operation in {PlanOperation.EDIT, PlanOperation.CREATE}
+            self.operation in {PlanOperation.EDIT, PlanOperation.CREATE, PlanOperation.DELETE}
             and len(self.target_files) != 1
         ):
-            raise ValueError(f"{self.operation.value} steps require exactly one target file")
+            raise ValueError(f"{self.operation.value} steps require exactly one target path")
         if self.operation == PlanOperation.VERIFY and len(self.verification_ids) != 1:
             raise ValueError("verify steps require exactly one verification ID")
         return self

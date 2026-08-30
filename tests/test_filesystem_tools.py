@@ -8,6 +8,7 @@ from repo_rivet.editing.runtime import EditingRuntime
 from repo_rivet.editing.tools import EditFileTool
 from repo_rivet.safety.path_policy import WorkspacePathPolicy
 from repo_rivet.tools.filesystem import (
+    DeletePathTool,
     ListFilesTool,
     ReadFileTool,
     SearchTextTool,
@@ -76,6 +77,120 @@ def test_write_file_only_creates_new_paths(tmp_path: Path) -> None:
     assert created.ok and created.metadata and created.metadata["snapshot_id"]
     assert not rejected.ok and "edit_file" in (rejected.error or "")
     assert (tmp_path / "src/new.py").read_text(encoding="utf-8") == "old"
+
+
+def test_delete_path_removes_workspace_file_and_empty_directory(tmp_path: Path) -> None:
+    policy = WorkspacePathPolicy(tmp_path)
+    runtime = EditingRuntime(policy)
+    tool = DeletePathTool(policy, runtime)
+    file_path = tmp_path / "obsolete.txt"
+    empty_directory = tmp_path / "empty"
+    file_path.write_text("obsolete\n", encoding="utf-8")
+    empty_directory.mkdir()
+
+    deleted_file = tool.execute({"path": "obsolete.txt"})
+    deleted_directory = tool.execute({"path": "empty"})
+
+    assert deleted_file.ok and deleted_file.metadata
+    assert deleted_file.metadata["path_type"] == "file"
+    assert deleted_file.metadata["workspace_revision"] == 1
+    assert deleted_directory.ok and deleted_directory.metadata
+    assert deleted_directory.metadata["path_type"] == "directory"
+    assert deleted_directory.metadata["workspace_revision"] == 2
+    assert not file_path.exists()
+    assert not empty_directory.exists()
+
+
+def test_delete_path_requires_explicit_recursive_directory_deletion(tmp_path: Path) -> None:
+    directory = tmp_path / "generated"
+    directory.mkdir()
+    (directory / "one.txt").write_text("one", encoding="utf-8")
+    nested = directory / "nested"
+    nested.mkdir()
+    (nested / "two.txt").write_text("two", encoding="utf-8")
+    tool = DeletePathTool(WorkspacePathPolicy(tmp_path))
+
+    rejected = tool.execute({"path": "generated"})
+    assert not rejected.ok
+    assert "recursive=true" in (rejected.error or "")
+    assert directory.exists()
+
+    deleted = tool.execute({"path": "generated", "recursive": True})
+
+    assert deleted.ok and deleted.metadata
+    assert deleted.metadata["entry_count"] == 3
+    assert not directory.exists()
+
+
+def test_delete_path_unlinks_symlink_without_following_target(tmp_path: Path) -> None:
+    outside = tmp_path.parent / f"{tmp_path.name}-outside.txt"
+    outside.write_text("keep", encoding="utf-8")
+    link = tmp_path / "outside-link"
+    link.symlink_to(outside)
+    tool = DeletePathTool(WorkspacePathPolicy(tmp_path))
+
+    result = tool.execute({"path": "outside-link"})
+
+    assert result.ok and result.metadata
+    assert result.metadata["path_type"] == "symlink"
+    assert not link.exists()
+    assert outside.read_text(encoding="utf-8") == "keep"
+
+
+def test_delete_path_rejects_workspace_root_and_git_metadata(tmp_path: Path) -> None:
+    (tmp_path / ".git").mkdir()
+    tool = DeletePathTool(WorkspacePathPolicy(tmp_path))
+
+    root = tool.execute({"path": ".", "recursive": True})
+    metadata = tool.execute({"path": ".git", "recursive": True})
+
+    assert not root.ok and "workspace root" in (root.error or "")
+    assert not metadata.ok and "metadata" in (metadata.error or "")
+    assert (tmp_path / ".git").exists()
+
+
+def test_recursive_delete_rejects_protected_nested_entries(tmp_path: Path) -> None:
+    directory = tmp_path / "archive"
+    metadata = directory / "nested" / ".git"
+    metadata.mkdir(parents=True)
+    tool = DeletePathTool(WorkspacePathPolicy(tmp_path))
+
+    result = tool.execute({"path": "archive", "recursive": True})
+
+    assert not result.ok
+    assert "Protected" in (result.error or "")
+    assert metadata.exists()
+
+
+def test_delete_path_rejects_escape_through_parent_symlink(tmp_path: Path) -> None:
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir()
+    target = outside / "keep.txt"
+    target.write_text("keep", encoding="utf-8")
+    (tmp_path / "linked-directory").symlink_to(outside, target_is_directory=True)
+    tool = DeletePathTool(WorkspacePathPolicy(tmp_path))
+
+    result = tool.execute({"path": "linked-directory/keep.txt"})
+
+    assert not result.ok
+    assert "escapes workspace" in (result.error or "")
+    assert target.exists()
+
+
+def test_delete_path_revalidates_target_after_approval_preflight(tmp_path: Path) -> None:
+    path = tmp_path / "changing.txt"
+    path.write_text("before", encoding="utf-8")
+    tool = DeletePathTool(WorkspacePathPolicy(tmp_path))
+    arguments = tool.arguments_type.model_validate({"path": "changing.txt"})
+    prepared = tool.approval_arguments(arguments)
+    assert isinstance(prepared, dict)
+    path.write_text("different content", encoding="utf-8")
+
+    result = tool.execute_validated(arguments)
+
+    assert not result.ok
+    assert "changed during approval" in (result.error or "")
+    assert path.exists()
 
 
 def test_edit_operations_use_original_snapshot_line_numbers(tmp_path: Path) -> None:

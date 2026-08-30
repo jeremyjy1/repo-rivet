@@ -184,6 +184,27 @@ def test_safe_auto_treats_git_status_as_typed_read(tmp_path: Path) -> None:
     assert human.requests == []
 
 
+def test_workspace_delete_is_typed_and_requires_human_approval(tmp_path: Path) -> None:
+    path = tmp_path / "obsolete.txt"
+    path.write_text("obsolete", encoding="utf-8")
+    human = FakeHumanApprover()
+    engine, _ = create_engine(tmp_path, mode=ApprovalMode.SAFE_AUTO, human=human)
+    registry = create_default_registry(tmp_path, approval_engine=engine)
+
+    result = registry.execute(
+        ToolCall(id="delete-1", name="delete_path", arguments={"path": "obsolete.txt"})
+    )
+
+    assert result.ok
+    assert not path.exists()
+    assert len(human.requests) == 1
+    request = human.requests[0]
+    assert request.facts.operation_class == OperationClass.DELETE
+    assert request.facts.delete_paths == [str(path)]
+    assert request.facts.effect_scope.value == "workspace"
+    assert request.assessment.level == RiskLevel.HIGH
+
+
 def test_edit_approval_contains_preflight_diff_and_version_fingerprint(tmp_path: Path) -> None:
     path = tmp_path / "main.py"
     path.write_text("value = 1\n", encoding="utf-8")

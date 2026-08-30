@@ -22,6 +22,7 @@ _PATH_KEYS: dict[str, tuple[str, ...]] = {
     "read_file": ("path",),
     "write_file": ("path",),
     "edit_file": ("path",),
+    "delete_path": ("path",),
     "run_command": ("cwd",),
     "run_verification": ("cwd",),
     "git_diff": ("path",),

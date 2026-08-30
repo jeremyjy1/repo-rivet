@@ -567,6 +567,10 @@ function describeToolRequest(tool: string, argumentsValue: unknown): string {
     return `${path || "."}${depth !== null ? ` · depth ${depth}` : ""}`;
   }
   if (tool === "write_file") return `Create or replace ${path || "workspace file"}`;
+  if (tool === "delete_path") {
+    const recursive = args.recursive === true ? " · recursive" : "";
+    return `Delete ${path || "workspace path"}${recursive}`;
+  }
   if (tool === "edit_file") {
     const operations = Array.isArray(args.operations) ? args.operations : [];
     const first = recordValue(operations[0]);

@@ -232,6 +232,11 @@ class EditingRuntime:
         self.workspace_revision += 1
         return self.workspace_revision
 
+    def record_deleted_path(self) -> int:
+        """Advance the shared workspace revision after a successful deletion."""
+        self.workspace_revision += 1
+        return self.workspace_revision
+
     def _record_noop(self, key: str) -> None:
         count = self._noop_counts.get(key, 0) + 1
         self._noop_counts[key] = count

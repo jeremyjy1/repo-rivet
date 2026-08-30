@@ -126,6 +126,129 @@ def test_mutating_tool_without_decision_is_rejected_before_executor() -> None:
     assert "decision_validation_failed" in tool_payload
 
 
+def test_non_plan_delete_uses_structured_approval_as_decision(tmp_path: Path) -> None:
+    target = tmp_path / "obsolete.txt"
+    target.write_text("obsolete", encoding="utf-8")
+    memory = MemoryState(session_id="delete-approval-decision")
+    memory.modified_files.add("src")
+    memory.invalidated_files.add("src/main.cpp")
+    memory.workspace_revision = 1
+    memory.reflection_required = True
+    approval = ApprovalEngine(
+        mode=ApprovalMode.ALLOW_ALL,
+        normalizer=RequestNormalizer(tmp_path),
+        risk_analyzer=RiskAnalyzer(),
+        hard_policy=HardSafetyPolicy(),
+        grant_store=ApprovalGrantStore(memory),
+        human_approver=NonInteractiveHumanApprover(),
+    )
+    registry = create_default_registry(tmp_path, approval_engine=approval)
+    registry.verification_runtime.bind(memory)
+    registry.verification_runtime.register_plan(
+        {
+            "requirements": ["workspace-valid"],
+            "checks": [
+                {
+                    "check_id": "workspace-valid",
+                    "title": "Confirm workspace remains valid",
+                    "kind": "test",
+                    "command": {"program": "true", "args": [], "cwd": "."},
+                    "criteria": {"expected_exit_codes": [0]},
+                    "required": True,
+                    "provenance": "model",
+                }
+            ],
+        }
+    )
+    delete = ToolCall(
+        id="delete-1",
+        name="delete_path",
+        arguments={"path": "obsolete.txt"},
+    )
+    agent = AgentController(
+        model_client=FakeModelClient(
+            [
+                ModelResponse(tool_calls=[delete]),
+                ModelResponse(content="Deleted the obsolete file and verified the workspace."),
+            ]
+        ),
+        tool_registry=registry,
+    )
+
+    result = agent.run("Delete obsolete.txt", memory=memory)
+
+    assert result.status == "success"
+    assert not target.exists()
+    assert memory.reasoning_events == []
+    assert not memory.reflection_required
+    assert not any(
+        message.tool_call_id == "delete-1"
+        and "decision_validation_failed" in (message.content or "")
+        for message in memory.messages
+    )
+
+
+def test_delete_preflight_failure_can_be_corrected_without_reflection(tmp_path: Path) -> None:
+    directory = tmp_path / "generated"
+    directory.mkdir()
+    (directory / "artifact.txt").write_text("generated", encoding="utf-8")
+    memory = MemoryState(session_id="delete-preflight-correction")
+    approval = ApprovalEngine(
+        mode=ApprovalMode.ALLOW_ALL,
+        normalizer=RequestNormalizer(tmp_path),
+        risk_analyzer=RiskAnalyzer(),
+        hard_policy=HardSafetyPolicy(),
+        grant_store=ApprovalGrantStore(memory),
+        human_approver=NonInteractiveHumanApprover(),
+    )
+    registry = create_default_registry(tmp_path, approval_engine=approval)
+    registry.verification_runtime.bind(memory)
+    registry.verification_runtime.register_plan(
+        {
+            "requirements": ["workspace-valid"],
+            "checks": [
+                {
+                    "check_id": "workspace-valid",
+                    "title": "Confirm workspace remains valid",
+                    "kind": "test",
+                    "command": {"program": "true", "args": [], "cwd": "."},
+                    "criteria": {"expected_exit_codes": [0]},
+                    "required": True,
+                    "provenance": "model",
+                }
+            ],
+        }
+    )
+    first = ToolCall(
+        id="delete-without-recursive",
+        name="delete_path",
+        arguments={"path": "generated"},
+    )
+    corrected = ToolCall(
+        id="delete-recursive",
+        name="delete_path",
+        arguments={"path": "generated", "recursive": True},
+    )
+    agent = AgentController(
+        model_client=FakeModelClient(
+            [
+                ModelResponse(tool_calls=[first]),
+                ModelResponse(tool_calls=[corrected]),
+                ModelResponse(content="Deleted the generated directory."),
+            ]
+        ),
+        tool_registry=registry,
+    )
+
+    result = agent.run("Delete generated", memory=memory)
+
+    assert result.status == "success"
+    assert not directory.exists()
+    assert not memory.reflection_required
+    first_result = next(message for message in memory.messages if message.tool_call_id == first.id)
+    assert "invalid_delete_target" in (first_result.content or "")
+
+
 def test_declared_tool_mismatch_is_rejected_without_guessing_intent() -> None:
     write = ToolCall(id="write-1", name="edit_file", arguments={"path": "app.py"})
     declared_read = decision("decision-1", "read_file")

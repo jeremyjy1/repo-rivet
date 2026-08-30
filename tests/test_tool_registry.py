@@ -19,6 +19,7 @@ def test_default_registry_exposes_workspace_and_decision_tools(tmp_path: Path) -
         "search_text",
         "read_file",
         "write_file",
+        "delete_path",
         "edit_file",
         "run_command",
         "run_verification",
@@ -54,6 +55,7 @@ def test_registry_identifies_workspace_file_mutation_semantically(tmp_path: Path
 
     assert registry.modifies_workspace_files("write_file")
     assert registry.modifies_workspace_files("edit_file")
+    assert registry.modifies_workspace_files("delete_path")
     assert not registry.modifies_workspace_files("run_command")
     assert not registry.modifies_workspace_files("read_file")
 
@@ -62,6 +64,7 @@ def test_registry_declares_semantic_decision_policies(tmp_path: Path) -> None:
     registry = create_default_registry(tmp_path)
 
     assert registry.decision_policy("edit_file") == DecisionPolicy.MUTATION
+    assert registry.decision_policy("delete_path") == DecisionPolicy.APPROVAL_GATED
     assert registry.decision_policy("run_command") == DecisionPolicy.COMMAND
     assert registry.decision_policy("run_verification") == DecisionPolicy.REGISTERED_PLAN
 

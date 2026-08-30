@@ -13,6 +13,7 @@ from repo_rivet.safety.command_policy import CommandPolicy
 from repo_rivet.safety.path_policy import WorkspacePathPolicy
 from repo_rivet.tools.base import BaseTool, DecisionPolicy, ToolCall, ToolResult
 from repo_rivet.tools.filesystem import (
+    DeletePathTool,
     ListFilesTool,
     ReadFileTool,
     SearchTextTool,
@@ -99,17 +100,18 @@ class ToolRegistry:
                 ok=False,
                 output="",
                 error=f"Unknown tool: {call.name}. Available tools: {available}",
+                metadata={"execution_attempted": False},
             )
         try:
             validated = tool.validate_arguments(call.arguments)
             if isinstance(validated, ToolResult):
-                return validated
+                return _before_execution(validated)
             if self.approval_engine is None:
                 return tool.execute_validated(validated)
 
             normalized_arguments = tool.approval_arguments(validated)
             if isinstance(normalized_arguments, ToolResult):
-                return normalized_arguments
+                return _before_execution(normalized_arguments)
             outcome = self.approval_engine.authorize(
                 tool_name=call.name,
                 arguments=normalized_arguments,
@@ -131,6 +133,7 @@ class ToolRegistry:
                     error_code=error_code,
                     retryable=False,
                     metadata={
+                        "execution_attempted": False,
                         "approval_source": decision.source,
                         "approval_fingerprint": decision.request_fingerprint,
                         "approval_abort": decision.abort_agent,
@@ -150,7 +153,10 @@ class ToolRegistry:
                         else "hard_policy_denied"
                     ),
                     retryable=False,
-                    metadata={"approval_source": stale_decision.source},
+                    metadata={
+                        "execution_attempted": False,
+                        "approval_source": stale_decision.source,
+                    },
                 )
             tool.approval_granted(validated, source=decision.source)
             self.approval_engine.record_execution_started(outcome)
@@ -163,6 +169,21 @@ class ToolRegistry:
             return result
         except Exception:  # pragma: no cover - defensive boundary around local integrations
             return ToolResult(ok=False, output="", error=f"Tool failed unexpectedly: {call.name}")
+
+
+def _before_execution(result: ToolResult) -> ToolResult:
+    """Mark a validation or preflight result without claiming the tool ran."""
+    metadata = dict(result.metadata or {})
+    metadata["execution_attempted"] = False
+    return ToolResult(
+        ok=result.ok,
+        output=result.output,
+        error=result.error,
+        metadata=metadata,
+        raw_output=result.raw_output,
+        error_code=result.error_code,
+        retryable=result.retryable,
+    )
 
 
 def create_default_registry(
@@ -195,6 +216,7 @@ def create_default_registry(
             SearchTextTool(path_policy, editing_runtime),
             ReadFileTool(path_policy, editing_runtime),
             WriteFileTool(path_policy, editing_runtime),
+            DeletePathTool(path_policy, editing_runtime),
             EditFileTool(editing_runtime),
             RunCommandTool(path_policy, command_policy),
             RunVerificationTool(verification_runtime),
