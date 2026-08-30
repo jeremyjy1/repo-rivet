@@ -230,9 +230,6 @@ function App() {
       <main className="main-pane">
         <div className="runbar">
           <div><Bot size={18} /><strong>{session?.name || "No session selected"}</strong>{session && <span className="revision">rev {session.workspace_revision}</span>}</div>
-          <div className="run-actions">
-            <button className={`mode-button ${mode === "planning" ? "plan" : ""}`} disabled={session?.workflow_mode === "plan_ready"} title={session?.workflow_mode === "plan_ready" ? "Review the plan in the Plan panel before execution" : "Switch the workflow for the next request"} onClick={() => setMode(mode === "execute" ? "planning" : "execute")}>{mode === "planning" ? <ListChecks size={15} /> : <Hammer size={15} />}{session?.workflow_mode === "plan_ready" ? "Plan ready" : mode === "planning" ? "Plan" : "Execute"}</button>
-          </div>
         </div>
         {error && <div className="error-banner"><ShieldAlert size={16} />{error}<button onClick={() => setError("")}>×</button></div>}
         <Timeline session={session} isRunning={isRunning} pendingApprovalId={approval?.request_id || null} invoke={invoke} onRefresh={refreshSession} />
@@ -882,7 +879,7 @@ function PlanControls({ sessionId, invoke, refresh }: { sessionId: string; invok
     });
     setSubmitting(false);
   };
-  return <div className="plan-controls"><div className="plan-buttons"><button className="primary" disabled={submitting} onClick={() => void invoke(async () => { await api(`/api/v1/sessions/${sessionId}/plan/execute`, { method: "POST", body: "{}" }); await refresh(); })}><Play size={14} /> Execute plan</button><button disabled={submitting} onClick={() => { setAction("revise"); setInstruction(""); }}>Request revision</button><button disabled={submitting} onClick={() => { setAction("inspect"); setInstruction(""); }}>Continue inspection</button><button disabled={submitting} onClick={() => void invoke(async () => { await api(`/api/v1/sessions/${sessionId}/plan/cancel`, { method: "POST", body: "{}" }); await refresh(); })}>Cancel</button></div>{action && <div className="plan-instruction"><label>{action === "revise" ? "Revision direction" : "What should RepoRivet inspect next?"}<textarea autoFocus value={instruction} onChange={(event) => setInstruction(event.target.value)} /></label><div><button onClick={() => setAction(null)}>Back</button><button className="primary" disabled={!instruction.trim() || submitting} onClick={() => void submitInstruction()}>{submitting ? "Submitting…" : action === "revise" ? "Revise plan" : "Continue planning"}</button></div></div>}</div>;
+  return <div className="plan-controls"><div className="plan-buttons"><button disabled={submitting} onClick={() => { setAction("revise"); setInstruction(""); }}>Request revision</button><button disabled={submitting} onClick={() => { setAction("inspect"); setInstruction(""); }}>Continue inspection</button><button disabled={submitting} onClick={() => void invoke(async () => { await api(`/api/v1/sessions/${sessionId}/plan/cancel`, { method: "POST", body: "{}" }); await refresh(); })}>Cancel</button></div>{action && <div className="plan-instruction"><label>{action === "revise" ? "Revision direction" : "What should RepoRivet inspect next?"}<textarea autoFocus value={instruction} onChange={(event) => setInstruction(event.target.value)} /></label><div><button onClick={() => setAction(null)}>Back</button><button className="primary" disabled={!instruction.trim() || submitting} onClick={() => void submitInstruction()}>{submitting ? "Submitting…" : action === "revise" ? "Revise plan" : "Continue planning"}</button></div></div>}</div>;
 }
 
 function ApprovalDialog({ approval, onDecision }: { approval: Approval; onDecision: (action: string, guidance?: string) => void }) {
