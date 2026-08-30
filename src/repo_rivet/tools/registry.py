@@ -1,6 +1,6 @@
 """Registration, schema generation, and dispatch for local tools."""
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
@@ -93,9 +93,19 @@ class ToolRegistry:
         return tool.decision_policy if tool is not None else DecisionPolicy.MUTATION
 
     def execute(self, call: ToolCall) -> ToolResult:
+        return self.execute_with_lifecycle(call)
+
+    def execute_with_lifecycle(
+        self,
+        call: ToolCall,
+        observer: Callable[[str, dict[str, Any]], None] | None = None,
+    ) -> ToolResult:
+        """Execute once while exposing preparation, approval, and dispatch boundaries."""
+        notify = observer or (lambda _stage, _payload: None)
         tool = self._tools.get(call.name)
         if tool is None:
             available = ", ".join(self.names) or "none"
+            notify("prepared", {"valid": False})
             return ToolResult(
                 ok=False,
                 output="",
@@ -105,13 +115,18 @@ class ToolRegistry:
         try:
             validated = tool.validate_arguments(call.arguments)
             if isinstance(validated, ToolResult):
+                notify("prepared", {"valid": False})
                 return _before_execution(validated)
+            notify("prepared", {"valid": True})
             if self.approval_engine is None:
+                notify("dispatched", {})
+                notify("running", {})
                 return tool.execute_validated(validated)
 
             normalized_arguments = tool.approval_arguments(validated)
             if isinstance(normalized_arguments, ToolResult):
                 return _before_execution(normalized_arguments)
+            notify("approval_requested", {"tool": call.name})
             outcome = self.approval_engine.authorize(
                 tool_name=call.name,
                 arguments=normalized_arguments,
@@ -119,6 +134,14 @@ class ToolRegistry:
                 session_id=self.approval_engine.session_id,
             )
             decision = outcome.decision
+            notify(
+                "approval_resolved",
+                {
+                    "approved": decision.action == ApprovalAction.ALLOW,
+                    "request_id": outcome.request.request_id,
+                    "source": decision.source,
+                },
+            )
             if decision.action != ApprovalAction.ALLOW:
                 error_code = (
                     "hard_policy_denied" if decision.source == "hard_policy" else "approval_denied"
@@ -160,6 +183,8 @@ class ToolRegistry:
                 )
             tool.approval_granted(validated, source=decision.source)
             self.approval_engine.record_execution_started(outcome)
+            notify("dispatched", {"request_id": outcome.request.request_id})
+            notify("running", {"request_id": outcome.request.request_id})
             result = tool.execute_validated(validated)
             self.approval_engine.record_execution(
                 outcome,

@@ -81,6 +81,8 @@ class ApprovalEngine:
         previous_mode = self.mode
         self.mode = mode
         self.grant_store.memory.approval_mode_override = mode
+        if self.grant_store.memory.runtime_v2 is not None and previous_mode != mode:
+            self.grant_store.memory.runtime_v2.revisions.approval_policy += 1
         self.grant_store.memory.denied_request_fingerprints.clear()
         self.grant_store.memory.approval_denial_guidance.clear()
         self.sync_memory_rule()

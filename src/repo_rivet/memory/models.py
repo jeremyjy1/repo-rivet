@@ -6,6 +6,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from repo_rivet.agent.runtime_state import AgentRuntimeState
 from repo_rivet.approval.models import ApprovalMode, OperationClass
 from repo_rivet.memory.token_estimator import ApproximateTokenEstimator
 from repo_rivet.planning.models import PlanArtifact, WorkflowMode
@@ -236,6 +237,8 @@ class MemoryState(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     session_id: str
+    runtime_v2: AgentRuntimeState | None = None
+    applied_action_ids: set[str] = Field(default_factory=set)
     config: MemoryConfig = Field(default_factory=MemoryConfig)
     fixed: FixedMemory | None = None
     task_updates: list[str] = Field(default_factory=list)
@@ -251,6 +254,7 @@ class MemoryState(BaseModel):
     verification_plan: VerificationPlan | None = None
     verification_results: dict[str, VerificationResult] = Field(default_factory=dict)
     verification_plan_recovery_attempts: int = Field(default=0, ge=0)
+    verification_plan_recovery_decision: ReasoningEvent | None = None
     verification_plan_revision_required: bool = False
     verification_plan_revision_reason: str | None = Field(default=None, max_length=1_000)
     verification_plan_revision_guidance: str | None = Field(default=None, max_length=2_000)
@@ -298,6 +302,12 @@ class MemoryState(BaseModel):
     ) -> None:
         """Preserve the first task verbatim and version every later user request."""
         normalized = task.strip()
+        task_changed = self.working.current_focus is not None and (
+            normalized != self.working.current_focus
+        )
+        if task_changed:
+            self.verification_plan_recovery_attempts = 0
+            self.verification_plan_recovery_decision = None
         self.denied_request_fingerprints.clear()
         self.approval_denial_guidance.clear()
         if self.fixed is None:
@@ -327,6 +337,7 @@ class MemoryState(BaseModel):
         self.verification_plan = None
         self.verification_results.clear()
         self.verification_plan_recovery_attempts = 0
+        self.verification_plan_recovery_decision = None
         self.verification_plan_revision_required = False
         self.verification_plan_revision_reason = None
         self.verification_plan_revision_guidance = None
@@ -342,6 +353,8 @@ class MemoryState(BaseModel):
         self.plan_artifact = None
         self.plan_update_reason = None
         self.workflow_mode = WorkflowMode.EXECUTE
+        self.runtime_v2 = None
+        self.applied_action_ids.clear()
         self.last_agent_outcome = None
 
     def append_user_update(self, instruction: str) -> None:
@@ -365,6 +378,7 @@ class MemoryState(BaseModel):
         self,
         *,
         error_for: Callable[[str, str], str] | None = None,
+        result_for: Callable[[str, str], Message | None] | None = None,
     ) -> tuple[list[tuple[str, str]], list[str]]:
         """Close unfinished tool groups in place and discard orphan tool results."""
         repaired: list[Message] = []
@@ -376,6 +390,10 @@ class MemoryState(BaseModel):
 
         def close_pending() -> None:
             for call_id, name in pending.items():
+                recovered = result_for(call_id, name) if result_for is not None else None
+                if recovered is not None:
+                    repaired.append(recovered)
+                    continue
                 error = (
                     error_for(call_id, name)
                     if error_for is not None

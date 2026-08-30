@@ -106,6 +106,34 @@ class AgentQueryService:
             },
             "modified_files": sorted(loaded.memory.modified_files),
             "workspace_revision": loaded.memory.workspace_revision,
+            "runtime": (
+                {
+                    "run_id": loaded.memory.runtime_v2.run_id,
+                    "status": loaded.memory.runtime_v2.status.value,
+                    "phase": loaded.memory.runtime_v2.phase.value,
+                    "wait": (
+                        loaded.memory.runtime_v2.wait.model_dump(mode="json")
+                        if loaded.memory.runtime_v2.wait is not None
+                        else None
+                    ),
+                    "current_action": (
+                        loaded.memory.runtime_v2.actions[
+                            loaded.memory.runtime_v2.current_action_id
+                        ].model_dump(mode="json")
+                        if loaded.memory.runtime_v2.current_action_id is not None
+                        and loaded.memory.runtime_v2.current_action_id
+                        in loaded.memory.runtime_v2.actions
+                        else None
+                    ),
+                    "recovery": (
+                        loaded.memory.runtime_v2.recovery.model_dump(mode="json")
+                        if loaded.memory.runtime_v2.recovery is not None
+                        else None
+                    ),
+                }
+                if loaded.memory.runtime_v2 is not None
+                else None
+            ),
             "last_event_seq": event_count,
             "run": run_view(manager.get(loaded.metadata.session_id)),
         }
@@ -349,7 +377,10 @@ class AgentCommandService:
     def set_approval_mode(self, session_id: str, mode: ApprovalMode) -> None:
         self._ensure_idle(session_id)
         loaded = self.sessions.load(session_id)
+        previous_mode = loaded.memory.approval_mode_override
         loaded.memory.approval_mode_override = mode
+        if loaded.memory.runtime_v2 is not None and previous_mode != mode:
+            loaded.memory.runtime_v2.revisions.approval_policy += 1
         loaded.store.save_state(loaded.memory, status=loaded.memory.status)
 
     def set_runtime_settings(

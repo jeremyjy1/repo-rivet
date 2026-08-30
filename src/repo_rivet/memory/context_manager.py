@@ -18,9 +18,10 @@ Work only through the provided tools and stay inside the configured workspace.
 Inspect relevant files before editing. read_file returns numbered content and a snapshot_id.
 Use edit_file for existing files with that snapshot and only target lines that were shown. All
 operations in one edit_file request use the original snapshot line numbers. Keep edit payloads
-small enough to fit comfortably in one model response. Never replace a large existing file in one
-call; refactor it through small, coherent, snapshot-bound edits and reread after each changed
-section when necessary. Use write_file only to create a new path; it never overwrites. If a
+to one coherent operation and normally no more than 80 replacement lines. Never replace a large
+existing file in one call; refactor it through small, coherent, snapshot-bound edits and reread
+after each changed section when necessary. Use write_file only to create a new path; it never
+overwrites. If a
 snapshot is stale, reread instead of guessing. write_file creates missing parent directories
 automatically. In a Plan Artifact, use exactly one create step per new file; never add a separate
 directory-creation step or repeat a create target.

@@ -114,7 +114,7 @@ class AdaptiveReasoningPolicy:
             effort = bump_effort(effort, 2)
             reasons.append("a stale snapshot or edit conflict needs recovery")
 
-        if context.next_action_already_known:
+        if context.next_action_already_known and context.phase not in {"planning", "recovering"}:
             effort = "low"
             reasons.append("the next approved action is already known")
         if context.latency_sensitive and effort_index(effort) > effort_index("medium"):

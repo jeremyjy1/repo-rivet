@@ -35,7 +35,9 @@ def test_adaptive_policy_selects_each_call_from_phase_and_facts() -> None:
 
     assert discovering.effort == "low"
     assert planning.effort == "xhigh"
-    assert known_action.effort == "low"
+    assert known_action.effort == "max"
+    assert "stale snapshot or edit conflict" in known_action.reason
+    assert "next approved action is already known" not in known_action.reason
     assert known_action.valid_for_calls == 1
 
 

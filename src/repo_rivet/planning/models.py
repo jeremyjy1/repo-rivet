@@ -23,10 +23,14 @@ class PlanStatus(StrEnum):
 
 class PlanStepStatus(StrEnum):
     PENDING = "pending"
+    READY = "ready"
     RUNNING = "running"
     COMPLETED = "completed"
+    SATISFIED = "satisfied"
     BLOCKED = "blocked"
     FAILED = "failed"
+    STALE = "stale"
+    SKIPPED = "skipped"
 
 
 class PlanOperation(StrEnum):
@@ -35,6 +39,19 @@ class PlanOperation(StrEnum):
     DELETE = "delete"
     COMMAND = "command"
     VERIFY = "verify"
+
+
+class CompletionPredicateKind(StrEnum):
+    ACTION_SUCCEEDED = "action_succeeded"
+    VERIFICATION_PASSED = "verification_passed"
+
+
+class CompletionPredicate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: CompletionPredicateKind
+    check_id: str | None = Field(default=None, max_length=100)
+    revision_scope: str = Field(default="current_workspace", max_length=100)
 
 
 class PlanVerification(BaseModel):
@@ -64,6 +81,10 @@ class PlanStepSpec(BaseModel):
         ),
     )
     verification_ids: list[str] = Field(default_factory=list, max_length=50)
+    completion_predicates: list[CompletionPredicate] = Field(
+        default_factory=list,
+        max_length=50,
+    )
     depends_on: list[str] = Field(default_factory=list, max_length=50)
     risk: str = Field(pattern=r"^(low|medium|high)$")
 
@@ -76,6 +97,19 @@ class PlanStepSpec(BaseModel):
             raise ValueError(f"{self.operation.value} steps require exactly one target path")
         if self.operation == PlanOperation.VERIFY and len(self.verification_ids) != 1:
             raise ValueError("verify steps require exactly one verification ID")
+        if not self.completion_predicates:
+            if self.verification_ids:
+                self.completion_predicates = [
+                    CompletionPredicate(
+                        kind=CompletionPredicateKind.VERIFICATION_PASSED,
+                        check_id=check_id,
+                    )
+                    for check_id in self.verification_ids
+                ]
+            else:
+                self.completion_predicates = [
+                    CompletionPredicate(kind=CompletionPredicateKind.ACTION_SUCCEEDED)
+                ]
         return self
 
 
@@ -192,9 +226,11 @@ class PlanArtifact(PlanDraft):
                 if step.status
                 in {
                     PlanStepStatus.PENDING,
+                    PlanStepStatus.READY,
                     PlanStepStatus.RUNNING,
                     PlanStepStatus.BLOCKED,
                     PlanStepStatus.FAILED,
+                    PlanStepStatus.STALE,
                 }
             ),
             None,

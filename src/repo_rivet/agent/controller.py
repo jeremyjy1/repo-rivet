@@ -1,5 +1,7 @@
 """Explicit single-agent model/tool/verification loop."""
 
+import copy
+import hashlib
 import json
 import time
 from collections.abc import Callable
@@ -9,6 +11,26 @@ from pathlib import Path
 from typing import Any, Literal, Protocol
 from uuid import uuid4
 
+from repo_rivet.actions.identity import ActionIdentity
+from repo_rivet.actions.models import (
+    ActionRecord,
+    ActionResultSnapshot,
+    ActionStatus,
+    DuplicateDisposition,
+    RetryClass,
+)
+from repo_rivet.actions.registry import ActionRegistry, ProposalClassification
+from repo_rivet.actions.retry_policy import may_retry_internally, retry_class_for
+from repo_rivet.agent.completion_gate import CompletionGate
+from repo_rivet.agent.phases import (
+    MODEL_PHASES,
+    DecisionEpoch,
+    ModelCallRecord,
+    RunStatus,
+    WorkflowPhase,
+)
+from repo_rivet.agent.runtime_kernel import RuntimeKernel
+from repo_rivet.agent.runtime_state import AgentRuntimeState
 from repo_rivet.agent.state import AgentStatus, SessionState
 from repo_rivet.agent.termination import TerminationPolicy
 from repo_rivet.agent.verifier import Verifier
@@ -18,6 +40,11 @@ from repo_rivet.context.manager import (
     ContextBudgetExceededError,
     ContextManager,
 )
+from repo_rivet.editing.models import (
+    RECOVERY_MAX_EDIT_OPERATIONS,
+    RECOVERY_MAX_NEW_LINES,
+)
+from repo_rivet.events.models import DomainEventKind
 from repo_rivet.llm.base import (
     ModelClient,
     ModelContextLengthError,
@@ -76,6 +103,7 @@ from repo_rivet.verification.runtime import VerificationRuntime
 _MAX_VERIFICATION_PLAN_RECOVERY_ATTEMPTS = 3
 _MAX_VERIFICATION_PLAN_REVISION_ATTEMPTS = 3
 _MAX_PLAN_SCOPE_REVISION_ATTEMPTS = 3
+_RECOVERY_MAX_WRITE_CHARS = 2_000
 
 
 class EventSink(Protocol):
@@ -126,6 +154,8 @@ class AgentController:
         self.memory_store = memory_store
         self.reasoning_manager = reasoning_manager or ReasoningManager()
         self.reasoning_policy = AdaptiveReasoningPolicy()
+        self.action_registry = ActionRegistry()
+        self.completion_gate = CompletionGate()
         self._reasoning_policy_mode = self.reasoning_manager.config.effort_policy
         self.skill_runtime = skill_runtime
         self.auto_plan_policy = auto_plan_policy or AutoPlanPolicy()
@@ -240,7 +270,13 @@ class AgentController:
             and memory.plan_artifact.status == PlanStatus.EXECUTING
         ):
             remaining_plan_steps = sum(
-                step.status != PlanStepStatus.COMPLETED for step in memory.plan_artifact.steps
+                step.status
+                not in {
+                    PlanStepStatus.COMPLETED,
+                    PlanStepStatus.SATISFIED,
+                    PlanStepStatus.SKIPPED,
+                }
+                for step in memory.plan_artifact.steps
             )
         step_limit = self.termination_policy.config.max_steps
         repaired_interrupted_calls = self._repair_interrupted_history(memory)
@@ -267,8 +303,30 @@ class AgentController:
         # Reflection is an immediate control-flow gate inside one agent run. A new user run
         # starts from the recorded observations and does not inherit an unfinished meta turn.
         memory.reflection_required = False
+        initial_phase = (
+            WorkflowPhase.PLANNING
+            if memory.workflow_mode == WorkflowMode.PLANNING
+            else WorkflowPhase.PLAN_REVIEW
+            if memory.workflow_mode == WorkflowMode.PLAN_READY
+            else WorkflowPhase.DECIDING
+        )
+        runtime = memory.runtime_v2
+        if runtime is None or runtime.status in {
+            RunStatus.COMPLETED,
+            RunStatus.FAILED,
+            RunStatus.CANCELLED,
+            RunStatus.ERROR,
+        }:
+            runtime = AgentRuntimeState.create(
+                memory.session_id,
+                workspace_revision=memory.workspace_revision,
+            )
+        else:
+            runtime = runtime.model_copy(deep=True)
+            runtime.revisions.workspace = memory.workspace_revision
         state = SessionState(
             task=task.strip(),
+            runtime=runtime,
             status=(
                 AgentStatus.PLANNING
                 if memory.workflow_mode == WorkflowMode.PLANNING
@@ -286,6 +344,7 @@ class AgentController:
             verification_plan=memory.verification_plan,
             verification_results=dict(memory.verification_results),
             verification_plan_recovery_attempts=memory.verification_plan_recovery_attempts,
+            pending_decision=memory.verification_plan_recovery_decision,
             verification_plan_revision_required=memory.verification_plan_revision_required,
             verification_plan_revision_reason=memory.verification_plan_revision_reason,
             verification_plan_revision_guidance=memory.verification_plan_revision_guidance,
@@ -302,6 +361,52 @@ class AgentController:
         )
         self.verification_runtime.bind(memory)
         self.plan_runtime.bind(memory)
+        if self._runtime_needs_reconciliation(state.runtime):
+            active = next(
+                (item for item in state.runtime.actions.values() if not item.terminal),
+                None,
+            )
+            recovery = (
+                self.action_registry.recovery_for(
+                    active,
+                    reason_code="interrupted_action_state_unknown",
+                    evidence_refs=[active.result_event_id] if active.result_event_id else [],
+                )
+                if active is not None
+                and active.status in {ActionStatus.DISPATCHED, ActionStatus.RUNNING}
+                else None
+            )
+            self._dispatch_runtime_event(
+                state,
+                DomainEventKind.RUNTIME_RECONCILED,
+                payload={
+                    "recovery": recovery.model_dump(mode="json") if recovery is not None else None
+                },
+            )
+            active = (
+                state.runtime.actions.get(state.runtime.current_action_id)
+                if state.runtime.current_action_id is not None
+                else None
+            )
+            if active is not None and active.status == ActionStatus.OBSERVED:
+                reconciled_terminal = self._replay_observed_action(
+                    active,
+                    state=state,
+                    memory=memory,
+                )
+                if reconciled_terminal is not None:
+                    return reconciled_terminal
+        self._dispatch_runtime_event(
+            state,
+            DomainEventKind.RUN_ACTIVATED,
+            payload={
+                "phase": (
+                    WorkflowPhase.RECOVERING.value
+                    if state.runtime is not None and state.runtime.recovery is not None
+                    else initial_phase.value
+                )
+            },
+        )
         if self.skill_runtime is not None:
             try:
                 self.skill_runtime.restore(memory)
@@ -411,8 +516,10 @@ class AgentController:
                 if terminal_result is not None:
                     return terminal_result
 
+                model_call_id: str | None = None
+                decision_epoch_id: str | None = None
                 try:
-                    tool_schemas = self._tool_schemas(state.workflow_mode)
+                    tool_schemas = self._tool_schemas(state.workflow_mode, state=state)
                     if state.verification_plan_revision_required or (
                         state.verification_plan_recovery_attempts > 0
                         and state.verification_plan is None
@@ -428,13 +535,10 @@ class AgentController:
                             for schema in tool_schemas
                             if schema.get("function", {}).get("name") == "update_plan"
                         ]
-                    if state.suppress_run_command_once:
-                        tool_schemas = [
-                            schema
-                            for schema in tool_schemas
-                            if schema.get("function", {}).get("name") != "run_command"
-                        ]
-                        state.suppress_run_command_once = False
+                    model_call_id, decision_epoch_id = self._begin_model_call(
+                        state=state,
+                        memory=memory,
+                    )
                     response = self._complete_with_context_recovery(
                         state=state,
                         memory=memory,
@@ -443,6 +547,12 @@ class AgentController:
                         ),
                     )
                 except ModelStreamInterrupted:
+                    self._end_model_call(
+                        state=state,
+                        memory=memory,
+                        model_call_id=model_call_id,
+                        succeeded=False,
+                    )
                     if not self._apply_pending_steering(state=state, memory=memory):
                         return self._finish(
                             state,
@@ -454,12 +564,29 @@ class AgentController:
                     self._save_memory(memory, state, status=state.status.value)
                     continue
                 except ResponseParseError as error:
+                    self._end_model_call(
+                        state=state,
+                        memory=memory,
+                        model_call_id=model_call_id,
+                        succeeded=False,
+                    )
                     bounded_edit_recovery = (
                         error.code == "invalid_tool_arguments_json"
                         and error.tool_name in {"edit_file", "write_file"}
                     )
                     cancelled_pending_decision = False
                     if bounded_edit_recovery:
+                        recovery_tool = (
+                            "edit_file" if error.tool_name == "edit_file" else "write_file"
+                        )
+                        if state.structured_tool_recovery != recovery_tool:
+                            state.structured_tool_recovery_failures = 0
+                        state.structured_tool_recovery = recovery_tool
+                        state.structured_tool_recovery_failures += 1
+                        state.structured_tool_recovery_requires_read = (
+                            recovery_tool == "edit_file"
+                            and state.structured_tool_recovery_failures == 1
+                        )
                         pending_action = (
                             state.pending_decision.next_action
                             if state.pending_decision is not None
@@ -470,16 +597,19 @@ class AgentController:
                             and pending_action.tool_name == error.tool_name
                         ):
                             state.pending_decision = None
+                            memory.verification_plan_recovery_decision = None
                             cancelled_pending_decision = True
                         memory.working.pending_actions.clear()
                     recovery_instruction = None
                     if bounded_edit_recovery:
                         if error.tool_name == "edit_file":
                             bounded_action = (
-                                "Reread the smallest necessary range, then issue one small, "
-                                "coherent, snapshot-bound edit_file operation. Continue the "
-                                "refactor through separate edits, using each newly returned "
-                                "snapshot."
+                                "The Controller has temporarily restricted the next action to "
+                                "read_file. Reread only the exact target range. After that, "
+                                "issue exactly one snapshot-bound edit_file operation with at "
+                                f"most "
+                                f"{RECOVERY_MAX_NEW_LINES} new_lines entries. Continue larger "
+                                "changes through separate edits using each returned snapshot."
                             )
                         else:
                             bounded_action = (
@@ -501,7 +631,10 @@ class AgentController:
                     state.record_model_error(
                         str(error),
                         recovery_instruction=recovery_instruction,
+                        count_as_empty=not bounded_edit_recovery,
                     )
+                    if bounded_edit_recovery:
+                        state.record_protocol_failure(str(error))
                     memory.messages.append(
                         Message.from_chat_message(state.messages[-1], step=state.tool_call_count)
                     )
@@ -515,11 +648,23 @@ class AgentController:
                         recovery=(
                             "bounded_edit" if bounded_edit_recovery else "retry_valid_response"
                         ),
+                        recovery_attempt=(
+                            state.structured_tool_recovery_failures
+                            if bounded_edit_recovery
+                            else None
+                        ),
+                        requires_read=state.structured_tool_recovery_requires_read,
                         pending_decision_cancelled=cancelled_pending_decision,
                     )
                     self._save_memory(memory, state, status=state.status.value)
                     continue
                 except AgentContextOverflowError as error:
+                    self._end_model_call(
+                        state=state,
+                        memory=memory,
+                        model_call_id=model_call_id,
+                        succeeded=False,
+                    )
                     return self._finish(
                         state,
                         memory,
@@ -527,6 +672,12 @@ class AgentController:
                         reason=str(error),
                     )
                 except ModelRequestError as error:
+                    self._end_model_call(
+                        state=state,
+                        memory=memory,
+                        model_call_id=model_call_id,
+                        succeeded=False,
+                    )
                     memory.last_model_error = error.record
                     self._log("model_error", **error.record.model_dump(mode="json"))
                     attempt_text = (
@@ -556,6 +707,12 @@ class AgentController:
                         ),
                     )
                 except Exception as error:
+                    self._end_model_call(
+                        state=state,
+                        memory=memory,
+                        model_call_id=model_call_id,
+                        succeeded=False,
+                    )
                     return self._finish(
                         state,
                         memory,
@@ -563,15 +720,27 @@ class AgentController:
                         reason=f"model request failed: {type(error).__name__}",
                     )
 
-                if self._apply_pending_steering(state=state, memory=memory):
+                redirected = self._apply_pending_steering(state=state, memory=memory)
+                if self._apply_runtime_settings(state=state, memory=memory):
+                    self._save_memory(memory, state, status=state.status.value)
+                stale_response = not self._decision_epoch_matches(
+                    state,
+                    decision_epoch_id,
+                )
+                self._end_model_call(
+                    state=state,
+                    memory=memory,
+                    model_call_id=model_call_id,
+                    succeeded=True,
+                )
+                if redirected or stale_response:
                     self._log(
                         "model_response_discarded_for_redirect",
                         step=state.step_count + 1,
+                        stale_decision_epoch=stale_response,
                     )
                     self._save_memory(memory, state, status=state.status.value)
                     continue
-                if self._apply_runtime_settings(state=state, memory=memory):
-                    self._save_memory(memory, state, status=state.status.value)
 
                 raw_assistant_message = response.as_assistant_message()
                 leaked_tool_protocol = (
@@ -735,6 +904,7 @@ class AgentController:
                 if state.pending_decision is not None:
                     state.pending_decision = None
                     memory.working.pending_actions.clear()
+                    memory.verification_plan_recovery_decision = None
                 if response.content and response.content.strip():
                     if state.workflow_mode == WorkflowMode.PLANNING:
                         self._append_system_feedback(
@@ -793,7 +963,26 @@ class AgentController:
         if self.memory_store is not None:
             return self.memory_store.reconcile_interrupted_tool_calls(memory)
 
-        missing, orphan_results = memory.repair_interrupted_tool_history()
+        runtime_results = {
+            action.tool_call_id: action.result
+            for action in (
+                memory.runtime_v2.actions.values() if memory.runtime_v2 is not None else ()
+            )
+            if action.result is not None and not action.result_applied
+        }
+
+        def persisted_result(call_id: str, _name: str) -> Message | None:
+            result = runtime_results.get(call_id)
+            if result is None:
+                return None
+            return Message.from_chat_message(
+                result.to_result().as_tool_message(call_id),
+                step=memory.tool_event_step,
+            )
+
+        missing, orphan_results = memory.repair_interrupted_tool_history(
+            result_for=persisted_result
+        )
         descriptions = [f"{name} ({call_id})" for call_id, name in missing]
         descriptions.extend(f"orphan tool result ({call_id})" for call_id in orphan_results)
         if not descriptions:
@@ -829,13 +1018,21 @@ class AgentController:
                 "user_steer_applied",
                 step=state.step_count + 1,
             )
+        if state.runtime is not None:
+            state.runtime.revisions.knowledge += 1
         state.task = normalized[-1]
         state.pending_decision = None
+        state.verification_plan_recovery_attempts = 0
+        memory.verification_plan_recovery_attempts = 0
+        memory.verification_plan_recovery_decision = None
         state.reflection_required = False
         state.candidate_final_assessment = None
         state.consecutive_failures = 0
         state.consecutive_protocol_failures = 0
         state.empty_model_responses = 0
+        state.structured_tool_recovery = None
+        state.structured_tool_recovery_failures = 0
+        state.structured_tool_recovery_requires_read = False
         state.renew_step_checkpoint(self.termination_policy.config.max_steps)
         state.started_at = time.monotonic()
         if state.workflow_mode == WorkflowMode.PLANNING:
@@ -883,12 +1080,18 @@ class AgentController:
         if approval_mode is not None and approval_engine is not None:
             approval_engine.set_mode(ApprovalMode(approval_mode))
             memory.approval_mode_override = ApprovalMode(approval_mode)
+            if state.runtime is not None and memory.runtime_v2 is not None:
+                state.runtime.revisions.approval_policy = (
+                    memory.runtime_v2.revisions.approval_policy
+                )
         if "skill" in updates and self.skill_runtime is not None:
             skill = updates["skill"]
             if skill:
                 self.skill_runtime.activate(memory, skill)
             else:
                 self.skill_runtime.clear(memory)
+            if state.runtime is not None:
+                state.runtime.revisions.knowledge += 1
             if memory.workflow_mode == WorkflowMode.PLAN_READY:
                 state.workflow_mode = WorkflowMode.PLAN_READY
                 state.status = AgentStatus.PLAN_READY
@@ -897,6 +1100,8 @@ class AgentController:
             and state.workflow_mode != WorkflowMode.PLANNING
         ):
             self._enter_planning_mode(state=state, memory=memory)
+            if state.runtime is not None:
+                state.runtime.revisions.plan += 1
             self._append_planning_feedback(state=state, memory=memory)
         reasoning_policy = updates.get("reasoning_policy")
         if reasoning_policy is not None:
@@ -914,7 +1119,10 @@ class AgentController:
         state.workflow_mode = WorkflowMode.PLANNING
         state.status = AgentStatus.PLANNING
         state.pending_decision = None
+        state.verification_plan_recovery_attempts = 0
+        memory.verification_plan_recovery_attempts = 0
         memory.working.pending_actions.clear()
+        memory.verification_plan_recovery_decision = None
 
     def _append_planning_feedback(
         self,
@@ -1240,6 +1448,8 @@ class AgentController:
         mutating_calls = [call for call in action_calls if self._is_state_changing(call.name)]
         pending_decision = state.pending_decision
         state.pending_decision = None
+        if action_calls:
+            memory.verification_plan_recovery_decision = None
         if reasoning_calls or action_calls:
             memory.working.pending_actions.clear()
         reasoning_event: ReasoningEvent | None = None
@@ -1313,6 +1523,10 @@ class AgentController:
                     else AgentStatus.RUNNING
                 )
                 registered_plan_id = plan.plan_id
+                if state.runtime is not None and memory.runtime_v2 is not None:
+                    state.runtime.revisions.verification_plan = (
+                        memory.runtime_v2.revisions.verification_plan
+                    )
             except ValueError as error:
                 registration_error = str(error)
 
@@ -1346,6 +1560,8 @@ class AgentController:
                     memory.plan_scope_revision_required = False
                     memory.plan_scope_revision_reason = None
                     memory.plan_scope_revision_attempts = 0
+                    if state.runtime is not None and memory.runtime_v2 is not None:
+                        state.runtime.revisions.plan = memory.runtime_v2.revisions.plan
                 except ValueError as error:
                     plan_error = str(error)
 
@@ -1364,10 +1580,12 @@ class AgentController:
         validation_error = reasoning_error or registration_error
         plan_step_validation_error = False
         plan_step_violation_call: ToolCall | None = None
+        multiple_primary_actions = False
         multiple_mutating_actions = False
+        structured_tool_recovery_violation = False
         verification_plan_missing_for_file_change = False
         unchanged_verification_retry: VerificationResult | None = None
-        duplicate_successful_command: ToolCall | None = None
+        proposal_classification: ProposalClassification | None = None
         if plan_calls and action_calls:
             validation_error = plan_error
         if validation_error is None and len(mutating_calls) > 1:
@@ -1376,6 +1594,19 @@ class AgentController:
                 "At most one state-changing tool may run in a model turn; split the "
                 "operations and execute only the current plan step."
             )
+        if validation_error is None and len(action_calls) > 1:
+            multiple_primary_actions = True
+            validation_error = (
+                "A model turn may contain at most one primary action. Return one tool action; "
+                "record_decision and register_verification may accompany it as metadata."
+            )
+        if validation_error is None and state.structured_tool_recovery is not None:
+            for call in action_calls:
+                recovery_error = self._structured_tool_recovery_error(call, state)
+                if recovery_error is not None:
+                    structured_tool_recovery_violation = True
+                    validation_error = recovery_error
+                    break
         if (
             validation_error is None
             and memory.plan_artifact is not None
@@ -1388,13 +1619,19 @@ class AgentController:
                     plan_step_violation_call = call
                     validation_error = plan_error
                     break
-        if mutating_calls and state.reflection_required:
-            validation_error = (
-                "The previous action failed or was denied. Record a reflection in a separate "
-                "turn before declaring another state-changing action."
+        if validation_error is None and len(action_calls) == 1 and state.runtime is not None:
+            proposal_classification = self.action_registry.classify(
+                action_calls[0],
+                runtime=state.runtime,
+                context=memory,
+                plan_step_id=self._current_plan_step_id(memory),
             )
         if validation_error is None:
             for call in action_calls:
+                if proposal_classification is not None and proposal_classification.disposition != (
+                    DuplicateDisposition.EXECUTE_NEW
+                ):
+                    break
                 unchanged_verification_retry = self._unchanged_failed_verification(call, state)
                 if unchanged_verification_retry is None:
                     continue
@@ -1408,20 +1645,10 @@ class AgentController:
                     "to add one before editing."
                 )
                 break
-        if validation_error is None:
-            duplicate_successful_command = next(
-                (call for call in action_calls if state.repeats_successful_command(call)),
-                None,
-            )
-            if duplicate_successful_command is not None:
-                validation_error = (
-                    "This exact command already completed successfully at the current "
-                    f"workspace revision ({state.workspace_revision}). Reuse its recorded "
-                    "observation instead of executing it again. Continue with a different "
-                    "action, register a deterministic verification if one is still needed, "
-                    "or provide the final answer."
-                )
-        if validation_error is None:
+        if validation_error is None and (
+            proposal_classification is None
+            or proposal_classification.disposition == DuplicateDisposition.EXECUTE_NEW
+        ):
             try:
                 validate_decision_for_actions(
                     decision_for_validation,
@@ -1443,10 +1670,17 @@ class AgentController:
                 "A verification plan is required before the first workspace file change. "
                 "Call register_verification before, or in the same response as, the file tool."
             )
-        if validation_error is not None and duplicate_successful_command is None:
+        if validation_error is not None and not verification_plan_missing_for_file_change:
             state.record_protocol_failure(validation_error)
-        elif validation_error is None:
+        else:
             state.consecutive_protocol_failures = 0
+
+        if verification_plan_missing_for_file_change:
+            # The action passed decision validation but cannot be dispatched until its
+            # verification prerequisite exists. Preserve the one-shot decision across the
+            # Controller-inserted registration turn; the requested action has not run yet.
+            state.pending_decision = decision_for_validation
+            memory.verification_plan_recovery_decision = decision_for_validation
 
         if reasoning_event is not None:
             event_type = (
@@ -1587,46 +1821,38 @@ class AgentController:
 
             if validation_error is not None:
                 result = ToolResult(
-                    ok=duplicate_successful_command is call,
-                    output=(
-                        "The command was not executed again. Its previous exit-0 result is "
-                        "still valid at the unchanged workspace revision."
-                        if duplicate_successful_command is call
-                        else ""
-                    ),
-                    error=(None if duplicate_successful_command is call else validation_error),
+                    ok=False,
+                    output="",
+                    error=validation_error,
                     error_code=(
                         "plan_step_violation"
                         if plan_step_validation_error
+                        else "structured_tool_recovery_violation"
+                        if structured_tool_recovery_violation
+                        else "action_cardinality_violation"
+                        if multiple_primary_actions
                         else "verification_retry_without_change"
                         if unchanged_verification_retry is not None
                         else "verification_plan_missing"
                         if verification_plan_missing_for_file_change
-                        else "duplicate_successful_command"
-                        if duplicate_successful_command is not None
                         else "decision_validation_failed"
                     ),
-                    retryable=duplicate_successful_command is not call,
-                    metadata=(
-                        {
-                            "executed": False,
-                            "reused_success": True,
-                            "workspace_revision": state.workspace_revision,
-                        }
-                        if duplicate_successful_command is call
-                        else None
-                    ),
+                    retryable=True,
                 )
-                if duplicate_successful_command is call:
-                    self._record_suppressed_action(
-                        call,
-                        result,
-                        state=state,
-                        memory=memory,
-                    )
-                else:
-                    self._record_blocked_action(call, result, state=state, memory=memory)
+                self._record_blocked_action(call, result, state=state, memory=memory)
                 continue
+
+            if proposal_classification is not None:
+                handled, terminal_result = self._handle_action_disposition(
+                    call,
+                    proposal_classification,
+                    state=state,
+                    memory=memory,
+                )
+                if terminal_result is not None:
+                    return terminal_result
+                if handled:
+                    continue
 
             self._log(
                 "action",
@@ -1670,14 +1896,52 @@ class AgentController:
                 plan_step = self.plan_runtime.start_action(call)
                 if plan_step is not None:
                     self._log_plan_step("plan_step_started", memory, plan_step)
-            result = self.tool_registry.execute(call)
-            successful_action = successful_action or result.ok
+            action = self._propose_action(
+                call,
+                classification=proposal_classification,
+                state=state,
+                memory=memory,
+            )
+            result = self._execute_action_effect(
+                call,
+                action_id=action.action_id,
+                state=state,
+                memory=memory,
+            )
+            successful_action = successful_action or self._action_succeeded(call, result)
             verification_result = (
                 self._verification_result(result) if call.name == "run_verification" else None
             )
-            terminal_result = self._record_action_result(call, result, state=state, memory=memory)
+            terminal_result = self._record_action_result(
+                call,
+                result,
+                state=state,
+                memory=memory,
+                action_id=action.action_id,
+            )
+            self._apply_action_observation(
+                action.action_id,
+                call,
+                result,
+                state=state,
+                memory=memory,
+            )
+            terminal_result = self._post_action_result(
+                result,
+                state=state,
+                memory=memory,
+            )
             if terminal_result is not None:
                 return terminal_result
+            if call.name == "edit_file" and result.error_code == "stale_snapshot":
+                recovery_result = self._recover_stale_edit_snapshot(
+                    call,
+                    result,
+                    state=state,
+                    memory=memory,
+                )
+                if recovery_result is not None:
+                    return recovery_result
             if verification_result is not None:
                 passed_verification_check = (
                     passed_verification_check
@@ -1686,6 +1950,13 @@ class AgentController:
                 )
                 if verification_result.status == VerificationStatus.INCONCLUSIVE:
                     inconclusive_verification = verification_result
+
+        if verification_plan_missing_for_file_change:
+            return self._request_verification_plan_recovery(
+                state=state,
+                memory=memory,
+                trigger="the first workspace file change requires a verification plan",
+            )
 
         if inconclusive_verification is not None:
             self._require_verification_plan_revision(
@@ -1727,6 +1998,26 @@ class AgentController:
                 and not state.reflection_required
             ):
                 state.pending_decision = reasoning_event
+            elif registration_calls and pending_decision is not None:
+                # A Controller-required registration attempt does not consume the already
+                # validated authority for the blocked file change, even if the submitted
+                # verification plan needs another correction.
+                state.pending_decision = pending_decision
+                memory.verification_plan_recovery_decision = pending_decision
+                if registered_plan_id is not None:
+                    self._append_system_feedback(
+                        state,
+                        memory,
+                        {
+                            "event": "verification_plan_recovery_completed",
+                            "instruction": (
+                                "The verification plan is registered. Issue the exact pending "
+                                "state-changing action now without another record_decision. "
+                                "The preserved decision remains one-shot and is consumed by "
+                                "that turn."
+                            ),
+                        },
+                    )
             if state.reasoning_only_turns > self.reasoning_manager.config.max_reflection_only_turns:
                 prompt = (
                     "Too many reasoning-only turns. Take a concrete tool action now, provide a "
@@ -1778,8 +2069,6 @@ class AgentController:
                 memory.plan_scope_revision_reason = scope_reason
                 memory.plan_scope_revision_attempts = 0
                 state.consecutive_protocol_failures = 0
-                state.repeated_tool_calls = 0
-                state.last_tool_signature = None
                 self._log(
                     "plan_scope_revision_required",
                     step=state.step_count,
@@ -1916,34 +2205,6 @@ class AgentController:
                 },
             )
             self._save_memory(memory, state, status=state.status.value)
-        if duplicate_successful_command is not None:
-            state.consecutive_protocol_failures = 0
-            state.repeated_tool_calls = 0
-            state.last_tool_signature = None
-            state.suppress_run_command_once = True
-            self._append_system_feedback(
-                state,
-                memory,
-                {
-                    "event": "duplicate_successful_command_suppressed",
-                    "workspace_revision": state.workspace_revision,
-                    "command": duplicate_successful_command.arguments.get("command"),
-                    "instruction": (
-                        "The duplicate command was not executed. Its prior exit-0 observation "
-                        "is still valid at this unchanged workspace revision. Do not issue the "
-                        "same command again. Continue with the next distinct action, use a "
-                        "registered verification check when proving completion, or provide the "
-                        "final answer. run_command is omitted from the next model turn."
-                    ),
-                },
-            )
-            self._log(
-                "duplicate_successful_command_suppressed",
-                step=state.step_count,
-                workspace_revision=state.workspace_revision,
-                command=duplicate_successful_command.arguments.get("command"),
-            )
-            self._save_memory(memory, state, status=state.status.value)
         if successful_action or (
             plan_step_validation_error and not state.plan_scope_revision_required
         ):
@@ -2012,6 +2273,7 @@ class AgentController:
             if ready_to_finish:
                 state.pending_decision = None
                 memory.working.pending_actions.clear()
+                memory.verification_plan_recovery_decision = None
             self._save_memory(memory, state, status=state.status.value)
         return None
 
@@ -2126,6 +2388,411 @@ class AgentController:
         )
         self._save_memory(memory, state, status=state.status.value)
 
+    @staticmethod
+    def _current_plan_step_id(memory: MemoryState) -> str | None:
+        artifact = memory.plan_artifact
+        if artifact is None or artifact.status != PlanStatus.EXECUTING:
+            return None
+        step = artifact.current_step
+        return step.step_id if step is not None else None
+
+    @staticmethod
+    def _runtime_needs_reconciliation(runtime: AgentRuntimeState) -> bool:
+        pending_model = runtime.model_call is not None and (
+            runtime.model_call.status.value == "pending"
+        )
+        active_action = any(not action.terminal for action in runtime.actions.values())
+        return pending_model or active_action or runtime.wait is not None
+
+    def _replay_observed_action(
+        self,
+        action: ActionRecord,
+        *,
+        state: SessionState,
+        memory: MemoryState,
+    ) -> AgentResult | None:
+        """Apply a persisted observation after restart without executing its tool again."""
+        if action.result is None:
+            raise RuntimeError(f"Observed action {action.action_id} has no persisted result")
+        call = ToolCall(
+            id=action.tool_call_id,
+            name=action.tool_name,
+            arguments=dict(action.normalized_arguments),
+        )
+        result = action.result.to_result()
+        result_already_linked = any(
+            item.role == "tool" and item.tool_call_id == call.id for item in memory.messages
+        )
+        self._record_action_result(
+            call,
+            result,
+            state=state,
+            memory=memory,
+            append_to_conversation=(
+                not action.result_delivered_to_model and not result_already_linked
+            ),
+            action_id=action.action_id,
+        )
+        self._apply_action_observation(
+            action.action_id,
+            call,
+            result,
+            state=state,
+            memory=memory,
+            delivered_to_model=True,
+        )
+        self._log(
+            "action_observation_replayed",
+            action_id=action.action_id,
+            tool=action.tool_name,
+        )
+        return self._post_action_result(result, state=state, memory=memory)
+
+    def _propose_action(
+        self,
+        call: ToolCall,
+        *,
+        classification: ProposalClassification | None,
+        state: SessionState,
+        memory: MemoryState,
+    ) -> ActionRecord:
+        runtime = state.runtime
+        if runtime is None:
+            raise RuntimeError("The v2 runtime must exist before proposing an action")
+        proposal = classification or self.action_registry.classify(
+            call,
+            runtime=runtime,
+            context=memory,
+            plan_step_id=self._current_plan_step_id(memory),
+        )
+        if proposal.disposition != DuplicateDisposition.EXECUTE_NEW:
+            raise RuntimeError(
+                f"Cannot execute a proposal classified as {proposal.disposition.value}"
+            )
+        if runtime.recovery is not None:
+            self._dispatch_runtime_event(
+                state,
+                DomainEventKind.RECOVERY_CLEARED,
+                payload={"phase": WorkflowPhase.DECIDING.value},
+            )
+            runtime = state.runtime
+            assert runtime is not None
+        action = self.action_registry.build_record(
+            call,
+            semantic_key=proposal.semantic_key,
+            runtime=runtime,
+            revisions=runtime.revisions,
+            plan_step_id=self._current_plan_step_id(memory),
+            continuation_phase=(
+                WorkflowPhase.VERIFYING
+                if call.name == "run_verification"
+                else WorkflowPhase.DECIDING
+            ),
+        )
+        self._dispatch_runtime_event(
+            state,
+            DomainEventKind.ACTION_PROPOSED,
+            correlation_id=action.action_id,
+            payload={"action": action.model_dump(mode="json")},
+        )
+        self._save_memory(memory, state, status=state.status.value)
+        return action
+
+    def _execute_action_effect(
+        self,
+        call: ToolCall,
+        *,
+        action_id: str,
+        state: SessionState,
+        memory: MemoryState,
+    ) -> ToolResult:
+        """Execute a proposed action while checkpointing every external boundary."""
+
+        def observe(stage: str, payload: dict[str, Any]) -> None:
+            runtime = state.runtime
+            if runtime is None:
+                raise RuntimeError("The v2 runtime disappeared during action execution")
+            action = runtime.actions[action_id]
+            event: DomainEventKind | None = None
+            if stage == "prepared" and action.status == ActionStatus.PROPOSED:
+                event = DomainEventKind.ACTION_PREPARED
+            elif stage == "approval_requested":
+                event = DomainEventKind.APPROVAL_REQUESTED
+            elif stage == "approval_resolved":
+                event = DomainEventKind.APPROVAL_RESOLVED
+            elif stage == "dispatched":
+                event = DomainEventKind.ACTION_DISPATCHED
+            elif stage == "running":
+                event = DomainEventKind.ACTION_RUNNING
+            if event is None:
+                return
+            self._dispatch_runtime_event(
+                state,
+                event,
+                correlation_id=action_id,
+                payload=payload,
+            )
+            self._save_memory(memory, state, status=state.status.value)
+
+        while True:
+            execute_with_lifecycle = getattr(self.tool_registry, "execute_with_lifecycle", None)
+            if callable(execute_with_lifecycle):
+                result = execute_with_lifecycle(call, observe)
+            else:
+                # Small test registries implement only execute(). Keep the same durable
+                # boundaries without making the Controller depend on a concrete registry.
+                observe("prepared", {"valid": True})
+                observe("dispatched", {})
+                observe("running", {})
+                result = self.tool_registry.execute(call)
+            retry_class = retry_class_for(result)
+            self._dispatch_runtime_event(
+                state,
+                DomainEventKind.ACTION_OBSERVED,
+                correlation_id=action_id,
+                payload={
+                    "result": ActionResultSnapshot.from_result(result).model_dump(mode="json"),
+                    "retryable": retry_class == RetryClass.TRANSIENT_INFRASTRUCTURE,
+                    "retry_class": retry_class.value,
+                },
+            )
+            self._save_memory(memory, state, status=state.status.value)
+            runtime = state.runtime
+            assert runtime is not None
+            action = runtime.actions[action_id]
+            if not may_retry_internally(result, attempt=action.attempt):
+                return result
+            self._log(
+                "action_retry_scheduled",
+                action_id=action_id,
+                tool=call.name,
+                attempt=action.attempt + 1,
+                error_code=result.error_code,
+            )
+            self._dispatch_runtime_event(
+                state,
+                DomainEventKind.ACTION_RETRY_SCHEDULED,
+                correlation_id=action_id,
+                payload={"error_code": result.error_code},
+            )
+            self._save_memory(memory, state, status=state.status.value)
+
+    def _apply_action_observation(
+        self,
+        action_id: str,
+        call: ToolCall,
+        result: ToolResult,
+        *,
+        state: SessionState,
+        memory: MemoryState,
+        delivered_to_model: bool = True,
+    ) -> None:
+        runtime = state.runtime
+        if runtime is None:
+            return
+        action = runtime.actions[action_id]
+        semantic_key = ActionIdentity.result_key(
+            action,
+            result,
+            context=memory,
+            revisions=runtime.revisions,
+        )
+        action_succeeded = self._action_succeeded(call, result)
+        self._dispatch_runtime_event(
+            state,
+            DomainEventKind.OBSERVATION_APPLIED,
+            correlation_id=action_id,
+            payload={
+                "succeeded": action_succeeded,
+                "new_knowledge": True,
+                "workspace_revision": state.workspace_revision,
+                "semantic_key": semantic_key,
+                "next_phase": (
+                    WorkflowPhase.DECIDING.value
+                    if action_succeeded
+                    else WorkflowPhase.RECOVERING.value
+                ),
+            },
+        )
+        if delivered_to_model:
+            self._dispatch_runtime_event(
+                state,
+                DomainEventKind.OBSERVATION_DELIVERED,
+                correlation_id=action_id,
+            )
+        if action_succeeded:
+            if state.runtime is not None and state.runtime.recovery is not None:
+                self._dispatch_runtime_event(
+                    state,
+                    DomainEventKind.RECOVERY_CLEARED,
+                    payload={"phase": WorkflowPhase.DECIDING.value},
+                )
+        else:
+            runtime = state.runtime
+            assert runtime is not None
+            failed = runtime.actions[action_id]
+            recovery = self.action_registry.recovery_for(
+                failed,
+                reason_code=(
+                    result.error_code or "verification_failed"
+                    if call.name == "run_verification"
+                    else result.error_code or "command_failed"
+                    if call.name == "run_command"
+                    else result.error_code or "action_failed"
+                ),
+                evidence_refs=[failed.result_event_id] if failed.result_event_id else [],
+            )
+            self._dispatch_runtime_event(
+                state,
+                DomainEventKind.RECOVERY_ENTERED,
+                correlation_id=action_id,
+                payload={"recovery": recovery.model_dump(mode="json")},
+            )
+            self._log(
+                "action_recovery_started",
+                action_id=action_id,
+                tool=call.name,
+                reason_code=recovery.reason_code,
+            )
+            # Recovery is now explicit state; do not require a provider to emit a ritual
+            # reflection before it can inspect evidence or choose a different action.
+            state.reflection_required = False
+            memory.reflection_required = False
+        self._save_memory(memory, state, status=state.status.value)
+
+    @staticmethod
+    def _action_succeeded(call: ToolCall, result: ToolResult) -> bool:
+        if not result.ok:
+            return False
+        if call.name == "run_command":
+            return (result.metadata or {}).get("exit_code") == 0
+        if call.name != "run_verification":
+            return True
+        verification = (result.metadata or {}).get("verification_result")
+        return isinstance(verification, dict) and verification.get("status") == (
+            VerificationStatus.PASSED.value
+        )
+
+    def _handle_action_disposition(
+        self,
+        call: ToolCall,
+        classification: ProposalClassification,
+        *,
+        state: SessionState,
+        memory: MemoryState,
+    ) -> tuple[bool, AgentResult | None]:
+        disposition = classification.disposition
+        if disposition == DuplicateDisposition.EXECUTE_NEW:
+            return False, None
+        previous = classification.previous
+        if (
+            disposition
+            in {
+                DuplicateDisposition.REUSE_RESULT,
+                DuplicateDisposition.REPLAY_UNDELIVERED_RESULT,
+            }
+            and previous is not None
+            and previous.result is not None
+        ):
+            result = previous.result.to_result()
+            metadata = dict(result.metadata or {})
+            metadata.update(
+                {
+                    "execution_attempted": False,
+                    "reused_action_id": previous.action_id,
+                    "duplicate_disposition": disposition.value,
+                }
+            )
+            result = ToolResult(
+                ok=result.ok,
+                output=result.output,
+                error=result.error,
+                metadata=metadata,
+                raw_output=result.raw_output,
+                error_code=result.error_code,
+                retryable=False,
+            )
+            self._record_suppressed_action(call, result, state=state, memory=memory)
+            if not previous.result_delivered_to_model:
+                self._dispatch_runtime_event(
+                    state,
+                    DomainEventKind.OBSERVATION_DELIVERED,
+                    correlation_id=previous.action_id,
+                )
+            self._log(
+                "action_result_reused",
+                action_id=previous.action_id,
+                tool=call.name,
+                disposition=disposition.value,
+            )
+            self._save_memory(memory, state, status=state.status.value)
+            return True, None
+
+        reason = {
+            DuplicateDisposition.WAIT_EXISTING: "an equivalent action is still in progress",
+            DuplicateDisposition.RETRY_INTERNAL: "transient retries were already exhausted",
+            DuplicateDisposition.REQUIRE_ALTERNATIVE: (
+                "the same action already failed; inspect its evidence and choose a distinct action"
+            ),
+            DuplicateDisposition.BLOCK: (
+                "the recovery state forbids repeating the failed action without new evidence"
+            ),
+        }.get(disposition, "the action cannot be executed in the current state")
+        if call.name == "run_verification" and disposition in {
+            DuplicateDisposition.REQUIRE_ALTERNATIVE,
+            DuplicateDisposition.BLOCK,
+        }:
+            reason = (
+                "This verification check already failed at the current workspace revision. "
+                "Do not rerun it before a relevant workspace change; inspect its evidence "
+                "and repair the cause."
+            )
+        if previous is not None and disposition in {
+            DuplicateDisposition.RETRY_INTERNAL,
+            DuplicateDisposition.REQUIRE_ALTERNATIVE,
+        }:
+            recovery = self.action_registry.recovery_for(
+                previous,
+                reason_code="alternative_action_required",
+                evidence_refs=[previous.result_event_id] if previous.result_event_id else [],
+            )
+            self._dispatch_runtime_event(
+                state,
+                DomainEventKind.RECOVERY_ENTERED,
+                correlation_id=previous.action_id,
+                payload={"recovery": recovery.model_dump(mode="json")},
+            )
+        result = ToolResult(
+            ok=False,
+            output="",
+            error=reason,
+            error_code=(
+                "verification_retry_without_change"
+                if call.name == "run_verification"
+                and disposition
+                in {
+                    DuplicateDisposition.REQUIRE_ALTERNATIVE,
+                    DuplicateDisposition.BLOCK,
+                }
+                else f"action_{disposition.value}"
+            ),
+            retryable=False,
+            metadata={"execution_attempted": False},
+        )
+        self._record_blocked_action(call, result, state=state, memory=memory)
+        self._append_system_feedback(
+            state,
+            memory,
+            {
+                "error": result.error_code,
+                "failed_action_id": previous.action_id if previous is not None else None,
+                "forbidden_semantic_key": classification.semantic_key,
+                "instruction": reason,
+            },
+        )
+        self._save_memory(memory, state, status=state.status.value)
+        return True, None
+
     def _record_suppressed_action(
         self,
         call: ToolCall,
@@ -2147,7 +2814,16 @@ class AgentController:
         state: SessionState,
         memory: MemoryState,
         append_to_conversation: bool = True,
+        action_id: str | None = None,
     ) -> AgentResult | None:
+        if action_id is not None and action_id in memory.applied_action_ids:
+            if append_to_conversation and not any(
+                item.role == "tool" and item.tool_call_id == call.id for item in memory.messages
+            ):
+                message = result.as_tool_message(call.id)
+                state.messages.append(message)
+                memory.append_tool_message(message, step=state.tool_call_count)
+            return None
         next_step = state.tool_call_count + 1
         output_ref = (
             self.memory_store.save_tool_output(call, result, step=next_step)
@@ -2199,6 +2875,24 @@ class AgentController:
         )
         memory.modified_files = set(state.modified_files)
         memory.workspace_revision = state.workspace_revision
+        if result.ok and state.structured_tool_recovery is not None:
+            if state.structured_tool_recovery_requires_read and call.name == "read_file":
+                state.structured_tool_recovery_requires_read = False
+                self._log(
+                    "structured_tool_recovery_read_completed",
+                    tool=state.structured_tool_recovery,
+                    path=call.arguments.get("path"),
+                    failure_count=state.structured_tool_recovery_failures,
+                )
+            elif call.name == state.structured_tool_recovery:
+                self._log(
+                    "structured_tool_recovery_completed",
+                    tool=state.structured_tool_recovery,
+                    failure_count=state.structured_tool_recovery_failures,
+                )
+                state.structured_tool_recovery = None
+                state.structured_tool_recovery_failures = 0
+                state.structured_tool_recovery_requires_read = False
         if completed_plan_step is not None:
             required_action = self._plan_step_action_contract(next_plan_step)
             self._append_system_feedback(
@@ -2295,13 +2989,6 @@ class AgentController:
                     workspace_revision=state.workspace_revision,
                     plan_step_id=plan_step.step_id if plan_step is not None else None,
                 )
-            if verification_result.status == VerificationStatus.INCONCLUSIVE:
-                # An inconclusive result changes the next valid action from rerunning the check
-                # to replacing its verification plan. Do not let the generic repeated-call guard
-                # terminate before the bounded plan-revision recovery can be installed by the
-                # caller.
-                state.repeated_tool_calls = 0
-                state.last_tool_signature = None
         self._log("observation", **observation.model_dump(mode="json"))
         if verification_result is not None:
             self._log("verification_result", **verification_result.model_dump(mode="json"))
@@ -2316,41 +3003,19 @@ class AgentController:
             metadata=result.metadata,
             output_ref=output_ref,
         )
+        if action_id is not None:
+            memory.applied_action_ids.add(action_id)
         self._save_memory(memory, state, status=state.status.value)
 
-        if (
-            call.name == "run_command"
-            and result.ok
-            and (result.metadata or {}).get("exit_code") == 0
-        ):
-            self._append_system_feedback(
-                state,
-                memory,
-                {
-                    "event": "command_completed_at_workspace_revision",
-                    "workspace_revision": state.workspace_revision,
-                    "command": call.arguments.get("command"),
-                    "instruction": (
-                        "This exact command succeeded. Do not rerun it while the workspace "
-                        "revision is unchanged. Use this observation and proceed to the next "
-                        "distinct action. If it is intended to prove a completion claim, use "
-                        "the corresponding registered verification check rather than repeating "
-                        "run_command."
-                    ),
-                },
-            )
-            self._save_memory(memory, state, status=state.status.value)
+        return None
 
-        if call.name == "edit_file" and result.error_code == "stale_snapshot":
-            terminal_result = self._recover_stale_edit_snapshot(
-                call,
-                result,
-                state=state,
-                memory=memory,
-            )
-            if terminal_result is not None:
-                return terminal_result
-
+    def _post_action_result(
+        self,
+        result: ToolResult,
+        *,
+        state: SessionState,
+        memory: MemoryState,
+    ) -> AgentResult | None:
         if result.metadata and result.metadata.get("approval_abort"):
             return self._finish(
                 state,
@@ -2392,8 +3057,6 @@ class AgentController:
             name="read_file",
             arguments=read_arguments,
         )
-        state.repeated_tool_calls = 0
-        state.last_tool_signature = None
         self._log(
             "stale_snapshot_recovery_started",
             step=state.step_count,
@@ -2411,13 +3074,48 @@ class AgentController:
             requested_by="controller",
             reason="refresh stale edit snapshot",
         )
-        recovery_result = self.tool_registry.execute(recovery_call)
+        classification = (
+            self.action_registry.classify(
+                recovery_call,
+                runtime=state.runtime,
+                context=memory,
+                plan_step_id=self._current_plan_step_id(memory),
+            )
+            if state.runtime is not None
+            else None
+        )
+        recovery_action = self._propose_action(
+            recovery_call,
+            classification=classification,
+            state=state,
+            memory=memory,
+        )
+        recovery_result = self._execute_action_effect(
+            recovery_call,
+            action_id=recovery_action.action_id,
+            state=state,
+            memory=memory,
+        )
         terminal_result = self._record_action_result(
             recovery_call,
             recovery_result,
             state=state,
             memory=memory,
             append_to_conversation=False,
+            action_id=recovery_action.action_id,
+        )
+        self._apply_action_observation(
+            recovery_action.action_id,
+            recovery_call,
+            recovery_result,
+            state=state,
+            memory=memory,
+            delivered_to_model=True,
+        )
+        terminal_result = self._post_action_result(
+            recovery_result,
+            state=state,
+            memory=memory,
         )
         metadata = recovery_result.metadata or {}
         if recovery_result.ok:
@@ -2616,8 +3314,35 @@ class AgentController:
             self._log("assessment", **assessment.model_dump(mode="json"))
 
         report = self.verifier.completion_report(state)
-        if report.complete:
+        gate = (
+            self.completion_gate.evaluate(state.runtime, memory)
+            if state.runtime is not None
+            else None
+        )
+        self._log(
+            "completion_gate_evaluated",
+            verifier_complete=report.complete,
+            **(gate.model_dump(mode="json") if gate is not None else {"ready": report.complete}),
+        )
+        if report.complete and (gate is None or gate.ready):
             return self._finish(state, memory, status="success", summary=summary)
+        if report.complete and gate is not None and not gate.ready:
+            self._append_system_feedback(
+                state,
+                memory,
+                {
+                    "error": "completion_gate_not_satisfied",
+                    "completion_gate": gate.model_dump(mode="json"),
+                    "instruction": (
+                        "The completion claim was not accepted. Continue the current plan, "
+                        "resolve the active action or approval, and make verification current "
+                        "before finalizing."
+                    ),
+                },
+            )
+            state.status = AgentStatus.RUNNING
+            self._save_memory(memory, state, status=state.status.value)
+            return None
 
         if state.verification_plan is None:
             return self._request_verification_plan_recovery(
@@ -2648,7 +3373,17 @@ class AgentController:
             return terminal_result
 
         report = self.verifier.completion_report(state)
-        if report.complete:
+        gate = (
+            self.completion_gate.evaluate(state.runtime, memory)
+            if state.runtime is not None
+            else None
+        )
+        self._log(
+            "completion_gate_evaluated",
+            verifier_complete=report.complete,
+            **(gate.model_dump(mode="json") if gate is not None else {"ready": report.complete}),
+        )
+        if report.complete and (gate is None or gate.ready):
             return self._finish(state, memory, status="success", summary=summary)
 
         self._append_system_feedback(
@@ -2679,6 +3414,8 @@ class AgentController:
     ) -> AgentResult | None:
         """Request a bounded plan-only correction without stopping on the first mistake."""
         if state.verification_plan_recovery_attempts >= (_MAX_VERIFICATION_PLAN_RECOVERY_ATTEMPTS):
+            state.pending_decision = None
+            memory.verification_plan_recovery_decision = None
             fallback_summary = (
                 state.candidate_final_assessment.summary
                 if state.candidate_final_assessment is not None
@@ -2698,8 +3435,6 @@ class AgentController:
         state.verification_plan_recovery_attempts += 1
         memory.verification_plan_recovery_attempts = state.verification_plan_recovery_attempts
         state.status = AgentStatus.AWAITING_VERIFICATION_PLAN
-        state.repeated_tool_calls = 0
-        state.last_tool_signature = None
         state.consecutive_protocol_failures = 0
         self._append_system_feedback(
             state,
@@ -2780,7 +3515,57 @@ class AgentController:
                 self.plan_runtime.start_action()
                 if plan_step is not None:
                     self._log_plan_step("plan_step_started", memory, plan_step)
-            result = self.tool_registry.execute(call)
+            classification = None
+            if state.runtime is not None:
+                classification = self.action_registry.classify(
+                    call,
+                    runtime=state.runtime,
+                    context=memory,
+                    plan_step_id=self._current_plan_step_id(memory),
+                )
+            action: ActionRecord | None = None
+            if (
+                classification is not None
+                and classification.disposition == DuplicateDisposition.REUSE_RESULT
+                and classification.previous is not None
+                and classification.previous.result is not None
+            ):
+                result = classification.previous.result.to_result()
+                self._log(
+                    "action_result_reused",
+                    action_id=classification.previous.action_id,
+                    tool=call.name,
+                    disposition=classification.disposition.value,
+                    controller_scheduled=True,
+                )
+            elif classification is None or classification.disposition == (
+                DuplicateDisposition.EXECUTE_NEW
+            ):
+                action = self._propose_action(
+                    call,
+                    classification=classification,
+                    state=state,
+                    memory=memory,
+                )
+                result = self._execute_action_effect(
+                    call,
+                    action_id=action.action_id,
+                    state=state,
+                    memory=memory,
+                )
+            elif classification.previous is not None and classification.previous.result is not None:
+                result = classification.previous.result.to_result()
+            else:
+                result = ToolResult(
+                    ok=False,
+                    output="",
+                    error=(
+                        "The verification action is already pending or requires a distinct "
+                        "recovery action."
+                    ),
+                    error_code=f"action_{classification.disposition.value}",
+                    retryable=False,
+                )
             if self._verification_result(result) is None:
                 now = datetime.now(UTC)
                 failed = VerificationResult(
@@ -2809,7 +3594,22 @@ class AgentController:
                 state=state,
                 memory=memory,
                 append_to_conversation=False,
+                action_id=action.action_id if action is not None else None,
             )
+            if action is not None:
+                self._apply_action_observation(
+                    action.action_id,
+                    call,
+                    result,
+                    state=state,
+                    memory=memory,
+                    delivered_to_model=True,
+                )
+                terminal_result = self._post_action_result(
+                    result,
+                    state=state,
+                    memory=memory,
+                )
             if terminal_result is not None:
                 return terminal_result
             recorded = state.verification_results.get(check_id)
@@ -2961,6 +3761,7 @@ class AgentController:
         memory.verification_plan_revision_guidance = state.verification_plan_revision_guidance
         state.pending_decision = None
         memory.working.pending_actions.clear()
+        memory.verification_plan_recovery_decision = None
         state.status = AgentStatus.AWAITING_VERIFICATION_PLAN
         self._append_verification_revision_feedback(state, memory)
         self._save_memory(memory, state, status=state.status.value)
@@ -3039,7 +3840,12 @@ class AgentController:
         self._save_memory(memory, state, status=state.status.value)
         return None
 
-    def _tool_schemas(self, workflow_mode: WorkflowMode) -> list[dict[str, Any]]:
+    def _tool_schemas(
+        self,
+        workflow_mode: WorkflowMode,
+        *,
+        state: SessionState | None = None,
+    ) -> list[dict[str, Any]]:
         schemas = self.tool_registry.schemas()
         if workflow_mode == WorkflowMode.PLANNING:
             schemas = [
@@ -3081,6 +3887,8 @@ class AgentController:
                     )
                     or schema.get("function", {}).get("name") in allowed_side_effects
                 ]
+        if state is not None and state.structured_tool_recovery is not None:
+            schemas = self._structured_tool_recovery_schemas(schemas, state)
         if self.reasoning_manager.config.enabled:
             return schemas
         return [
@@ -3088,6 +3896,95 @@ class AgentController:
             for schema in schemas
             if schema.get("function", {}).get("name") != "record_decision"
         ]
+
+    @staticmethod
+    def _structured_tool_recovery_schemas(
+        schemas: list[dict[str, Any]],
+        state: SessionState,
+    ) -> list[dict[str, Any]]:
+        if state.structured_tool_recovery_requires_read:
+            return [
+                schema
+                for schema in schemas
+                if schema.get("function", {}).get("name") == "read_file"
+            ]
+
+        constrained = copy.deepcopy(schemas)
+        for schema in constrained:
+            function = schema.get("function", {})
+            if function.get("name") != state.structured_tool_recovery:
+                continue
+            parameters = function.get("parameters", {})
+            properties = parameters.get("properties", {})
+            if state.structured_tool_recovery == "edit_file":
+                function["description"] = (
+                    "RECOVERY MODE: issue exactly one snapshot-bound line operation with at "
+                    f"most {RECOVERY_MAX_NEW_LINES} new_lines entries. Split larger changes "
+                    "across later calls and use the fresh snapshot returned after each edit."
+                )
+                operations = properties.get("operations", {})
+                operations["maxItems"] = RECOVERY_MAX_EDIT_OPERATIONS
+                for definition in parameters.get("$defs", {}).values():
+                    new_lines = definition.get("properties", {}).get("new_lines")
+                    if isinstance(new_lines, dict):
+                        new_lines["maxItems"] = RECOVERY_MAX_NEW_LINES
+            elif state.structured_tool_recovery == "write_file":
+                function["description"] = (
+                    "RECOVERY MODE: create only a minimal valid file. Keep content under "
+                    f"{_RECOVERY_MAX_WRITE_CHARS} characters, then expand it with read_file "
+                    "and snapshot-bound edit_file calls."
+                )
+                content = properties.get("content")
+                if isinstance(content, dict):
+                    content["maxLength"] = _RECOVERY_MAX_WRITE_CHARS
+        return constrained
+
+    @staticmethod
+    def _structured_tool_recovery_error(
+        call: ToolCall,
+        state: SessionState,
+    ) -> str | None:
+        recovery_tool = state.structured_tool_recovery
+        if recovery_tool is None:
+            return None
+        if state.structured_tool_recovery_requires_read:
+            if call.name == "read_file":
+                return None
+            return (
+                "Structured edit recovery requires one read_file call before another "
+                f"{recovery_tool} request; received {call.name}."
+            )
+        if call.name != recovery_tool:
+            return None
+        if recovery_tool == "write_file":
+            content = call.arguments.get("content")
+            if isinstance(content, str) and len(content) > _RECOVERY_MAX_WRITE_CHARS:
+                return (
+                    "Structured write recovery accepts at most "
+                    f"{_RECOVERY_MAX_WRITE_CHARS} content characters; create a minimal file "
+                    "and expand it through snapshot-bound edits."
+                )
+            return None
+
+        operations = call.arguments.get("operations")
+        if not isinstance(operations, list):
+            return None
+        if len(operations) > RECOVERY_MAX_EDIT_OPERATIONS:
+            return (
+                "Structured edit recovery accepts exactly one operation per request; "
+                "split the change across fresh snapshots."
+            )
+        new_line_count = sum(
+            len(operation.get("new_lines", []))
+            for operation in operations
+            if isinstance(operation, dict) and isinstance(operation.get("new_lines", []), list)
+        )
+        if new_line_count > RECOVERY_MAX_NEW_LINES:
+            return (
+                "Structured edit recovery accepts at most "
+                f"{RECOVERY_MAX_NEW_LINES} new_lines entries; edit a smaller range first."
+            )
+        return None
 
     @staticmethod
     def _plan_step_side_effect_tools(step: PlanStep | None) -> set[str]:
@@ -3467,8 +4364,10 @@ class AgentController:
         )
         recovery = (
             state.reflection_required
+            or state.verification_plan_recovery_attempts > 0
             or state.verification_plan_revision_required
             or state.plan_scope_revision_required
+            or state.structured_tool_recovery is not None
             or failed_checks > 0
         )
         if state.status == AgentStatus.FINALIZING:
@@ -3521,6 +4420,130 @@ class AgentController:
             latency_sensitive=phase in {"discovering", "acting", "finalizing"},
         )
 
+    def _model_phase(self, state: SessionState) -> WorkflowPhase:
+        if state.status == AgentStatus.FINALIZING:
+            return WorkflowPhase.FINALIZING
+        if state.workflow_mode == WorkflowMode.PLANNING:
+            return WorkflowPhase.PLANNING
+        if (
+            state.reflection_required
+            or state.verification_plan_revision_required
+            or state.plan_scope_revision_required
+            or state.structured_tool_recovery is not None
+            or (state.runtime is not None and state.runtime.recovery is not None)
+        ):
+            return WorkflowPhase.RECOVERING
+        return WorkflowPhase.DECIDING
+
+    def _decision_epoch(self, state: SessionState) -> DecisionEpoch:
+        if state.runtime is None:
+            raise RuntimeError("v2 runtime is not initialized")
+        memory = self.plan_runtime.memory
+        artifact = memory.plan_artifact if memory is not None else None
+        current_step = (
+            artifact.current_step
+            if artifact is not None and artifact.status == PlanStatus.EXECUTING
+            else None
+        )
+        verification_payload = {
+            key: {
+                "status": result.status.value,
+                "workspace_revision": result.workspace_revision,
+            }
+            for key, result in sorted(state.verification_results.items())
+        }
+        verification_hash = hashlib.sha256(
+            json.dumps(
+                verification_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        revisions = state.runtime.revisions
+        return DecisionEpoch(
+            phase=self._model_phase(state),
+            plan_step_id=current_step.step_id if current_step is not None else None,
+            workspace_revision=revisions.workspace,
+            knowledge_revision=revisions.knowledge,
+            plan_revision=revisions.plan,
+            verification_plan_revision=revisions.verification_plan,
+            current_action_id=state.runtime.current_action_id,
+            verification_state_hash=verification_hash,
+        )
+
+    def _begin_model_call(
+        self,
+        *,
+        state: SessionState,
+        memory: MemoryState,
+    ) -> tuple[str, str]:
+        phase = self._model_phase(state)
+        if phase not in MODEL_PHASES:
+            raise RuntimeError(f"Model calls are forbidden during {phase.value}")
+        if state.runtime is None:
+            raise RuntimeError("v2 runtime is not initialized")
+        if state.runtime.phase != phase:
+            self._dispatch_runtime_event(
+                state,
+                DomainEventKind.PHASE_CHANGED,
+                payload={"phase": phase.value},
+            )
+        epoch = self._decision_epoch(state)
+        model_call_id = f"model-{uuid4().hex[:12]}"
+        record = ModelCallRecord(
+            model_call_id=model_call_id,
+            decision_epoch_id=epoch.epoch_id,
+            phase=phase,
+            profile=state.current_reasoning_effort or "default",
+        )
+        self._dispatch_runtime_event(
+            state,
+            DomainEventKind.MODEL_CALL_STARTED,
+            correlation_id=model_call_id,
+            payload={
+                "model_call": record.model_dump(mode="json"),
+                "decision_epoch": epoch.model_dump(mode="json"),
+            },
+        )
+        # Waiting for a provider response is a runtime detail. Keep the durable
+        # session lifecycle at its current workflow status so session metadata
+        # remains loadable while a model call is in flight.
+        self._save_memory(memory, state, status=state.status.value)
+        return model_call_id, epoch.epoch_id
+
+    def _end_model_call(
+        self,
+        *,
+        state: SessionState,
+        memory: MemoryState,
+        model_call_id: str | None,
+        succeeded: bool,
+    ) -> None:
+        if model_call_id is None or state.runtime is None:
+            return
+        pending = state.runtime.model_call
+        if pending is None or pending.model_call_id != model_call_id:
+            return
+        self._dispatch_runtime_event(
+            state,
+            (
+                DomainEventKind.MODEL_CALL_FINISHED
+                if succeeded
+                else DomainEventKind.MODEL_CALL_FAILED
+            ),
+            correlation_id=model_call_id,
+        )
+        self._save_memory(memory, state, status=state.status.value)
+
+    def _decision_epoch_matches(
+        self,
+        state: SessionState,
+        expected_epoch_id: str | None,
+    ) -> bool:
+        if expected_epoch_id is None or state.runtime is None:
+            return False
+        return self._decision_epoch(state).epoch_id == expected_epoch_id
+
     @staticmethod
     def _record_reasoning_selection(
         state: SessionState,
@@ -3562,6 +4585,21 @@ class AgentController:
             "stopped": AgentStatus.STOPPED,
             "error": AgentStatus.ERROR,
         }[status]
+        self._dispatch_runtime_event(
+            state,
+            DomainEventKind.RUN_FINISHED,
+            payload={
+                "status": {
+                    "success": RunStatus.COMPLETED.value,
+                    "plan_ready": RunStatus.PAUSED.value,
+                    "incomplete": RunStatus.FAILED.value,
+                    "blocked": RunStatus.BLOCKED.value,
+                    "stopped": RunStatus.PAUSED.value,
+                    "error": RunStatus.ERROR.value,
+                }[status],
+                "reason": reason,
+            },
+        )
         memory_status = "completed" if status == "success" else status
         memory.last_agent_outcome = status
         memory.discard_provider_state()
@@ -3597,6 +4635,9 @@ class AgentController:
         memory.plan_scope_revision_attempts = state.plan_scope_revision_attempts
         memory.candidate_final_assessment = state.candidate_final_assessment
         memory.workflow_mode = state.workflow_mode
+        memory.runtime_v2 = (
+            state.runtime.model_copy(deep=True) if state.runtime is not None else None
+        )
         memory.status = status
         if self.memory_store is not None:
             self.memory_store.save_state(
@@ -3605,6 +4646,35 @@ class AgentController:
                 tool_call_count=state.tool_call_count,
                 status=status,
             )
+
+    def _dispatch_runtime_event(
+        self,
+        state: SessionState,
+        kind: DomainEventKind,
+        *,
+        correlation_id: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        if state.runtime is None:
+            state.runtime = AgentRuntimeState.create("ephemeral")
+        kernel = RuntimeKernel(state.runtime)
+        event = kernel.dispatch(
+            kind,
+            correlation_id=correlation_id,
+            payload=payload,
+        )
+        state.runtime = kernel.state
+        self._log(
+            "runtime_transition",
+            domain_event=event.kind.value,
+            event_id=event.event_id,
+            event_seq=event.seq,
+            state_version=kernel.state.state_version,
+            run_id=kernel.state.run_id,
+            run_status=kernel.state.status.value,
+            phase=kernel.state.phase.value,
+            correlation_id=correlation_id,
+        )
 
     def _log(self, event_type: str, **data: Any) -> None:
         if self.event_logger is not None:

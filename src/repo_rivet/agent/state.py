@@ -5,8 +5,9 @@ import json
 import time
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
+from repo_rivet.agent.runtime_state import AgentRuntimeState
 from repo_rivet.llm.base import ModelResponse, ReasoningEffort
 from repo_rivet.planning.models import WorkflowMode
 from repo_rivet.reasoning.models import ReasoningEvent
@@ -42,6 +43,7 @@ class SessionState:
     """Track conversation progress and safety-relevant counters."""
 
     task: str
+    runtime: AgentRuntimeState | None = None
     status: AgentStatus = AgentStatus.RUNNING
     workflow_mode: WorkflowMode = WorkflowMode.EXECUTE
     messages: list[dict[str, Any]] = field(default_factory=list)
@@ -66,17 +68,15 @@ class SessionState:
     plan_scope_revision_attempts: int = 0
     candidate_final_assessment: FinalAssessment | None = None
     consecutive_failures: int = 0
-    repeated_tool_calls: int = 0
     empty_model_responses: int = 0
+    structured_tool_recovery: Literal["edit_file", "write_file"] | None = None
+    structured_tool_recovery_failures: int = 0
+    structured_tool_recovery_requires_read: bool = False
     consecutive_length_responses: int = 0
     provider_reasoning_detected: bool = False
     force_thinking_disabled: bool = False
     sanitize_unreplayable_provider_history: bool = False
     consecutive_protocol_failures: int = 0
-    last_tool_signature: str | None = None
-    last_successful_command_signature: str | None = None
-    last_successful_command_workspace_revision: int | None = None
-    suppress_run_command_once: bool = False
     recent_errors: list[str] = field(default_factory=list)
     started_at: float = field(default_factory=time.monotonic)
     interrupted: bool = False
@@ -124,10 +124,19 @@ class SessionState:
             )
         return False
 
-    def record_model_error(self, error: str, *, recovery_instruction: str | None = None) -> None:
+    def record_model_error(
+        self,
+        error: str,
+        *,
+        recovery_instruction: str | None = None,
+        count_as_empty: bool = True,
+    ) -> None:
         """Record an unusable model response and request a corrected response."""
         self.step_count += 1
-        self.empty_model_responses += 1
+        if count_as_empty:
+            self.empty_model_responses += 1
+        else:
+            self.empty_model_responses = 0
         self.recent_errors.append(error)
         self.recent_errors[:] = self.recent_errors[-5:]
         instruction = recovery_instruction or ("Return valid text or a valid function tool call.")
@@ -140,28 +149,19 @@ class SessionState:
 
     def record_tool_result(self, call: ToolCall, result: ToolResult) -> None:
         """Update counters and file-change state after one ordered tool call."""
-        self._record_tool_outcome(call, result, track_repetition=True)
+        self._record_tool_outcome(call, result)
         self.messages.append(result.as_tool_message(call.id))
 
     def record_automatic_tool_result(self, call: ToolCall, result: ToolResult) -> None:
         """Track a controller-scheduled tool without inventing an assistant Tool Call."""
-        self._record_tool_outcome(call, result, track_repetition=False)
+        self._record_tool_outcome(call, result)
 
     def _record_tool_outcome(
         self,
         call: ToolCall,
         result: ToolResult,
-        *,
-        track_repetition: bool,
     ) -> None:
         self.tool_call_count += 1
-        if track_repetition:
-            signature = self.tool_signature(call)
-            if signature == self.last_tool_signature:
-                self.repeated_tool_calls += 1
-            else:
-                self.last_tool_signature = signature
-                self.repeated_tool_calls = 1
 
         if result.ok:
             self.consecutive_failures = 0
@@ -182,30 +182,6 @@ class SessionState:
                     self.verification_results[check_id] = verification.model_copy(
                         update={"status": VerificationStatus.STALE}
                     )
-        if track_repetition and call.name == "run_command":
-            exit_code = (result.metadata or {}).get("exit_code")
-            if result.ok and exit_code == 0:
-                self.last_successful_command_signature = self.tool_signature(call)
-                self.last_successful_command_workspace_revision = self.workspace_revision
-            else:
-                self.last_successful_command_signature = None
-                self.last_successful_command_workspace_revision = None
-
-    @staticmethod
-    def tool_signature(call: ToolCall) -> str:
-        return json.dumps(
-            {"name": call.name, "arguments": call.arguments},
-            ensure_ascii=False,
-            sort_keys=True,
-            default=str,
-        )
-
-    def repeats_successful_command(self, call: ToolCall) -> bool:
-        return (
-            call.name == "run_command"
-            and self.last_successful_command_signature == self.tool_signature(call)
-            and self.last_successful_command_workspace_revision == self.workspace_revision
-        )
 
     def record_meaningful_progress(self, call: ToolCall, result: ToolResult) -> None:
         """Record a new successful observation without trusting model claims."""

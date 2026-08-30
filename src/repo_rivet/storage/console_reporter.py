@@ -120,6 +120,29 @@ class ConsoleEventReporter:
             self._action(data)
         elif event_type == "action_blocked":
             self._action_blocked(data)
+        elif event_type == "action_result_reused":
+            tool = self._safe(data.get("tool", "tool"), limit=80)
+            self._print_trace_label(
+                "REUSE",
+                f"{tool} · previous valid result reused; tool was not executed",
+                style="bold cyan",
+            )
+        elif event_type == "action_retry_scheduled":
+            tool = self._safe(data.get("tool", "tool"), limit=80)
+            attempt = self._safe(data.get("attempt", "?"), limit=10)
+            self._print_trace_label(
+                "RETRY",
+                f"{tool} · transient infrastructure failure · attempt {attempt}",
+                style="bold yellow",
+            )
+        elif event_type == "action_recovery_started":
+            tool = self._safe(data.get("tool", "tool"), limit=80)
+            reason = self._safe(data.get("reason_code", "action failed"), limit=120)
+            self._print_trace_label(
+                "RECOVER",
+                f"{tool} · {reason} · choose a distinct evidence-based action",
+                style="bold yellow",
+            )
         elif event_type == "observation":
             self._observation(data)
         elif event_type == "verification_result":

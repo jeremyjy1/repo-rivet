@@ -370,7 +370,7 @@ def test_search_result_makes_only_matching_line_editable(tmp_path: Path) -> None
     assert path.read_text(encoding="utf-8") == "first\nfound\nlast\n"
 
 
-def test_repeated_noop_triggers_loop_guard(tmp_path: Path) -> None:
+def test_repeated_noop_remains_a_stable_non_retryable_result(tmp_path: Path) -> None:
     path = tmp_path / "module.py"
     path.write_text("same\n", encoding="utf-8")
     snapshot_dir = tmp_path / "session" / "snapshots"
@@ -388,8 +388,10 @@ def test_repeated_noop_triggers_loop_guard(tmp_path: Path) -> None:
     third = resumed_edit.execute(request)
 
     assert first.error_code == "edit_noop"
-    assert second.error_code == "edit_noop" and "reread" in (second.error or "")
-    assert third.error_code == "edit_loop_detected" and third.retryable is False
+    assert second.error_code == "edit_noop"
+    assert third.error_code == "edit_noop"
+    assert first.retryable is False
+    assert second.error == first.error == third.error
 
 
 def test_unicode_line_separator_is_not_treated_as_a_file_line_break(tmp_path: Path) -> None:

@@ -916,6 +916,13 @@ def _print_session_details(
     modified = ", ".join(sorted(memory.modified_files)) or "none"
     details.append(f"Modified:  {_terminal_text(modified)}\n")
     details.append(f"Verification: {_terminal_text(memory.summary.verification_status)}")
+    if memory.runtime_v2 is not None:
+        details.append(f"\nRuntime:   {memory.runtime_v2.status.value}")
+        details.append(f"\nPhase:     {memory.runtime_v2.phase.value}")
+        if memory.runtime_v2.wait is not None:
+            details.append(f"\nWaiting:   {memory.runtime_v2.wait.kind.value}")
+        if memory.runtime_v2.recovery is not None:
+            details.append(f"\nRecovery:  {_terminal_text(memory.runtime_v2.recovery.reason_code)}")
     if memory.active_skill is not None:
         details.append(
             f"\nGlobal Skill: {memory.active_skill.id}"

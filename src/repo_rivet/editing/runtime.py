@@ -47,8 +47,6 @@ class EditingRuntime:
         self.event_logger = event_logger
         self.workspace_revision = initial_workspace_revision
         self._prepared: dict[str, PreparedEdit] = {}
-        self._noop_path = snapshot_dir / "noop-counts.json" if snapshot_dir is not None else None
-        self._noop_counts = self._load_noop_counts()
 
     def capture(
         self,
@@ -238,43 +236,14 @@ class EditingRuntime:
         self.workspace_revision += 1
         return self.workspace_revision
 
-    def _record_noop(self, key: str) -> None:
-        count = self._noop_counts.get(key, 0) + 1
-        self._noop_counts[key] = count
-        self._save_noop_counts()
-        if count >= 3:
-            raise EditError(
-                "edit_loop_detected",
-                "The same no-op edit was submitted three times; reread before editing again",
-                retryable=False,
-            )
-        message = "Edit result is byte-identical to the current file"
-        if count == 2:
-            message += "; reread the file before retrying"
-        raise EditError("edit_noop", message)
-
-    def _load_noop_counts(self) -> dict[str, int]:
-        if self._noop_path is None or not self._noop_path.exists():
-            return {}
-        try:
-            payload = json.loads(self._noop_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError, json.JSONDecodeError):
-            return {}
-        if not isinstance(payload, dict):
-            return {}
-        return {
-            key: value
-            for key, value in payload.items()
-            if isinstance(key, str) and isinstance(value, int) and value > 0
-        }
-
-    def _save_noop_counts(self) -> None:
-        if self._noop_path is None:
-            return
-        self._noop_path.parent.mkdir(parents=True, exist_ok=True)
-        atomic_replace_bytes(
-            self._noop_path,
-            (json.dumps(self._noop_counts, sort_keys=True, indent=2) + "\n").encode("utf-8"),
+    def _record_noop(self, _key: str) -> None:
+        raise EditError(
+            "edit_noop",
+            (
+                "Edit result is byte-identical to the current file; use the existing "
+                "observation and choose a different action"
+            ),
+            retryable=False,
         )
 
     @staticmethod

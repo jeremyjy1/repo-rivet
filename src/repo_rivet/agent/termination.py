@@ -12,7 +12,6 @@ class TerminationConfig:
     max_seconds: float = 600
     max_consecutive_failures: int = 5
     max_consecutive_protocol_failures: int = 5
-    max_repeated_tool_calls: int = 3
     max_empty_model_responses: int = 3
     max_consecutive_length_responses: int = 3
 
@@ -22,7 +21,6 @@ class TerminationConfig:
             "max_seconds": self.max_seconds,
             "max_consecutive_failures": self.max_consecutive_failures,
             "max_consecutive_protocol_failures": self.max_consecutive_protocol_failures,
-            "max_repeated_tool_calls": self.max_repeated_tool_calls,
             "max_empty_model_responses": self.max_empty_model_responses,
             "max_consecutive_length_responses": self.max_consecutive_length_responses,
         }
@@ -68,11 +66,6 @@ class TerminationPolicy:
             return (
                 "maximum consecutive action protocol failures reached "
                 f"({self.config.max_consecutive_protocol_failures})"
-            )
-        if state.repeated_tool_calls >= self.config.max_repeated_tool_calls:
-            return (
-                "repeated identical tool call limit reached "
-                f"({self.config.max_repeated_tool_calls})"
             )
         if state.empty_model_responses >= self.config.max_empty_model_responses:
             return (

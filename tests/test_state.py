@@ -16,7 +16,20 @@ def test_record_model_response_tracks_empty_responses() -> None:
     assert state.messages[1]["role"] == "assistant"
 
 
-def test_record_tool_result_tracks_changes_failures_and_repetition() -> None:
+def test_structured_tool_parse_error_is_not_counted_as_empty_response() -> None:
+    state = SessionState(task="edit app.py")
+
+    state.record_model_error(
+        "edit_file arguments contain invalid JSON",
+        recovery_instruction="Read the target and retry a bounded edit.",
+        count_as_empty=False,
+    )
+
+    assert state.step_count == 1
+    assert state.empty_model_responses == 0
+
+
+def test_record_tool_result_tracks_changes_and_failures() -> None:
     state = SessionState(task="task")
     call = ToolCall(
         id="call-1",
@@ -39,7 +52,6 @@ def test_record_tool_result_tracks_changes_failures_and_repetition() -> None:
     state.record_tool_result(call, ToolResult(ok=True, output="changed"))
 
     assert state.tool_call_count == 2
-    assert state.repeated_tool_calls == 2
     assert state.consecutive_failures == 0
     assert state.modified_files == {"app.py"}
     assert state.workspace_revision == 1
@@ -68,7 +80,7 @@ def test_only_new_successful_tool_observations_count_as_progress() -> None:
     assert not state.made_progress_since_checkpoint
 
 
-def test_controller_scheduled_tools_do_not_consume_model_repetition_budget() -> None:
+def test_controller_scheduled_tools_share_the_tool_count() -> None:
     state = SessionState(task="task")
     read = ToolCall(id="read", name="read_file", arguments={"path": "app.py"})
     automatic = ToolCall(
@@ -81,8 +93,6 @@ def test_controller_scheduled_tools_do_not_consume_model_repetition_budget() -> 
     state.record_automatic_tool_result(automatic, ToolResult(ok=True, output="failed"))
 
     assert state.tool_call_count == 2
-    assert state.last_tool_signature is not None
-    assert state.repeated_tool_calls == 1
 
 
 def test_failed_verification_does_not_count_as_meaningful_progress() -> None:

@@ -294,7 +294,7 @@ def test_read_decision_cannot_cover_mutation_in_same_turn() -> None:
         for message in memory.messages
         if message.tool_call_id in {"read-1", "write-1"}
     ]
-    assert all("actual tools were write_file" in payload for payload in tool_payloads)
+    assert all("at most one primary action" in payload.lower() for payload in tool_payloads)
 
 
 def test_matching_decision_executes_action_and_creates_executor_observation() -> None:
@@ -669,7 +669,7 @@ def test_final_assessment_meta_call_is_closed_before_the_next_model_request() ->
     )
 
 
-def test_failed_action_requires_reflection_before_another_mutation() -> None:
+def test_failed_action_blocks_identical_replay_but_allows_distinct_recovery() -> None:
     first = ToolCall(id="command-1", name="run_command", arguments={"command": "pytest -q"})
     blocked_call = ToolCall(
         id="command-2",
@@ -680,16 +680,6 @@ def test_failed_action_requires_reflection_before_another_mutation() -> None:
         id="command-3",
         name="run_command",
         arguments={"command": "pytest -q --maxfail=1"},
-    )
-    reflection = ToolCall(
-        id="reflection-1",
-        name="record_decision",
-        arguments={
-            "phase": "reflection",
-            "current_goal": "diagnose the failed test",
-            "summary": "The verification command failed, so inspect the failure before retrying.",
-            "evidence_refs": ["obs-failed"],
-        },
     )
     tools = FakeToolRegistry(
         [
@@ -703,7 +693,6 @@ def test_failed_action_requires_reflection_before_another_mutation() -> None:
             [
                 ModelResponse(tool_calls=[decision("decision-1", "run_command"), first]),
                 ModelResponse(tool_calls=[decision("decision-2", "run_command"), blocked_call]),
-                ModelResponse(tool_calls=[reflection]),
                 ModelResponse(tool_calls=[decision("decision-3", "run_command"), retry]),
                 ModelResponse(content="Verification recovered."),
             ]
@@ -719,7 +708,7 @@ def test_failed_action_requires_reflection_before_another_mutation() -> None:
     blocked_payload = next(
         message.content or "" for message in memory.messages if message.tool_call_id == "command-2"
     )
-    assert "Record a reflection in a separate turn" in blocked_payload
+    assert "recovery state forbids repeating" in blocked_payload
     assert not memory.reflection_required
 
 
@@ -765,4 +754,6 @@ def test_task_decision_cannot_bypass_independent_human_approval(tmp_path: Path) 
         event for event in memory.observation_events if event.tool_call_id == "write-1"
     )
     assert not write_observation.ok
-    assert memory.reflection_required
+    assert not memory.reflection_required
+    assert memory.runtime_v2 is not None
+    assert memory.runtime_v2.recovery is not None

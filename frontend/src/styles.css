@@ -88,6 +88,10 @@ button:focus-visible, textarea:focus-visible, select:focus-visible { outline: 2p
 .runbar > div { display: flex; align-items: center; gap: 8px; }
 .runbar svg { color: var(--accent); }
 .revision { color: var(--muted); font: 9px "JetBrains Mono", monospace; background: #191e27; border: 1px solid var(--border); border-radius: 10px; padding: 3px 6px; }
+.runtime-state { color: var(--muted); background: #191e27; border: 1px solid var(--border); border-radius: 999px; padding: 3px 8px; font: 9px "JetBrains Mono", monospace; white-space: nowrap; }
+.runtime-state.waiting { color: var(--amber); }
+.runtime-state.completed { color: var(--accent); }
+.runtime-state.blocked, .runtime-state.failed, .runtime-state.error { color: var(--red); }
 .plan-buttons button { display: flex; align-items: center; gap: 6px; border: 1px solid var(--border); border-radius: 7px; background: #181c24; color: #bec5d0; padding: 7px 10px; font-size: 11px; cursor: pointer; }
 .plan-buttons button:hover { border-color: #4b5668; color: white; }
 .error-banner { grid-row: 2; display: flex; align-items: center; gap: 8px; padding: 8px 15px; color: #ffc2c2; background: #3a1d23; border-bottom: 1px solid #67303b; font-size: 11px; }
@@ -141,7 +145,7 @@ button:focus-visible, textarea:focus-visible, select:focus-visible { outline: 2p
 .conversation-plan-steps { display: flex; flex-direction: column; gap: 7px; margin: 0; padding: 14px 16px; list-style: none; }
 .conversation-plan-steps li { display: grid; grid-template-columns: 25px minmax(0, 1fr); gap: 9px; align-items: start; }
 .conversation-plan-steps li > b { display: grid; place-items: center; width: 23px; height: 23px; color: #9ba6b5; background: #242b34; border-radius: 50%; font-size: 9px; }
-.conversation-plan-steps li.completed > b { color: #07120c; background: var(--accent); }
+.conversation-plan-steps li.completed > b, .conversation-plan-steps li.satisfied > b, .conversation-plan-steps li.skipped > b { color: #07120c; background: var(--accent); }
 .conversation-plan-steps li > b svg, .plan-step > b svg { display: block; }
 .conversation-plan-steps strong, .conversation-plan-steps small { display: block; overflow-wrap: anywhere; }.conversation-plan-steps strong { font-size: 11px; }.conversation-plan-steps small { margin-top: 3px; color: var(--muted); font: 9px/1.5 "JetBrains Mono", monospace; }
 .conversation-plan-verification, .conversation-plan-files { display: grid; grid-template-columns: 90px minmax(0, 1fr); gap: 9px; margin: 0 16px 9px; padding: 8px 10px; background: #101612; border: 1px solid #263c30; border-radius: 7px; font-size: 10px; }.conversation-plan-verification strong, .conversation-plan-files strong { color: #91a19a; }.conversation-plan-verification span, .conversation-plan-files span { overflow-wrap: anywhere; color: #c8d0cb; font-family: "JetBrains Mono", monospace; }
@@ -225,7 +229,7 @@ button:focus-visible, textarea:focus-visible, select:focus-visible { outline: 2p
 .plan-card { display: flex; flex-direction: column; gap: 7px; }
 .plan-status { display: flex; justify-content: space-between; gap: 10px; margin-bottom: 7px; font-size: 12px; }.plan-status span { color: var(--amber); font: 9px "JetBrains Mono", monospace; text-transform: uppercase; }
 .plan-step { display: grid; grid-template-columns: 24px minmax(0, 1fr); gap: 8px; padding: 9px; border: 1px solid #2b313d; background: #141820; border-radius: 7px; }
-.plan-step > b { display: grid; place-items: center; width: 22px; height: 22px; border-radius: 50%; color: #8f99a9; background: #242a35; font-size: 10px; }.plan-step.completed > b { color: #07120c; background: var(--accent); }
+.plan-step > b { display: grid; place-items: center; width: 22px; height: 22px; border-radius: 50%; color: #8f99a9; background: #242a35; font-size: 10px; }.plan-step.completed > b, .plan-step.satisfied > b, .plan-step.skipped > b { color: #07120c; background: var(--accent); }
 .plan-step strong, .plan-step small { display: block; }.plan-step strong { font-size: 11px; }.plan-step small { color: var(--muted); margin-top: 3px; font: 9px "JetBrains Mono", monospace; }
 .plan-buttons { display: flex; flex-wrap: wrap; margin: 8px 0; }.plan-buttons .primary, .approval-actions .primary { color: #07120c; background: var(--accent); border-color: var(--accent); }
 .plan-controls { min-width: 0; }.plan-instruction { margin: 8px 0 3px; padding: 10px; background: #11151c; border: 1px solid #2b3340; border-radius: 8px; }.plan-instruction label { color: #909baa; font-size: 10px; }.plan-instruction textarea { display: block; width: 100%; min-width: 0; min-height: 76px; margin-top: 7px; padding: 9px; overflow-x: hidden; overflow-wrap: anywhere; resize: vertical; color: #e3e7ed; background: #0c0f14; border: 1px solid #303846; border-radius: 7px; font-size: 11px; }.plan-instruction > div { display: flex; justify-content: flex-end; gap: 7px; margin-top: 8px; }.plan-instruction button { padding: 7px 9px; color: #bdc5d0; background: #1b2029; border: 1px solid #343c49; border-radius: 6px; font-size: 10px; cursor: pointer; }.plan-instruction button.primary { color: #07120c; background: var(--accent); border-color: var(--accent); }.plan-instruction button:disabled { opacity: .4; cursor: not-allowed; }
@@ -279,7 +283,7 @@ button:focus-visible, textarea:focus-visible, select:focus-visible { outline: 2p
 :root[data-theme="light"] .session-delete:hover { color: #a93441; background: #f9e5e8; }
 :root[data-theme="light"] .breadcrumb { color: #526071; background: #f5f7fa; border-color: #d8dee7; }
 :root[data-theme="light"] .file-list button { color: #445163; }
-:root[data-theme="light"] .revision, :root[data-theme="light"] .event-heading b { background: #eef1f5; }
+:root[data-theme="light"] .revision, :root[data-theme="light"] .runtime-state, :root[data-theme="light"] .event-heading b { background: #eef1f5; }
 :root[data-theme="light"] .run-actions button, :root[data-theme="light"] .plan-buttons button { color: #445163; background: #f7f8fa; }
 :root[data-theme="light"] .run-actions button:hover, :root[data-theme="light"] .plan-buttons button:hover { color: #202631; border-color: #9ca8b8; }
 :root[data-theme="light"] .run-actions .mode-button.plan, :root[data-theme="light"] .mode-notice { color: #8c5908; background: #fff7e9; border-color: #dfc48f; }
@@ -302,7 +306,7 @@ button:focus-visible, textarea:focus-visible, select:focus-visible { outline: 2p
 :root[data-theme="light"] .conversation-plan-header > span { background: #dcefe4; }
 :root[data-theme="light"] .conversation-plan.stale .conversation-plan-header > span { background: #f7e4bd; }
 :root[data-theme="light"] .conversation-plan-steps li > b { color: #536173; background: #e5eaf0; }
-:root[data-theme="light"] .conversation-plan-steps li.completed > b { color: var(--accent); background: #dcefe4; }
+:root[data-theme="light"] .conversation-plan-steps li.completed > b, :root[data-theme="light"] .conversation-plan-steps li.satisfied > b, :root[data-theme="light"] .conversation-plan-steps li.skipped > b { color: var(--accent); background: #dcefe4; }
 :root[data-theme="light"] .conversation-plan-verification, :root[data-theme="light"] .conversation-plan-files, :root[data-theme="light"] .conversation-plan-actions { color: #364352; background: #f7fbf8; border-color: #c8e0d1; }
 :root[data-theme="light"] .conversation-plan-verification span, :root[data-theme="light"] .conversation-plan-files span { color: #445163; }
 :root[data-theme="light"] .conversation-plan.stale .conversation-plan-actions { background: #fffaf1; border-color: #dfc48f; }
@@ -334,7 +338,7 @@ button:focus-visible, textarea:focus-visible, select:focus-visible { outline: 2p
 :root[data-theme="light"] .muted-card { border-color: #cbd3de; }
 :root[data-theme="light"] .plan-step { background: #f7f8fa; border-color: #d8dee7; }
 :root[data-theme="light"] .plan-step > b { color: #526071; background: #e4e9ef; }
-:root[data-theme="light"] .plan-step.completed > b { color: var(--accent); background: #dcefe4; }
+:root[data-theme="light"] .plan-step.completed > b, :root[data-theme="light"] .plan-step.satisfied > b, :root[data-theme="light"] .plan-step.skipped > b { color: var(--accent); background: #dcefe4; }
 :root[data-theme="light"] .plan-instruction { background: #f5f7fa; border-color: #d4dbe4; }
 :root[data-theme="light"] .plan-instruction textarea, :root[data-theme="light"] .guidance textarea { color: #202631; background: #ffffff; border-color: #cbd3de; }
 :root[data-theme="light"] .plan-instruction button { color: #445163; background: #ffffff; border-color: #cbd3de; }

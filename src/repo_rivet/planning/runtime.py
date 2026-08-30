@@ -89,6 +89,8 @@ class PlanRuntime:
         memory.plan_artifact = artifact
         memory.workflow_mode = WorkflowMode.PLAN_READY
         memory.plan_update_reason = update_reason
+        if memory.runtime_v2 is not None:
+            memory.runtime_v2.revisions.plan += 1
         return artifact
 
     def approve(self) -> PlanArtifact:
@@ -105,12 +107,18 @@ class PlanRuntime:
         if not artifact.execution_snapshots:
             artifact.execution_snapshots = dict(artifact.snapshots)
         for step in artifact.steps:
-            if step.status != PlanStepStatus.COMPLETED:
+            if step.status not in {
+                PlanStepStatus.COMPLETED,
+                PlanStepStatus.SATISFIED,
+                PlanStepStatus.SKIPPED,
+            }:
                 step.status = PlanStepStatus.PENDING
                 step.last_error = None
         memory.workflow_mode = WorkflowMode.EXECUTE
         memory.reflection_required = False
         memory.working.pending_actions.clear()
+        if memory.runtime_v2 is not None:
+            memory.runtime_v2.revisions.plan += 1
         return artifact
 
     def cancel(self) -> None:
@@ -118,6 +126,8 @@ class PlanRuntime:
         if memory.plan_artifact is not None:
             memory.plan_artifact.status = PlanStatus.CANCELLED
         memory.workflow_mode = WorkflowMode.EXECUTE
+        if memory.runtime_v2 is not None:
+            memory.runtime_v2.revisions.plan += 1
 
     def stale_reasons(self, artifact: PlanArtifact | None = None) -> list[str]:
         memory = self._memory()
@@ -243,7 +253,11 @@ class PlanRuntime:
 
     def start_action(self, call: ToolCall | None = None) -> PlanStep | None:
         step = self.matching_step(call) if call is not None else self._require_plan().current_step
-        if step is not None and step.status != PlanStepStatus.COMPLETED:
+        if step is not None and step.status not in {
+            PlanStepStatus.COMPLETED,
+            PlanStepStatus.SATISFIED,
+            PlanStepStatus.SKIPPED,
+        }:
             step.status = PlanStepStatus.RUNNING
         return step
 
@@ -258,7 +272,7 @@ class PlanRuntime:
         step = self.matching_step(call)
         if step is None:
             return
-        refinement = step.status == PlanStepStatus.COMPLETED
+        refinement = step.status in {PlanStepStatus.COMPLETED, PlanStepStatus.SATISFIED}
         if not refinement and step.status != PlanStepStatus.RUNNING:
             return
         passed = result.ok
@@ -322,7 +336,11 @@ class PlanRuntime:
                     else PlanStepStatus.FAILED
                 )
             step.last_error = result.error or "tool result did not satisfy the step"
-        if all(item.status == PlanStepStatus.COMPLETED for item in artifact.steps):
+        if all(
+            item.status
+            in {PlanStepStatus.COMPLETED, PlanStepStatus.SATISFIED, PlanStepStatus.SKIPPED}
+            for item in artifact.steps
+        ):
             artifact.status = PlanStatus.COMPLETED
 
     def _completed_file_refinement_step(
@@ -339,7 +357,7 @@ class PlanRuntime:
             (
                 step
                 for step in artifact.steps
-                if step.status == PlanStepStatus.COMPLETED
+                if step.status in {PlanStepStatus.COMPLETED, PlanStepStatus.SATISFIED}
                 and step.operation in {PlanOperation.CREATE, PlanOperation.EDIT}
                 and normalized_path in step.target_files
             ),

@@ -7,6 +7,11 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+MAX_EDIT_OPERATIONS = 10
+MAX_NEW_LINES_PER_OPERATION = 500
+RECOVERY_MAX_EDIT_OPERATIONS = 1
+RECOVERY_MAX_NEW_LINES = 40
+
 
 class EditError(ValueError):
     """Expected edit rejection with a stable machine-readable code."""
@@ -55,7 +60,10 @@ class VisibleRange(BaseModel):
 class _NewLinesOperation(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    new_lines: list[str] = Field(default_factory=list, max_length=10_000)
+    new_lines: list[str] = Field(
+        default_factory=list,
+        max_length=MAX_NEW_LINES_PER_OPERATION,
+    )
 
     @model_validator(mode="after")
     def validate_lines(self) -> _NewLinesOperation:
@@ -119,7 +127,7 @@ class EditFileArguments(BaseModel):
 
     path: str
     snapshot_id: str = Field(min_length=64, max_length=64, pattern=r"^[a-f0-9]{64}$")
-    operations: list[EditOperation] = Field(min_length=1, max_length=50)
+    operations: list[EditOperation] = Field(min_length=1, max_length=MAX_EDIT_OPERATIONS)
 
 
 class TextSplice(BaseModel):

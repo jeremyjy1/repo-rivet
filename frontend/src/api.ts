@@ -43,6 +43,14 @@ export type SessionDetail = SessionSummary & {
   verification: Record<string, any>;
   modified_files: string[];
   workspace_revision: number;
+  runtime: {
+    run_id: string;
+    status: string;
+    phase: string;
+    wait: { kind: string; correlation_id: string; resume_phase: string } | null;
+    current_action: { action_id: string; tool_name: string; status: string } | null;
+    recovery: { reason_code: string; failed_action_id: string | null } | null;
+  } | null;
   last_event_seq: number;
   run: {
     status: string;

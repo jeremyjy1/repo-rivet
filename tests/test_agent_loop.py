@@ -3,9 +3,11 @@ from pathlib import Path
 from typing import cast
 
 from repo_rivet.agent.controller import AgentController
+from repo_rivet.agent.runtime_state import AgentRuntimeState
 from repo_rivet.agent.state import SessionState
 from repo_rivet.agent.termination import TerminationConfig, TerminationPolicy
 from repo_rivet.approval.models import ApprovalMode
+from repo_rivet.editing.models import EditFileArguments
 from repo_rivet.llm.base import ModelContextLengthError, ModelResponse, ModelStreamInterrupted
 from repo_rivet.llm.openai_compatible import ModelRequestError
 from repo_rivet.llm.parser import ResponseParseError
@@ -181,6 +183,31 @@ def test_agent_executes_tool_then_returns_final_text() -> None:
     assert result.summary == "Done."
     assert result.step_count == 2
     assert result.tool_call_count == 1
+
+
+def test_model_wait_state_is_not_persisted_as_session_status(tmp_path: Path) -> None:
+    class RecordingMemoryStore(MemoryStore):
+        def __init__(self, session_dir: Path) -> None:
+            super().__init__(session_dir)
+            self.saved_statuses: list[str] = []
+
+        def save_state(self, memory: MemoryState, **runtime_state: object) -> None:
+            self.saved_statuses.append(str(runtime_state.get("status", memory.status)))
+            super().save_state(memory, **runtime_state)
+
+    store = RecordingMemoryStore(tmp_path / "session")
+    model = FakeModelClient([ModelResponse(content="Done.")])
+    agent = AgentController(
+        model_client=model,
+        tool_registry=cast(ToolRegistry, FakeToolRegistry([])),
+        memory_store=store,
+    )
+
+    result = agent.run("inspect the project")
+
+    assert result.status == "success"
+    assert "waiting" not in store.saved_statuses
+    assert store.load_state().status == "completed"
 
 
 def test_reasoning_effort_is_selected_by_task_phase_with_configured_ceiling() -> None:
@@ -459,7 +486,7 @@ def test_failed_automatic_verification_requires_repair_before_same_revision_retr
         for message in model.requests[3]["messages"]
         if message.get("role") == "tool" and message.get("tool_call_id") == "repeat"
     )
-    assert "Do not rerun it before relevant workspace changes" in str(blocked.get("content"))
+    assert "Do not rerun it before a relevant workspace change" in str(blocked.get("content"))
     assert any(
         event_type == "verification_repair_required" and data.get("check_id") == "tests"
         for event_type, data in events.events
@@ -565,7 +592,6 @@ def test_inconclusive_verification_requires_direct_complete_plan_revision() -> N
     result = controller(
         model,
         tools,
-        termination=TerminationPolicy(TerminationConfig(max_repeated_tool_calls=2)),
     ).run("validate the scripts", memory=memory)
 
     assert result.status == "success"
@@ -781,13 +807,11 @@ def test_file_change_without_verification_plan_is_blocked_before_execution() -> 
     write = call("1", "write_file", {"path": "app.py", "content": "new"})
     model = FakeModelClient(
         [
-            ModelResponse(tool_calls=[decision("d1", "write_file"), write]),
+            ModelResponse(tool_calls=[decision("d1", "write_file")]),
+            ModelResponse(tool_calls=[write]),
+            ModelResponse(tool_calls=[verification_plan()]),
             ModelResponse(
-                tool_calls=[
-                    verification_plan(),
-                    decision("d2", "write_file"),
-                    call("2", "write_file", {"path": "app.py", "content": "new"}),
-                ]
+                tool_calls=[call("2", "write_file", {"path": "app.py", "content": "new"})]
             ),
             ModelResponse(content="Implemented and verified."),
         ]
@@ -803,7 +827,7 @@ def test_file_change_without_verification_plan_is_blocked_before_execution() -> 
     result = controller(model, tools).run("fix the bug", memory=memory)
 
     assert result.status == "success"
-    assert len(model.requests) == 3
+    assert len(model.requests) == 5
     assert [executed.name for executed in tools.calls] == ["write_file", "run_verification"]
     blocked_result = next(
         message
@@ -811,6 +835,7 @@ def test_file_change_without_verification_plan_is_blocked_before_execution() -> 
         if message.role == "tool" and message.tool_call_id == "1"
     )
     assert "verification_plan_missing" in (blocked_result.content or "")
+    assert memory.verification_plan_recovery_decision is None
 
 
 def test_resumed_missing_plan_recovery_allows_protocol_correction() -> None:
@@ -861,7 +886,6 @@ def test_run_verification_without_plan_recovers_before_execution() -> None:
     result = controller(
         model,
         tools,
-        termination=TerminationPolicy(TerminationConfig(max_repeated_tool_calls=2)),
         event_logger=events,
     ).run("verify the current project", memory=memory)
 
@@ -1142,17 +1166,39 @@ def test_missing_durable_reasoning_for_tool_history_restarts_thinking_context() 
     validate_tool_call_protocol(model.requests[0]["messages"])
 
 
-def test_agent_stops_repeated_identical_tool_calls() -> None:
-    repeated = call("1", "read_file", {"path": "app.py"})
-    model = FakeModelClient([ModelResponse(tool_calls=[repeated])] * 3)
-    tools = FakeToolRegistry([ToolResult(ok=True, output="content")] * 3)
-    termination = TerminationPolicy(TerminationConfig(max_repeated_tool_calls=3))
+def test_agent_reuses_repeated_identical_read_without_executing_again() -> None:
+    model = FakeModelClient(
+        [
+            ModelResponse(tool_calls=[call("1", "read_file", {"path": "app.py"})]),
+            ModelResponse(tool_calls=[call("2", "read_file", {"path": "app.py"})]),
+            ModelResponse(tool_calls=[call("3", "read_file", {"path": "app.py"})]),
+            ModelResponse(content="Inspection complete."),
+        ]
+    )
+    tools = FakeToolRegistry(
+        [
+            ToolResult(
+                ok=True,
+                output="content",
+                metadata={
+                    "path": "app.py",
+                    "sha256": "content-sha",
+                    "snapshot_id": "snapshot-app",
+                },
+            )
+        ]
+    )
+    events = RecordingSink()
 
-    result = controller(model, tools, termination=termination).run("inspect")
+    result = controller(
+        model,
+        tools,
+        event_logger=events,
+    ).run("inspect")
 
-    assert result.status == "stopped"
-    assert "repeated identical tool call" in (result.reason or "")
-    assert result.tool_call_count == 3
+    assert result.status == "success"
+    assert len(tools.calls) == 1
+    assert sum(name == "action_result_reused" for name, _ in events.events) == 2
 
 
 def test_successful_command_is_not_executed_twice_at_same_workspace_revision() -> None:
@@ -1193,7 +1239,7 @@ def test_successful_command_is_not_executed_twice_at_same_workspace_revision() -
         name == "tool_result" and data.get("error_code") == "duplicate_successful_command"
         for name, data in events.events
     )
-    assert any(name == "duplicate_successful_command_suppressed" for name, _ in events.events)
+    assert any(name == "action_result_reused" for name, _ in events.events)
     assert {schema["function"]["name"] for schema in model.requests[2]["tools"]} == set()
 
 
@@ -1225,9 +1271,10 @@ def test_stale_edit_snapshot_is_refreshed_without_consuming_repetition_budget() 
     )
     tools = FakeToolRegistry([refreshed])
     agent = controller(FakeModelClient([]), tools)
-    state = SessionState(task="update Board")
-    state.repeated_tool_calls = 2
-    state.last_tool_signature = "stale-edit"
+    state = SessionState(
+        task="update Board",
+        runtime=AgentRuntimeState.create("stale-edit-recovery"),
+    )
     memory = MemoryState(session_id="stale-edit-recovery")
     edit = call(
         "stale-edit",
@@ -1247,8 +1294,15 @@ def test_stale_edit_snapshot_is_refreshed_without_consuming_repetition_budget() 
     )
 
     terminal = agent._record_action_result(edit, stale, state=state, memory=memory)
+    recovery_terminal = agent._recover_stale_edit_snapshot(
+        edit,
+        stale,
+        state=state,
+        memory=memory,
+    )
 
     assert terminal is None
+    assert recovery_terminal is None
     assert len(tools.calls) == 1
     assert tools.calls[0].name == "read_file"
     assert tools.calls[0].arguments == {
@@ -1256,8 +1310,6 @@ def test_stale_edit_snapshot_is_refreshed_without_consuming_repetition_budget() 
         "start_line": 50,
         "end_line": 349,
     }
-    assert state.repeated_tool_calls == 0
-    assert state.last_tool_signature is None
     assert state.consecutive_failures == 0
     assert state.reflection_required is False
     assert memory.current_snapshots["src/Board.cpp"] == fresh_snapshot
@@ -1356,6 +1408,75 @@ def test_agent_replaces_truncated_whole_file_edit_with_bounded_recovery() -> Non
     assert invalid_event["recovery"] == "bounded_edit"
     assert invalid_event["pending_decision_cancelled"] is True
     assert invalid_event["argument_chars"] == 27_952
+
+
+def test_malformed_edit_enters_controller_enforced_read_then_bounded_recovery() -> None:
+    class RecoverySchemaRegistry(FakeToolRegistry):
+        def schemas(self) -> list[dict[str, object]]:
+            return [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "description": "Read a file range.",
+                        "parameters": {"type": "object"},
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "edit_file",
+                        "description": "Edit a file.",
+                        "parameters": EditFileArguments.model_json_schema(),
+                    },
+                },
+            ]
+
+    parse_error = ResponseParseError(
+        "Tool call edit_file contains invalid JSON arguments: Expecting ',' delimiter",
+        code="invalid_tool_arguments_json",
+        tool_name="edit_file",
+        argument_chars=2_178,
+    )
+    read = call(
+        "read-recovery",
+        "read_file",
+        {"path": "app.py", "start_line": 1, "end_line": 20},
+    )
+    model = FakeModelClient(
+        [parse_error, ModelResponse(tool_calls=[read]), ModelResponse(content="Recovered.")]
+    )
+    model.reasoning_effort_ceiling = "max"  # type: ignore[attr-defined]
+    events = RecordingSink()
+    agent = AgentController(
+        model_client=model,
+        tool_registry=cast(
+            ToolRegistry,
+            RecoverySchemaRegistry([ToolResult(ok=True, output="x")]),
+        ),
+        event_logger=events,
+    )
+
+    result = agent.run("edit app.py")
+
+    assert result.status == "success"
+    assert [item["function"]["name"] for item in model.requests[1]["tools"]] == ["read_file"]
+    assert model.requests[1]["options"].reasoning_effort == "high"
+    recovery_schema = next(
+        item["function"]
+        for item in model.requests[2]["tools"]
+        if item["function"]["name"] == "edit_file"
+    )
+    parameters = recovery_schema["parameters"]
+    assert parameters["properties"]["operations"]["maxItems"] == 1
+    assert {
+        definition["properties"]["new_lines"]["maxItems"]
+        for definition in parameters["$defs"].values()
+        if "new_lines" in definition["properties"]
+    } == {40}
+    invalid = next(data for name, data in events.events if name == "model_response_invalid")
+    assert invalid["requires_read"] is True
+    assert invalid["recovery_attempt"] == 1
 
 
 def test_agent_returns_error_after_model_client_retries_fail() -> None:

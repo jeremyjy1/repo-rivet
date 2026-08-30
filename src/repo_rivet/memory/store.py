@@ -159,6 +159,9 @@ class MemoryStore:
         if changed:
             memory.context_checkpoint = None
             memory.workspace_revision += 1
+            if memory.runtime_v2 is not None:
+                memory.runtime_v2.revisions.workspace = memory.workspace_revision
+                memory.runtime_v2.revisions.knowledge += 1
             for check_id, result in list(memory.verification_results.items()):
                 if result.status != VerificationStatus.STALE:
                     memory.verification_results[check_id] = result.model_copy(
@@ -224,8 +227,26 @@ class MemoryStore:
                 )
             return "Tool call was not started before interruption and was not retried."
 
+        runtime_results = {
+            action.tool_call_id: action.result
+            for action in (
+                memory.runtime_v2.actions.values() if memory.runtime_v2 is not None else ()
+            )
+            if action.result is not None and not action.result_applied
+        }
+
+        def persisted_result(call_id: str, _name: str) -> Message | None:
+            result = runtime_results.get(call_id)
+            if result is None:
+                return None
+            return Message.from_chat_message(
+                result.to_result().as_tool_message(call_id),
+                step=memory.tool_event_step,
+            )
+
         missing, orphan_results = memory.repair_interrupted_tool_history(
-            error_for=interruption_error
+            error_for=interruption_error,
+            result_for=persisted_result,
         )
         for call_id, name in missing:
             started.setdefault(call_id, name)
@@ -233,7 +254,9 @@ class MemoryStore:
         uncertain = [
             call_id
             for call_id in event_started
-            if call_id not in event_finished and started.get(call_id) != "record_decision"
+            if call_id not in event_finished
+            and call_id not in runtime_results
+            and started.get(call_id) != "record_decision"
         ]
         if not missing_results and not uncertain and not orphan_results:
             return []

@@ -79,6 +79,7 @@ const sessionRefreshEvents = new Set([
   "approval.requested",
   "approval.awaiting.human",
   "approval.resolved",
+  "action.recovery.started",
   "external.files.changed",
   "plan.approved",
   "plan.cancelled",
@@ -97,6 +98,7 @@ const sessionRefreshEvents = new Set([
 const hiddenTimelineEvents = new Set([
   "model.call.finished",
   "model.stream.progress",
+  "runtime.transition",
   "run.finished",
   "web.run.finished",
 ]);
@@ -365,7 +367,15 @@ function App() {
 
       <main className="main-pane">
         <div className="runbar">
-          <div><Bot size={18} /><strong>{session?.name || "No session selected"}</strong>{session && <span className="revision">rev {session.workspace_revision}</span>}</div>
+          <div>
+            <Bot size={18} />
+            <strong>{session?.name || "No session selected"}</strong>
+            {session && <span className="revision">rev {session.workspace_revision}</span>}
+            {session?.runtime && <span className={`runtime-state ${session.runtime.status}`} title={`Run ${session.runtime.run_id}`}>
+              {humanize(session.runtime.phase)}
+              {session.runtime.wait ? ` · waiting for ${humanize(session.runtime.wait.kind)}` : ""}
+            </span>}
+          </div>
         </div>
         {error && <div className="error-banner"><ShieldAlert size={16} />{error}<button onClick={() => setError("")}>×</button></div>}
         <Timeline session={session} isRunning={isRunning} pendingApprovalId={approval?.request_id || null} invoke={invoke} onRefresh={refreshSession} />
@@ -1030,6 +1040,24 @@ function presentEvent(event: AgentEvent, pendingApprovalId: string | null): Even
     }
     case "assessment":
       return { title: "Assessment", summary, detail: stringList(payload.changes).length ? `changes: ${stringList(payload.changes).join(", ")}` : "" };
+    case "action.result.reused":
+      return {
+        title: "Previous result reused",
+        summary: `${humanize(textValue(payload.tool) || "tool")} was not executed again`,
+        detail: humanize(textValue(payload.disposition) || "valid result"),
+      };
+    case "action.retry.scheduled":
+      return {
+        title: "Transient action retry",
+        summary: `${humanize(textValue(payload.tool) || "tool")} · attempt ${textValue(payload.attempt)}`,
+        detail: humanize(textValue(payload.error_code)),
+      };
+    case "action.recovery.started":
+      return {
+        title: "Recovery started",
+        summary: `${humanize(textValue(payload.tool) || "action")} needs a different next action`,
+        detail: humanize(textValue(payload.reason_code)),
+      };
     case "auto.plan.started":
       return { title: "Automatic planning", summary: "Entered read-only Plan Mode", detail: clipped(textValue(payload.reason)) };
     case "auto.plan.review.started":
@@ -1252,8 +1280,9 @@ const PlanResultCard = memo(function PlanResultCard({ session, invoke, refresh }
 });
 
 function PlanStepMarker({ index, status }: { index: number; status: string }) {
-  return <b aria-label={status === "completed" ? `Step ${index + 1} completed` : `Step ${index + 1}: ${status}`}>
-    {status === "completed" ? <Check size={13} strokeWidth={3} /> : index + 1}
+  const satisfied = ["completed", "satisfied", "skipped"].includes(status);
+  return <b aria-label={satisfied ? `Step ${index + 1} ${status}` : `Step ${index + 1}: ${status}`}>
+    {satisfied ? <Check size={13} strokeWidth={3} /> : index + 1}
   </b>;
 }
 
