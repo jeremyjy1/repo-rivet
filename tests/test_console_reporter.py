@@ -31,12 +31,16 @@ class RecordingStatus:
     def __init__(self) -> None:
         self.started = False
         self.stopped = False
+        self.message = ""
 
     def start(self) -> None:
         self.started = True
 
     def stop(self) -> None:
         self.stopped = True
+
+    def update(self, message: str) -> None:
+        self.message = message
 
 
 def test_console_reporter_shows_transient_status_while_model_generates(
@@ -66,6 +70,30 @@ def test_console_reporter_shows_transient_status_while_model_generates(
 
     assert status.stopped is True
     assert reporter._active_status is None
+    assert buffer.getvalue() == ""
+
+
+def test_console_reporter_updates_model_status_with_safe_reasoning_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    buffer = StringIO()
+    console = Console(file=buffer, force_terminal=False, color_system=None, width=240)
+    reporter = ConsoleEventReporter(console)
+    status = RecordingStatus()
+
+    monkeypatch.setattr(console, "status", lambda _message, *, spinner: status)
+
+    reporter.log("model_call", step=1)
+    reporter.log(
+        "model_stream_progress",
+        activity_phase="evaluating_options",
+        elapsed_seconds=24.2,
+        reasoning_chars=10_000,
+    )
+
+    assert "analyzing context" in status.message
+    assert "evaluating the next action" in status.message
+    assert "24s" in status.message
     assert buffer.getvalue() == ""
 
 

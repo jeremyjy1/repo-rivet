@@ -3,7 +3,7 @@
 import json
 import re
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any, Protocol, cast
@@ -11,7 +11,12 @@ from typing import Any, Protocol, cast
 from openai import OpenAI
 
 from repo_rivet.config import ApiConfig
-from repo_rivet.llm.base import ModelContextLengthError, ModelRequestOptions, ModelResponse
+from repo_rivet.llm.base import (
+    ModelContextLengthError,
+    ModelRequestOptions,
+    ModelResponse,
+    ModelStreamInterrupted,
+)
 from repo_rivet.llm.parser import ResponseParseError, ResponseParser
 from repo_rivet.llm.protocol import find_pending_tool_calls, validate_tool_call_protocol
 from repo_rivet.verification.models import ModelErrorRecord
@@ -21,6 +26,11 @@ _INLINE_SECRET_PATTERN = re.compile(
     r"(\s*[:=]\s*)(?:bearer\s+)?[^\s,;]+"
 )
 _STREAM_PROGRESS_INTERVAL_SECONDS = 2.0
+_REASONING_EFFORT_ORDER = ("low", "high", "max")
+
+
+class ModelReasoningStalled(RuntimeError):
+    """A stream produced private reasoning but no actionable response for too long."""
 
 
 class EventSink(Protocol):
@@ -33,18 +43,6 @@ class ModelRequestError(RuntimeError):
     def __init__(self, record: ModelErrorRecord) -> None:
         super().__init__(record.message)
         self.record = record
-
-
-class ReasoningStreamStalled(RuntimeError):
-    """A stream produced excessive hidden reasoning without an actionable response."""
-
-    def __init__(self, *, elapsed_seconds: float, reasoning_chars: int) -> None:
-        super().__init__(
-            "Model stream produced only hidden reasoning for "
-            f"{elapsed_seconds:.1f}s ({reasoning_chars} characters)"
-        )
-        self.elapsed_seconds = elapsed_seconds
-        self.reasoning_chars = reasoning_chars
 
 
 class OpenAICompatibleClient:
@@ -67,6 +65,16 @@ class OpenAICompatibleClient:
         )
         self._parser = parser or ResponseParser()
         self._event_logger = event_logger
+        self._interrupt_checker: Callable[[], bool] | None = None
+
+    def set_interrupt_checker(self, checker: Callable[[], bool] | None) -> None:
+        """Install a cheap thread-safe check used to abandon an in-flight stream."""
+        self._interrupt_checker = checker
+
+    @property
+    def reasoning_effort_ceiling(self) -> str:
+        """Expose the configured controller ceiling without leaking provider credentials."""
+        return self._config.reasoning_effort
 
     def complete(
         self,
@@ -91,37 +99,48 @@ class OpenAICompatibleClient:
         provider_thinking_disabled = thinking_enabled is False
         reasoning_context_restart_required = False
         max_attempts = self._config.max_retries + 1
-        reasoning_recovery_used = False
+        reasoning_protocol_recovery_used = False
         for attempt in range(1, max_attempts + 1):
             try:
                 while True:
                     try:
+                        self._raise_if_interrupted()
                         stream = self._create_stream(
                             messages=messages,
                             tools=tools,
                             provider_options=provider_options,
                             attempt=attempt,
                         )
-                        parsed, usage = self._consume_stream(stream, attempt=attempt)
-                    except ReasoningStreamStalled as error:
-                        if reasoning_recovery_used:
-                            raise
-                        reasoning_recovery_used = True
-                        provider_options = _disable_provider_thinking(provider_options)
-                        provider_thinking_disabled = True
-                        reasoning_context_restart_required = True
-                        self._log(
-                            "model_stream_reasoning_recovery",
+                        parsed, usage = self._consume_stream(
+                            stream,
                             attempt=attempt,
-                            elapsed_seconds=round(error.elapsed_seconds, 1),
-                            reasoning_chars=error.reasoning_chars,
-                            recovery="restart_with_thinking_disabled",
+                            reasoning_effort=reasoning_effort,
+                        )
+                    except ModelReasoningStalled as error:
+                        lower_effort = _lower_reasoning_effort(reasoning_effort)
+                        if lower_effort is None:
+                            raise
+                        previous_effort = reasoning_effort
+                        reasoning_effort = lower_effort
+                        provider_options["reasoning_effort"] = lower_effort
+                        self._log(
+                            "model_reasoning_effort_downgraded",
+                            attempt=attempt,
+                            previous_effort=previous_effort,
+                            reasoning_effort=lower_effort,
+                            elapsed_seconds=error.args[0],
+                            reason="no actionable stream output",
                         )
                         continue
+                    except ModelStreamInterrupted:
+                        raise
                     except Exception as error:
-                        if not _reasoning_content_replay_required(error) or reasoning_recovery_used:
+                        if (
+                            not _reasoning_content_replay_required(error)
+                            or reasoning_protocol_recovery_used
+                        ):
                             raise
-                        reasoning_recovery_used = True
+                        reasoning_protocol_recovery_used = True
                         provider_options = _disable_provider_thinking(provider_options)
                         provider_thinking_disabled = True
                         reasoning_context_restart_required = True
@@ -134,9 +153,13 @@ class OpenAICompatibleClient:
                         continue
                     break
                 break
+            except ModelStreamInterrupted:
+                raise
             except ResponseParseError:
                 raise
             except Exception as error:
+                if self._interrupted():
+                    raise ModelStreamInterrupted("model stream redirected by user") from error
                 if _is_context_length_error(error):
                     raise ModelContextLengthError("Provider context limit exceeded") from error
                 retryable = _is_retryable_error(error)
@@ -199,7 +222,13 @@ class OpenAICompatibleClient:
             )
             return self._client.chat.completions.create(**request)
 
-    def _consume_stream(self, stream: Any, *, attempt: int) -> tuple[ModelResponse, Any]:
+    def _consume_stream(
+        self,
+        stream: Any,
+        *,
+        attempt: int,
+        reasoning_effort: str | None,
+    ) -> tuple[ModelResponse, Any]:
         started_at = time.monotonic()
         last_progress_at = started_at
         chunk_count = 0
@@ -212,6 +241,7 @@ class OpenAICompatibleClient:
         usage: Any = None
 
         for chunk in _iter_stream_and_close(stream):
+            self._raise_if_interrupted()
             chunk_count += 1
             chunk_usage = getattr(chunk, "usage", None)
             if chunk_usage is not None:
@@ -243,19 +273,20 @@ class OpenAICompatibleClient:
                             fallback_index=fallback_index,
                         )
 
-            elapsed_seconds = time.monotonic() - started_at
-            if (
-                reasoning_chars >= self._config.reasoning_stall_chars
-                and elapsed_seconds >= self._config.reasoning_stall_seconds
-                and content_chars == 0
-                and not tool_fragments
-            ):
-                raise ReasoningStreamStalled(
-                    elapsed_seconds=elapsed_seconds,
-                    reasoning_chars=reasoning_chars,
-                )
-
             now = time.monotonic()
+            elapsed_seconds = now - started_at
+            tool_argument_chars = sum(
+                len("".join(fragment["arguments"]))
+                for fragment in tool_fragments.values()
+            )
+            if (
+                reasoning_chars
+                and not content_chars
+                and not tool_argument_chars
+                and reasoning_effort in {"high", "max"}
+                and elapsed_seconds >= self._config.reasoning_stall_seconds
+            ):
+                raise ModelReasoningStalled(round(elapsed_seconds, 1))
             if chunk_count == 1 or now - last_progress_at >= _STREAM_PROGRESS_INTERVAL_SECONDS:
                 self._log_stream_progress(
                     attempt=attempt,
@@ -264,9 +295,11 @@ class OpenAICompatibleClient:
                     content_parts=content_parts,
                     reasoning_parts=reasoning_parts,
                     tool_fragments=tool_fragments,
+                    reasoning_effort=reasoning_effort,
                 )
                 last_progress_at = now
 
+        self._raise_if_interrupted()
         if chunk_count == 0:
             raise ResponseParseError("Model stream contained no chunks")
         self._log_stream_progress(
@@ -276,6 +309,7 @@ class OpenAICompatibleClient:
             content_parts=content_parts,
             reasoning_parts=reasoning_parts,
             tool_fragments=tool_fragments,
+            reasoning_effort=reasoning_effort,
             completed=True,
         )
         response = _assembled_stream_response(
@@ -286,6 +320,14 @@ class OpenAICompatibleClient:
         )
         return self._parser.parse(response), usage
 
+    def _raise_if_interrupted(self) -> None:
+        if self._interrupted():
+            raise ModelStreamInterrupted("model stream redirected by user")
+
+    def _interrupted(self) -> bool:
+        checker = self._interrupt_checker
+        return checker is not None and checker()
+
     def _log_stream_progress(
         self,
         *,
@@ -295,24 +337,67 @@ class OpenAICompatibleClient:
         content_parts: list[str],
         reasoning_parts: list[str],
         tool_fragments: dict[int, dict[str, Any]],
+        reasoning_effort: str | None,
         completed: bool = False,
     ) -> None:
+        content_chars = sum(len(part) for part in content_parts)
+        reasoning_chars = sum(len(part) for part in reasoning_parts)
+        tool_argument_chars = sum(
+            len("".join(fragment["arguments"])) for fragment in tool_fragments.values()
+        )
         self._log(
             "model_stream_progress",
             attempt=attempt,
             elapsed_seconds=round(time.monotonic() - started_at, 1),
             chunk_count=chunk_count,
-            content_chars=sum(len(part) for part in content_parts),
-            reasoning_chars=sum(len(part) for part in reasoning_parts),
-            tool_argument_chars=sum(
-                len("".join(fragment["arguments"])) for fragment in tool_fragments.values()
+            content_chars=content_chars,
+            reasoning_chars=reasoning_chars,
+            tool_argument_chars=tool_argument_chars,
+            activity_phase=_stream_activity_phase(
+                content_chars=content_chars,
+                reasoning_chars=reasoning_chars,
+                tool_argument_chars=tool_argument_chars,
+                completed=completed,
             ),
+            reasoning_effort=reasoning_effort,
             completed=completed,
         )
 
     def _log(self, event_type: str, **data: Any) -> None:
         if self._event_logger is not None:
             self._event_logger.log(event_type, **data)
+
+
+def _stream_activity_phase(
+    *,
+    content_chars: int,
+    reasoning_chars: int,
+    tool_argument_chars: int,
+    completed: bool,
+) -> str:
+    """Describe stream progress without exposing provider-private reasoning text."""
+    if completed:
+        return "completed"
+    if tool_argument_chars:
+        return "preparing_tool"
+    if content_chars:
+        return "composing_answer"
+    if reasoning_chars >= 20_000:
+        return "refining_action"
+    if reasoning_chars >= 8_000:
+        return "evaluating_options"
+    if reasoning_chars >= 2_000:
+        return "analyzing_context"
+    if reasoning_chars:
+        return "understanding_task"
+    return "waiting"
+
+
+def _lower_reasoning_effort(effort: str | None) -> str | None:
+    if effort not in _REASONING_EFFORT_ORDER:
+        return None
+    index = _REASONING_EFFORT_ORDER.index(effort)
+    return _REASONING_EFFORT_ORDER[index - 1] if index else None
 
 
 def _stream_reasoning_text(delta: Any) -> str | None:

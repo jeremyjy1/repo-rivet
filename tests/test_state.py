@@ -68,6 +68,42 @@ def test_only_new_successful_tool_observations_count_as_progress() -> None:
     assert not state.made_progress_since_checkpoint
 
 
+def test_controller_scheduled_tools_do_not_consume_model_repetition_budget() -> None:
+    state = SessionState(task="task")
+    read = ToolCall(id="read", name="read_file", arguments={"path": "app.py"})
+    automatic = ToolCall(
+        id="automatic",
+        name="run_verification",
+        arguments={"check_id": "tests"},
+    )
+
+    state.record_tool_result(read, ToolResult(ok=True, output="content"))
+    state.record_automatic_tool_result(automatic, ToolResult(ok=True, output="failed"))
+
+    assert state.tool_call_count == 2
+    assert state.last_tool_signature is not None
+    assert state.repeated_tool_calls == 1
+
+
+def test_failed_verification_does_not_count_as_meaningful_progress() -> None:
+    state = SessionState(task="task")
+    verification = ToolCall(
+        id="verify",
+        name="run_verification",
+        arguments={"check_id": "tests"},
+    )
+    failed = ToolResult(
+        ok=True,
+        output="tests failed",
+        metadata={"verification_result": {"status": "failed"}},
+    )
+
+    state.record_tool_result(verification, failed)
+
+    assert state.progress_revision == 0
+    assert not state.made_progress_since_checkpoint
+
+
 def test_delete_path_counts_as_a_workspace_modification() -> None:
     state = SessionState(task="task")
     call = ToolCall(id="delete-1", name="delete_path", arguments={"path": "generated"})

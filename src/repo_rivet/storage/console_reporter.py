@@ -49,6 +49,20 @@ _TOOL_PROGRESS_LABELS = {
     "search_text": "searching workspace text",
     "write_file": "creating file",
 }
+_MODEL_ACTIVITY_LABELS = {
+    "waiting": "Waiting for model output",
+    "understanding_task": "Understanding the task",
+    "analyzing_context": "Understanding the task › analyzing context and constraints",
+    "evaluating_options": (
+        "Understanding the task › analyzing context › evaluating the next action"
+    ),
+    "refining_action": (
+        "Understanding the task › analyzing context › evaluating options › refining the action"
+    ),
+    "composing_answer": "Composing the answer",
+    "preparing_tool": "Preparing a structured tool request",
+    "completed": "Finishing the model response",
+}
 _STATUS_STOP_EVENTS = {
     "approved_tool_executed",
     "approval_awaiting_human",
@@ -83,6 +97,10 @@ class ConsoleEventReporter:
 
         if event_type == "model_call":
             self._start_model_status()
+        elif event_type == "model_stream_progress":
+            self._update_model_status(data)
+        elif event_type == "model_reasoning_effort_downgraded":
+            self._reasoning_effort_downgraded(data)
         elif event_type == "auto_plan_review_started":
             self._start_status("[cyan]Evaluating whether Plan Mode is needed…[/cyan]")
         elif event_type == "llm_approval_review_started":
@@ -240,6 +258,30 @@ class ConsoleEventReporter:
 
     def _start_model_status(self) -> None:
         self._start_status("[cyan]Model is generating the next action…[/cyan]")
+
+    def _update_model_status(self, data: dict[str, Any]) -> None:
+        phase = self._safe(data.get("activity_phase", "waiting"), limit=40)
+        label = _MODEL_ACTIVITY_LABELS.get(phase, _MODEL_ACTIVITY_LABELS["waiting"])
+        elapsed = data.get("elapsed_seconds")
+        timing = f" · {self._format_elapsed(elapsed)}" if isinstance(elapsed, (int, float)) else ""
+        message = f"[cyan]{label}{timing}…[/cyan]"
+        if self._active_status is None:
+            self._start_status(message)
+            return
+        self._active_status.update(message)
+
+    def _reasoning_effort_downgraded(self, data: dict[str, Any]) -> None:
+        effort = self._safe(data.get("reasoning_effort", "lower"), limit=20)
+        self._start_status(
+            f"[cyan]No actionable response yet; retrying with {effort} reasoning…[/cyan]"
+        )
+
+    @staticmethod
+    def _format_elapsed(seconds: float) -> str:
+        if seconds < 60:
+            return f"{seconds:.1f}s" if seconds < 10 else f"{seconds:.0f}s"
+        minutes, remainder = divmod(int(seconds), 60)
+        return f"{minutes}m {remainder:02d}s"
 
     def _start_status(self, message: str) -> None:
         self._stop_status()

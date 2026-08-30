@@ -46,6 +46,7 @@ class SubmitRequest(BaseModel):
     skill: str | None = Field(default=None, max_length=100)
     no_skills: bool = False
     auto_plan: AutoPlanMode | None = None
+    delivery: Literal["redirect", "queue"] = "redirect"
 
 
 class ApprovalDecisionRequest(BaseModel):
@@ -198,6 +199,7 @@ def create_app(
             skill=payload.skill,
             no_skills=payload.no_skills,
             auto_plan=payload.auto_plan,
+            delivery=payload.delivery,
         )
 
     @app.post("/api/v1/sessions/{session_id}/stop", dependencies=[Depends(require_write)])

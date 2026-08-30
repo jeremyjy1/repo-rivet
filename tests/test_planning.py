@@ -562,6 +562,88 @@ def test_stale_previous_step_tool_triggers_controller_scheduled_plan_check(
     assert scheduled["check_ids"] == ["tests"]
 
 
+def test_failed_controller_plan_check_blocks_same_revision_model_retry(
+    tmp_path: Path,
+) -> None:
+    memory = inspected_memory(tmp_path)
+    registry = create_default_registry(tmp_path)
+    registry.plan_runtime.bind(memory)
+    payload = plan_payload(operation="command")
+    steps = payload["steps"]
+    assert isinstance(steps, list)
+    steps[0]["target_files"] = []  # type: ignore[index]
+    artifact = registry.plan_runtime.submit({"plan": payload})
+    registry.plan_runtime.approve()
+    registry.verification_runtime.bind(memory)
+    registry.verification_runtime.register_plan(
+        {
+            "requirements": ["tests"],
+            "checks": [
+                {
+                    "check_id": "tests",
+                    "title": "Failing registered command",
+                    "kind": "test",
+                    "command": {"program": "false", "args": [], "cwd": "."},
+                    "criteria": {"expected_exit_codes": [0]},
+                    "required": True,
+                    "provenance": "model",
+                }
+            ],
+        }
+    )
+    stale_edit = ToolCall(
+        id="stale-edit",
+        name="edit_file",
+        arguments={"path": "app.py", "snapshot_id": "old", "operations": []},
+    )
+    repeated = ToolCall(
+        id="repeat-check",
+        name="run_command",
+        arguments={"command": "false", "cwd": ".", "timeout_seconds": 60},
+    )
+    repair_plan = ToolCall(
+        id="repair-plan",
+        name="update_plan",
+        arguments={
+            "reason": "The registered test failed and requires a source repair.",
+            "plan": plan_payload(),
+        },
+    )
+
+    class RecordingSink:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, dict[str, object]]] = []
+
+        def log(self, event_type: str, **data: object) -> None:
+            self.events.append((event_type, data))
+
+    events = RecordingSink()
+    result = AgentController(
+        model_client=FakeModelClient(
+                [
+                    ModelResponse(tool_calls=[stale_edit]),
+                    ModelResponse(tool_calls=[repeated]),
+                    ModelResponse(tool_calls=[repair_plan]),
+                ]
+        ),
+        tool_registry=registry,
+        event_logger=events,
+    ).run("Continue the approved plan", memory=memory)
+
+    assert result.status == "plan_ready"
+    assert artifact.current_step is not None
+    assert artifact.current_step.status == PlanStepStatus.FAILED
+    assert memory.plan_artifact is not None
+    assert memory.plan_artifact.status == PlanStatus.READY
+    blocked = [data for name, data in events.events if name == "action_blocked"]
+    assert [item["error_code"] for item in blocked] == [
+        "plan_step_violation",
+        "verification_retry_without_change",
+    ]
+    assert sum(name == "verification_result" for name, _ in events.events) == 1
+    assert any(name == "verification_repair_required" for name, _ in events.events)
+
+
 def test_plan_update_preserves_completed_steps_and_clears_old_reflection(
     tmp_path: Path,
 ) -> None:

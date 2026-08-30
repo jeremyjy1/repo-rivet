@@ -37,6 +37,7 @@ type Bootstrap = {
 type FileEntry = { name: string; path: string; kind: "file" | "directory"; size: number | null };
 type Skill = { id: string; name: string; description: string; version: string; source: string };
 type Theme = "dark" | "light";
+type RunDelivery = "redirect" | "queue";
 
 function initialTheme(): Theme {
   const stored = localStorage.getItem("reporivet-theme");
@@ -68,6 +69,7 @@ const sessionRefreshEvents = new Set([
   "auto.plan.started",
   "run.finished",
   "session.start",
+  "user.input",
   "verification.result",
   "web.run.finished",
 ]);
@@ -108,10 +110,13 @@ function App() {
   const [theme, setTheme] = useState<Theme>(initialTheme);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
+  const creatingSession = useRef<Promise<string> | null>(null);
+  const selectedSessionId = useRef<string | null>(null);
 
   const refreshSession = useCallback(async (sessionId?: string | null) => {
     if (!sessionId) return;
     const detail = await api<SessionDetail>(`/api/v1/sessions/${sessionId}`);
+    selectedSessionId.current = detail.session_id;
     setSession(detail);
     if (detail.approval_mode) setApprovalMode(detail.approval_mode);
   }, []);
@@ -158,26 +163,48 @@ function App() {
     catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
   }, []);
 
-  const createSession = () => invoke(async () => {
+  const createAndSelectSession = useCallback(async () => {
     const created = await api<SessionSummary>("/api/v1/sessions", { method: "POST", body: JSON.stringify({}) });
+    selectedSessionId.current = created.session_id;
     const data = await api<Bootstrap>("/api/v1/bootstrap");
     setBoot(data);
     await refreshSession(created.session_id);
-  });
+    return created.session_id;
+  }, [refreshSession]);
+
+  const createSession = () => invoke(async () => { await createAndSelectSession(); });
+
+  const ensureSession = useCallback(async () => {
+    if (selectedSessionId.current) return selectedSessionId.current;
+    if (!creatingSession.current) {
+      creatingSession.current = createAndSelectSession().finally(() => {
+        creatingSession.current = null;
+      });
+    }
+    return creatingSession.current;
+  }, [createAndSelectSession]);
 
   const selectSession = (id: string) => invoke(async () => {
     await api(`/api/v1/sessions/${id}/use`, { method: "POST", body: "{}" });
     await refreshSession(id);
   });
 
-  const submit = (task: string) => invoke(async () => {
-    if (!session) return;
-    await api(`/api/v1/sessions/${session.session_id}/runs`, {
-      method: "POST",
-      body: JSON.stringify({ task, mode, approval_mode: approvalMode, auto_plan: autoPlan, skill: selectedSkill || null }),
-    });
-    await refreshSession(session.session_id);
-  });
+  const submit = async (task: string, delivery: RunDelivery) => {
+    setError("");
+    try {
+      const sessionId = await ensureSession();
+      await api(`/api/v1/sessions/${sessionId}/runs`, {
+        method: "POST",
+        body: JSON.stringify({ task, mode, approval_mode: approvalMode, auto_plan: autoPlan, skill: selectedSkill || null, delivery }),
+      });
+      const data = await api<Bootstrap>("/api/v1/bootstrap");
+      setBoot(data);
+      await refreshSession(sessionId);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+      throw cause;
+    }
+  };
 
   const openDirectory = (path: string) => invoke(async () => {
     setCurrentDir(path);
@@ -234,7 +261,7 @@ function App() {
         {error && <div className="error-banner"><ShieldAlert size={16} />{error}<button onClick={() => setError("")}>×</button></div>}
         <Timeline session={session} isRunning={isRunning} pendingApprovalId={approval?.request_id || null} invoke={invoke} onRefresh={refreshSession} />
         <Composer
-          disabled={!session}
+          disabled={false}
           isRunning={isRunning}
           mode={mode}
           setMode={setMode}
@@ -250,6 +277,7 @@ function App() {
           selectedSkill={selectedSkill}
           setSelectedSkill={setSelectedSkill}
           settings={boot.settings}
+          onActivate={() => { void invoke(async () => { await ensureSession(); }); }}
           onStop={() => invoke(() => api(`/api/v1/sessions/${session!.session_id}/stop`, { method: "POST", body: "{}" }))}
           onSubmit={submit}
         />
@@ -300,7 +328,7 @@ const Timeline = memo(function Timeline({ session, isRunning, pendingApprovalId,
     "model.error",
     "model.stream.progress",
     "model.stream.retry",
-    "model.stream.reasoning.recovery",
+    "model.reasoning.effort.downgraded",
     "model.reasoning.protocol.recovery",
     "auto.plan.review.started",
     "auto.plan.review.completed",
@@ -313,8 +341,10 @@ const Timeline = memo(function Timeline({ session, isRunning, pendingApprovalId,
   if (latestModelActivity?.type === "model.stream.progress") {
     const elapsed = numberValue(latestModelActivity.payload.elapsed_seconds);
     const contentChars = numberValue(latestModelActivity.payload.content_chars);
-    const reasoningChars = numberValue(latestModelActivity.payload.reasoning_chars);
     const toolChars = numberValue(latestModelActivity.payload.tool_argument_chars);
+    const phase = textValue(latestModelActivity.payload.activity_phase);
+    const reasoningEffort = textValue(latestModelActivity.payload.reasoning_effort);
+    const effortLabel = reasoningEffort ? ` · ${reasoningEffort} reasoning` : "";
     const elapsedLabel = elapsed !== null ? ` · ${formatElapsed(elapsed)}` : "";
     if (latestModelActivity.payload.completed === true) {
       workingLabel = "Finishing streamed model response";
@@ -322,15 +352,15 @@ const Timeline = memo(function Timeline({ session, isRunning, pendingApprovalId,
       workingLabel = `Receiving tool request · ${toolChars.toLocaleString()} characters${elapsedLabel}`;
     } else if (contentChars !== null && contentChars > 0) {
       workingLabel = `Receiving answer · ${contentChars.toLocaleString()} characters${elapsedLabel}`;
-    } else if (reasoningChars !== null && reasoningChars > 0) {
-      workingLabel = `Model is reasoning${elapsedLabel}`;
+    } else if (phase && phase !== "waiting") {
+      workingLabel = `Model reasoning${effortLabel} · ${reasoningProgressLabel(phase)}${elapsedLabel}`;
     } else {
       workingLabel = `Waiting for model output${elapsedLabel}`;
     }
-  } else if (latestModelActivity?.type === "model.stream.reasoning.recovery") {
-    workingLabel = "Hidden reasoning stalled · retrying this request directly";
   } else if (latestModelActivity?.type === "model.reasoning.protocol.recovery") {
     workingLabel = "Provider reasoning state was not replayable · retrying this request directly";
+  } else if (latestModelActivity?.type === "model.reasoning.effort.downgraded") {
+    workingLabel = `No actionable response yet · retrying with ${textValue(latestModelActivity.payload.reasoning_effort) || "lower"} reasoning`;
   } else if (latestModelActivity?.type === "auto.plan.review.started") {
     workingLabel = "Evaluating whether Plan Mode is needed";
   } else if (latestModelActivity?.type === "auto.plan.review.completed") {
@@ -370,7 +400,9 @@ const Timeline = memo(function Timeline({ session, isRunning, pendingApprovalId,
       if (timeline && timeline.scrollHeight - timeline.scrollTop - timeline.clientHeight < 160) {
         stickToBottom.current = true;
       }
-      if (event.type === "session.start") stickToBottom.current = true;
+      if (event.type === "session.start" || event.type === "user.input") {
+        stickToBottom.current = true;
+      }
       setEvents((current) => mergeEvents(current, [event]));
       if (shouldRefreshSession(event.type)) {
         window.clearTimeout(refreshTimer);
@@ -465,7 +497,7 @@ const MessageBlock = memo(function MessageBlock({ message }: { message: SessionD
   </article>;
 }, (previous, next) => previous.message.role === next.message.role && previous.message.content === next.message.content && previous.message.step === next.message.step);
 
-const Composer = memo(function Composer({ disabled, isRunning, mode, setMode, planReady, autoPlan, setAutoPlan, approvalMode, setApprovalMode, skills, selectedSkill, setSelectedSkill, settings, onStop, onSubmit }: {
+const Composer = memo(function Composer({ disabled, isRunning, mode, setMode, planReady, autoPlan, setAutoPlan, approvalMode, setApprovalMode, skills, selectedSkill, setSelectedSkill, settings, onActivate, onStop, onSubmit }: {
   disabled: boolean;
   isRunning: boolean;
   mode: "execute" | "planning";
@@ -479,31 +511,44 @@ const Composer = memo(function Composer({ disabled, isRunning, mode, setMode, pl
   selectedSkill: string;
   setSelectedSkill: (skill: string) => void;
   settings: Bootstrap["settings"];
+  onActivate: () => void;
   onStop: () => Promise<void> | void;
-  onSubmit: (task: string) => Promise<void> | void;
+  onSubmit: (task: string, delivery: RunDelivery) => Promise<void> | void;
 }) {
   const [value, setValue] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [delivery, setDelivery] = useState<RunDelivery>("redirect");
   const send = async () => {
     const task = value.trim();
-    if (!task || disabled || isRunning) return;
-    setValue("");
-    await onSubmit(task);
+    if (!task || disabled || submitting) return;
+    setSubmitting(true);
+    try {
+      await onSubmit(task, delivery);
+      setValue((current) => current.trim() === task ? "" : current);
+    }
+    catch { /* The app-level submit handler preserves and displays the error. */ }
+    finally { setSubmitting(false); }
   };
+  const stopsRun = isRunning && !value.trim();
+  const sendLabel = isRunning
+    ? delivery === "redirect" ? "Redirect current run" : "Queue follow-up"
+    : "Send prompt";
   return <div className="composer-wrap">
     <div className="composer-shell">
       <div className="composer-input">
-        <textarea value={value} disabled={disabled || isRunning} onChange={(event) => setValue(event.target.value)} onKeyDown={(event) => {
+        <textarea value={value} disabled={disabled} onFocus={onActivate} onChange={(event) => setValue(event.target.value)} onKeyDown={(event) => {
           if (event.key === "Enter" && !event.shiftKey) {
             event.preventDefault();
             void send();
           }
-        }} placeholder={mode === "planning" ? "Ask RepoRivet to inspect and prepare a plan…" : "Describe what you want to change…"} />
-        <button className={`send-button ${isRunning ? "stop" : ""}`} aria-label={isRunning ? "Stop current run" : "Send prompt"} title={isRunning ? "Stop current run" : "Send prompt"} disabled={disabled || (!isRunning && !value.trim())} onClick={() => void (isRunning ? onStop() : send())}>{isRunning ? <CircleStop size={18} /> : <Send size={18} />}</button>
-        <div className="composer-meta"><span>Enter to send · Shift+Enter for newline</span><span>{value.length.toLocaleString()} chars</span></div>
+        }} placeholder={isRunning ? delivery === "redirect" ? "Redirect the current run now…" : "Queue a follow-up for after the current task…" : mode === "planning" ? "Ask RepoRivet to inspect and prepare a plan…" : "Describe what you want to change…"} />
+        <button className={`send-button ${stopsRun ? "stop" : ""}`} aria-label={stopsRun ? "Stop current run" : sendLabel} title={stopsRun ? "Stop current run" : sendLabel} disabled={disabled || submitting || (!isRunning && !value.trim())} onClick={() => void (stopsRun ? onStop() : send())}>{stopsRun ? <CircleStop size={18} /> : submitting ? <LoaderCircle className="spin" size={18} /> : <Send size={18} />}</button>
+        <div className="composer-meta"><span>{isRunning ? delivery === "redirect" ? "Enter to redirect · clear the field to stop" : "Enter to queue · clear the field to stop" : "Enter to send · Shift+Enter for newline"}</span><span>{value.length.toLocaleString()} chars</span></div>
       </div>
       <div className="composer-toolbar">
         <div className="composer-controls">
           <span className="composer-settings-icon" title="Request settings"><Settings2 size={13} /></span>
+          {isRunning && <label className="composer-control" title="Choose whether this message interrupts the current model response or waits for the current task to finish"><MessageSquareText size={13} /><select aria-label="Message delivery" value={delivery} onChange={(event) => setDelivery(event.target.value as RunDelivery)}><option value="redirect">Redirect now</option><option value="queue">Queue next</option></select></label>}
           <label className={`composer-control ${mode === "planning" ? "plan" : ""}`} title="Workflow mode">{mode === "planning" ? <ListChecks size={13} /> : <Hammer size={13} />}<select aria-label="Workflow mode" value={mode} disabled={planReady} onChange={(event) => setMode(event.target.value as "execute" | "planning")}><option value="execute">Execute</option><option value="planning">{planReady ? "Plan ready" : "Plan"}</option></select></label>
           <label className="composer-control" title={settings.auto_plan_llm ? "Automatic planning · Adaptive uses an isolated LLM classifier" : "Automatic planning · LLM classifier disabled"}><RefreshCw size={13} /><select aria-label="Automatic planning" value={autoPlan} onChange={(event) => setAutoPlan(event.target.value as "off" | "adaptive" | "always")}><option value="adaptive">Adaptive plan</option><option value="always">Plan first</option><option value="off">No auto plan</option></select></label>
           <label className="composer-control" title="Approval mode"><ShieldAlert size={13} /><select aria-label="Approval mode" value={approvalMode} onChange={(event) => setApprovalMode(event.target.value)}><option value="safe-auto">Safe auto</option><option value="llm-auto">LLM auto</option><option value="always-ask">Always ask</option><option value="allow-all">Allow all</option></select></label>
@@ -515,7 +560,7 @@ const Composer = memo(function Composer({ disabled, isRunning, mode, setMode, pl
   </div>;
 });
 
-function EmptyState() { return <div className="empty-state"><div className="empty-icon"><GitBranch size={30} /></div><h2>Build with evidence</h2><p>Create or select a session, then ask RepoRivet to inspect, plan, edit, and verify your workspace.</p></div>; }
+function EmptyState() { return <div className="empty-state"><div className="empty-icon"><GitBranch size={30} /></div><h2>Build with evidence</h2><p>Click the composer to start a new conversation, or select an existing session from the sidebar.</p></div>; }
 
 type EventPresentation = { title: string; summary: string; detail: string };
 
@@ -534,6 +579,19 @@ function formatElapsed(seconds: number): string {
   const minutes = Math.floor(seconds / 60);
   const remainder = Math.floor(seconds % 60);
   return `${minutes}m ${remainder.toString().padStart(2, "0")}s`;
+}
+
+function reasoningProgressLabel(phase: string): string {
+  const labels: Record<string, string> = {
+    understanding_task: "understanding the task",
+    analyzing_context: "understanding the task › analyzing context and constraints",
+    evaluating_options: "understanding the task › analyzing context › evaluating the next action",
+    refining_action: "understanding the task › analyzing context › evaluating options › refining the action",
+    composing_answer: "composing the answer",
+    preparing_tool: "preparing a structured tool request",
+    completed: "finishing the response",
+  };
+  return labels[phase] || "working through the request";
 }
 
 function recordValue(value: unknown): Record<string, unknown> {
@@ -725,12 +783,18 @@ function presentEvent(event: AgentEvent, pendingApprovalId: string | null): Even
       const reasons = stringList(payload.reasons);
       return { title: `Verification · ${check}`, summary: humanize(textValue(payload.status) || "completed"), detail: reasons.join(" · ") };
     }
-    case "model.call":
+    case "model.call": {
+      const effort = textValue(payload.reasoning_effort);
+      const ceiling = textValue(payload.reasoning_effort_ceiling);
       return {
         title: "Model request",
         summary: numberValue(payload.message_count) !== null ? `${numberValue(payload.message_count)} messages` : "Preparing the next model action",
-        detail: numberValue(payload.effective_estimated_prompt_tokens) !== null ? `${numberValue(payload.effective_estimated_prompt_tokens)!.toLocaleString()} estimated prompt tokens` : "",
+        detail: [
+          numberValue(payload.effective_estimated_prompt_tokens) !== null ? `${numberValue(payload.effective_estimated_prompt_tokens)!.toLocaleString()} estimated prompt tokens` : "",
+          effort ? `${effort} reasoning${ceiling ? ` · ${ceiling} ceiling` : ""}` : "",
+        ].filter(Boolean).join(" · "),
       };
+    }
     case "model.response": {
       const tools = stringList(payload.tools);
       return { title: "Model response", summary: tools.length ? `Requested ${tools.map(humanize).join(", ")}` : humanize(textValue(payload.finish_reason) || "Response received"), detail: "" };
@@ -750,26 +814,27 @@ function presentEvent(event: AgentEvent, pendingApprovalId: string | null): Even
     }
     case "model.response.continuation":
       return { title: "Recovering truncated response", summary: payload.thinking_disabled === true ? "Restarting with provider thinking disabled" : "Continuing the model response", detail: "" };
+    case "user.input":
+      return { title: "Follow-up queued", summary: clipped(textValue(payload.task)), detail: "Starts after the current task finishes" };
+    case "model.redirected":
+      return { title: "Direction changed", summary: "Stopped the previous model response and continued with your latest instruction", detail: "" };
     case "model.stream.retry":
       return {
         title: "Retrying model stream",
         summary: `${humanize(textValue(payload.error_type) || "stream interrupted")} · attempt ${textValue(payload.attempt)}/${textValue(payload.max_attempts)}`,
         detail: numberValue(payload.delay_seconds) !== null ? `Retrying in ${numberValue(payload.delay_seconds)} seconds` : "",
       };
-    case "model.stream.reasoning.recovery":
-      return {
-        title: "Recovering stalled reasoning",
-        summary: "Retrying this request without thinking; the next turn restarts thinking context",
-        detail: [
-          numberValue(payload.elapsed_seconds) !== null ? formatElapsed(numberValue(payload.elapsed_seconds)!) : "",
-          numberValue(payload.reasoning_chars) !== null ? `${numberValue(payload.reasoning_chars)!.toLocaleString()} hidden reasoning characters discarded` : "",
-        ].filter(Boolean).join(" · "),
-      };
     case "model.reasoning.protocol.recovery":
       return {
         title: "Recovering provider reasoning protocol",
         summary: "Retrying this request without thinking; the next turn restarts thinking context",
         detail: humanize(textValue(payload.error_type)),
+      };
+    case "model.reasoning.effort.downgraded":
+      return {
+        title: "Reasoning effort reduced",
+        summary: `No actionable response arrived in ${formatElapsed(numberValue(payload.elapsed_seconds) || 0)}; retrying at ${textValue(payload.reasoning_effort) || "a lower tier"}`,
+        detail: `${textValue(payload.previous_effort) || "higher"} → ${textValue(payload.reasoning_effort) || "lower"}`,
       };
     case "model.stream.usage.unavailable":
       return {
@@ -792,9 +857,9 @@ function presentEvent(event: AgentEvent, pendingApprovalId: string | null): Even
 }
 
 const EventCard = memo(function EventCard({ event, pendingApprovalId }: { event: AgentEvent; pendingApprovalId: string | null }) {
-  if (event.type === "session.start") {
+  if (event.type === "session.start" || (event.type === "user.input" && textValue(event.payload.delivery) === "redirect")) {
     const task = textValue(event.payload.task);
-    return <article className="message user timeline-user-message"><div className="message-label"><span>YOU</span><time>{new Date(event.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</time></div><ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml>{task}</ReactMarkdown></article>;
+    return <article className="message user timeline-user-message"><div className="message-label"><span>{event.type === "user.input" ? "YOU · REDIRECT" : "YOU"}</span><time>{new Date(event.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</time></div><ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml>{task}</ReactMarkdown></article>;
   }
   const isTool = event.type.startsWith("tool.");
   const presentation = presentEvent(event, pendingApprovalId);

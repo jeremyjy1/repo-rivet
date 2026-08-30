@@ -3,13 +3,15 @@ from pathlib import Path
 from typing import cast
 
 from repo_rivet.agent.controller import AgentController
+from repo_rivet.agent.state import SessionState
 from repo_rivet.agent.termination import TerminationConfig, TerminationPolicy
-from repo_rivet.llm.base import ModelContextLengthError, ModelResponse
+from repo_rivet.llm.base import ModelContextLengthError, ModelResponse, ModelStreamInterrupted
 from repo_rivet.llm.openai_compatible import ModelRequestError
 from repo_rivet.llm.parser import ResponseParseError
 from repo_rivet.llm.protocol import validate_tool_call_protocol
 from repo_rivet.memory.models import MemoryState, Message
 from repo_rivet.memory.store import MemoryStore
+from repo_rivet.planning.models import WorkflowMode
 from repo_rivet.tools.base import ToolCall, ToolResult
 from repo_rivet.tools.registry import ToolRegistry
 from repo_rivet.verification.models import ModelErrorRecord
@@ -79,6 +81,26 @@ def passed_verification_result(*, check_id: str = "tests", revision: int = 1) ->
                 "workspace_revision": revision,
                 "exit_code": 0,
                 "reasons": ["all registered success criteria passed"],
+                "started_at": now,
+                "finished_at": now,
+            },
+        },
+    )
+
+
+def failed_verification_result(*, check_id: str = "tests", revision: int = 1) -> ToolResult:
+    now = datetime.now(UTC).isoformat()
+    return ToolResult(
+        ok=True,
+        output="tests failed",
+        metadata={
+            "exit_code": 1,
+            "verification_result": {
+                "check_id": check_id,
+                "status": "failed",
+                "workspace_revision": revision,
+                "exit_code": 1,
+                "reasons": ["exit code 1 was not one of [0]"],
                 "started_at": now,
                 "finished_at": now,
             },
@@ -160,6 +182,24 @@ def test_agent_executes_tool_then_returns_final_text() -> None:
     assert result.tool_call_count == 1
 
 
+def test_reasoning_effort_is_selected_by_task_phase_with_configured_ceiling() -> None:
+    model = FakeModelClient([])
+    model.reasoning_effort_ceiling = "high"  # type: ignore[attr-defined]
+    agent = controller(model, FakeToolRegistry([]))
+
+    routine = agent._model_request_options(SessionState(task="edit one file"))
+    planning = agent._model_request_options(
+        SessionState(task="design a refactor", workflow_mode=WorkflowMode.PLANNING)
+    )
+    recovery = agent._model_request_options(
+        SessionState(task="repair a failure", reflection_required=True)
+    )
+
+    assert routine and routine.reasoning_effort == "low"
+    assert planning and planning.reasoning_effort == "high"
+    assert recovery and recovery.reasoning_effort == "high"
+
+
 def test_long_final_response_is_bounded_only_in_assessment_memory() -> None:
     summary = "Detailed result. " + ("x" * 2_500)
     model = FakeModelClient([ModelResponse(content=summary)])
@@ -197,6 +237,40 @@ def test_empty_model_response_is_replaced_with_local_feedback() -> None:
         or bool((message.get("content") or "").strip() or message.get("tool_calls"))
         for message in second_history
     )
+
+
+def test_user_redirect_restarts_current_model_turn_without_ending_run() -> None:
+    model = FakeModelClient(
+        [
+            ModelStreamInterrupted("redirected"),
+            ModelResponse(content="Changed direction and completed."),
+        ]
+    )
+    memory = MemoryState(session_id="redirected-run")
+    events = RecordingSink()
+    agent = controller(model, FakeToolRegistry([]), event_logger=events)
+    source_calls = 0
+
+    def steering_source() -> list[str]:
+        nonlocal source_calls
+        source_calls += 1
+        return ["Use C++ instead."] if source_calls == 2 else []
+
+    agent.set_steering_source(steering_source)
+    result = agent.run("Use JavaScript.", memory=memory)
+
+    assert result.status == "success"
+    assert result.summary == "Changed direction and completed."
+    assert [message.content for message in memory.messages if message.role == "user"] == [
+        "Use JavaScript.",
+        "Use C++ instead.",
+    ]
+    assert "Use C++ instead." in [
+        message["content"]
+        for message in model.requests[1]["messages"]
+        if message["role"] == "user"
+    ]
+    assert any(name == "model_redirected" for name, _data in events.events)
 
 
 def test_interrupted_tool_call_is_closed_before_same_process_continues(tmp_path: Path) -> None:
@@ -334,6 +408,45 @@ def test_agent_automatically_runs_registered_checks_before_finishing() -> None:
     assert result.verification_status.value == "passed"
     assert [item.name for item in tools.calls] == ["write_file", "run_verification"]
     assert len(model.requests) == 2
+
+
+def test_failed_automatic_verification_requires_repair_before_same_revision_retry() -> None:
+    write = call("write", "write_file", {"path": "app.py", "content": "new"})
+    repeated_check = call("repeat", "run_verification", {"check_id": "tests"})
+    model = FakeModelClient(
+        [
+            ModelResponse(tool_calls=[verification_plan(), decision("d1", "write_file"), write]),
+            ModelResponse(content="Implementation is ready for verification."),
+            ModelResponse(tool_calls=[repeated_check]),
+            ModelResponse(content="The failing test requires a source repair first."),
+        ]
+    )
+    tools = FakeToolRegistry(
+        [
+            ToolResult(ok=True, output="written"),
+            failed_verification_result(),
+        ]
+    )
+    events = RecordingSink()
+
+    result = controller(model, tools, event_logger=events).run("fix the bug")
+
+    assert result.status == "incomplete"
+    assert [item.name for item in tools.calls] == ["write_file", "run_verification"]
+    blocked = next(
+        message
+        for message in model.requests[3]["messages"]
+        if message.get("role") == "tool" and message.get("tool_call_id") == "repeat"
+    )
+    assert "Do not rerun it before relevant workspace changes" in str(blocked.get("content"))
+    assert any(
+        event_type == "verification_repair_required" and data.get("check_id") == "tests"
+        for event_type, data in events.events
+    )
+    assert any(
+        "verification_failed" in str(message.get("content"))
+        for message in model.requests[2]["messages"]
+    )
 
 
 def test_started_verification_runs_remaining_required_checks_without_model_round_trips() -> None:

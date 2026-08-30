@@ -38,12 +38,11 @@ class ApiConfig(BaseModel):
     model: str = Field(min_length=1)
     context_window_tokens: int = Field(ge=1_000)
     thinking_mode: Literal["provider_default", "enabled", "disabled"] = "provider_default"
-    reasoning_effort: Literal["low", "high", "max"] | None = None
+    reasoning_effort: Literal["low", "high", "max"] = "max"
+    reasoning_stall_seconds: float = Field(default=45, gt=0, le=300)
     tokenizer_encoding: str | None = Field(default=None, min_length=1)
     timeout_seconds: float = Field(default=60, gt=0, le=600)
     max_retries: int = Field(default=3, ge=0, le=10)
-    reasoning_stall_seconds: float = Field(default=20, ge=0, le=600)
-    reasoning_stall_chars: int = Field(default=12_000, ge=100, le=1_000_000)
 
     @field_validator("api_key", mode="before")
     @classmethod

@@ -11,6 +11,10 @@ class ModelContextLengthError(RuntimeError):
     """A provider rejected the request because its context was too large."""
 
 
+class ModelStreamInterrupted(RuntimeError):
+    """The current streamed response was intentionally abandoned for a user redirect."""
+
+
 @dataclass(frozen=True, slots=True)
 class ModelRequestOptions:
     """Per-request provider controls used for bounded recovery."""

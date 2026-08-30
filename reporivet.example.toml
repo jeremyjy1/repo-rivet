@@ -5,16 +5,14 @@ model = "replace-with-model-name"
 context_window_tokens = 128000
 # provider_default, enabled, or disabled.
 thinking_mode = "provider_default"
-# Optional for compatible reasoning models: low, high, or max.
-# reasoning_effort = "low"
+# Maximum reasoning tier. The controller selects a lower tier for routine turns and
+# automatically downgrades stalled reasoning-only streams.
+reasoning_effort = "max"
+reasoning_stall_seconds = 45
 # Optional optimization; unavailable or unknown encodings fall back to conservative estimation.
 # tokenizer_encoding = "o200k_base"
 timeout_seconds = 60
 max_retries = 3
-# Restart once with provider thinking disabled when a stream spends this long producing only
-# hidden reasoning and has not started an answer or tool request. This is not an output cap.
-reasoning_stall_seconds = 20
-reasoning_stall_chars = 12000
 
 [token]
 # Cost ceiling for one active cache epoch. The safe model budget still takes precedence.

@@ -2,6 +2,7 @@
 
 import json
 import re
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,7 @@ class EventLogger:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._secrets = tuple(secret for secret in secrets if secret)
         self._max_string_length = max_string_length
+        self._write_lock = threading.Lock()
 
     def log(self, event_type: str, **data: Any) -> None:
         """Append one sanitized event as a UTF-8 JSON line."""
@@ -45,7 +47,7 @@ class EventLogger:
             "event": event_type,
             "data": self._sanitize(data),
         }
-        with self.path.open("a", encoding="utf-8") as log_file:
+        with self._write_lock, self.path.open("a", encoding="utf-8") as log_file:
             json.dump(event, log_file, ensure_ascii=False, default=str)
             log_file.write("\n")
 

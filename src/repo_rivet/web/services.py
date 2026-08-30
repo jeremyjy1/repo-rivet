@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from repo_rivet.approval.models import ApprovalMode
 from repo_rivet.config import load_config
@@ -20,6 +20,19 @@ from repo_rivet.web.events import read_events
 from repo_rivet.web.runtime_manager import RuntimeManager, run_view
 
 _IGNORED_DIRS = {".git", ".venv", "node_modules", "__pycache__", ".pytest_cache", ".ruff_cache"}
+_ACTIVE_RUN_STATUSES = {"queued", "running", "awaiting_approval"}
+_AUTOMATIC_SESSION_NAME_MAX_CHARS = 48
+
+
+def automatic_session_name(task: str) -> str:
+    """Derive a stable, immediate conversation title from the first user request."""
+    lines = [" ".join(line.split()) for line in task.splitlines() if line.strip()]
+    candidate = (lines[0] if lines else "New conversation").strip("#>*-` ")
+    if not candidate:
+        candidate = "New conversation"
+    if len(candidate) <= _AUTOMATIC_SESSION_NAME_MAX_CHARS:
+        return candidate
+    return candidate[: _AUTOMATIC_SESSION_NAME_MAX_CHARS - 1].rstrip() + "…"
 
 
 class AgentQueryService:
@@ -202,11 +215,19 @@ class AgentCommandService:
         skill: str | None,
         no_skills: bool,
         auto_plan: AutoPlanMode | None,
+        delivery: Literal["redirect", "queue"] = "redirect",
     ) -> dict[str, Any]:
         resolved_id = self.sessions.resolve_id(session_id)
         self.sessions.set_active(self.workspace, resolved_id)
         self.sessions.ensure_resumable(self.sessions.read_metadata(resolved_id))
+        current_run = self.manager.get(resolved_id)
+        if current_run is not None and current_run.status in _ACTIVE_RUN_STATUSES:
+            if delivery == "queue":
+                return run_view(await self.manager.enqueue(resolved_id, task)) or {}
+            return run_view(await self.manager.steer(resolved_id, task)) or {}
         loaded = self.sessions.load(resolved_id)
+        if loaded.metadata.name == "untitled" and not loaded.metadata.task_preview:
+            self.sessions.rename(resolved_id, automatic_session_name(task))
         if loaded.memory.workflow_mode == WorkflowMode.PLAN_READY and mode == WorkflowMode.EXECUTE:
             raise ValueError(
                 "A plan is waiting for review. Execute it through the plan approval action, "

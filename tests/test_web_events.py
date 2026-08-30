@@ -14,9 +14,11 @@ from repo_rivet.approval.models import (
     RiskLevel,
 )
 from repo_rivet.planning.models import WorkflowMode
+from repo_rivet.session.store import FileSessionStore
 from repo_rivet.web.approvals import WebHumanApprover
 from repo_rivet.web.events import EventBroker, read_event_page, read_events
-from repo_rivet.web.runtime_manager import RuntimeManager
+from repo_rivet.web.runtime_manager import ActiveRun, RuntimeManager
+from repo_rivet.web.services import AgentCommandService, automatic_session_name
 
 
 def test_persisted_events_have_stable_order_and_replay_cursor(tmp_path: Path) -> None:
@@ -199,6 +201,102 @@ def test_web_approval_rejects_repeating_high_risk_grant() -> None:
         )
     approver.abort_pending()
     thread.join(timeout=1)
+
+
+def test_new_direction_releases_pending_approval_with_guidance() -> None:
+    approver = WebHumanApprover()
+    result = []
+    thread = threading.Thread(target=lambda: result.append(approver.ask(_approval_request())))
+    thread.start()
+    assert approver.wait_for_pending(timeout=1) is not None
+
+    assert approver.redirect_pending("Use C++ instead")
+    thread.join(timeout=1)
+
+    assert result[0].action == ApprovalAction.DENY
+    assert not result[0].abort_agent
+    assert result[0].guidance == "Use C++ instead"
+
+
+def test_automatic_session_name_is_immediate_bounded_and_single_line() -> None:
+    task = "\n# Build a terminal Tetris game with deterministic self-tests " + ("now " * 20)
+
+    title = automatic_session_name(task)
+
+    assert title.startswith("Build a terminal Tetris")
+    assert title.endswith("…")
+    assert len(title) == 48
+    assert "\n" not in title
+
+
+def test_first_submission_names_an_empty_browser_session(tmp_path: Path) -> None:
+    class StubManager:
+        def get(self, session_id: str) -> None:
+            del session_id
+            return None
+
+        async def start(self, **kwargs: object) -> ActiveRun:
+            return ActiveRun(
+                run_id="run-1",
+                session_id=str(kwargs["session_id"]),
+                workspace=tmp_path,
+                task=str(kwargs["task"]),
+                mode=kwargs["mode"],  # type: ignore[arg-type]
+            )
+
+    sessions = FileSessionStore(root=tmp_path / "home")
+    created = sessions.create(workspace=tmp_path)
+    commands = AgentCommandService(tmp_path, sessions, StubManager())  # type: ignore[arg-type]
+
+    asyncio.run(
+        commands.submit(
+            created.metadata.session_id,
+            task="Build a terminal Tetris game",
+            mode=WorkflowMode.EXECUTE,
+            approval_mode=None,
+            skill=None,
+            no_skills=False,
+            auto_plan=None,
+        )
+    )
+
+    metadata = sessions.read_metadata(created.metadata.session_id)
+    assert metadata.name == "Build a terminal Tetris game"
+
+
+def test_runtime_manager_redirects_active_stream_and_queues_instruction(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        manager = RuntimeManager(
+            workspace=tmp_path,
+            config_path=tmp_path / "config.toml",
+            broker=EventBroker(),
+        )
+        run = ActiveRun(
+            run_id="run-1",
+            session_id="session-1",
+            workspace=tmp_path,
+            task="first",
+            mode=WorkflowMode.EXECUTE,
+            status="running",
+        )
+        manager._runs[run.session_id] = run
+
+        queued = await manager.enqueue(run.session_id, "Add tests after the current task")
+        redirected = await manager.steer(run.session_id, "Use C++ instead")
+
+        assert queued is run
+        assert redirected is run
+        assert run.inputs.has_redirect()
+        assert run.inputs.drain_redirects() == ["Use C++ instead"]
+        follow_up = run.inputs.pop_or_close()
+        assert follow_up is not None
+        assert follow_up.instruction == "Add tests after the current task"
+        assert follow_up.delivery == "queue"
+        assert run.inputs.pop_or_close() is None
+        with pytest.raises(ValueError, match="finishing"):
+            await manager.steer(run.session_id, "This must not be silently lost")
+
+    asyncio.run(scenario())
 
 
 def test_runtime_manager_rejects_a_second_run_while_stopping(tmp_path: Path) -> None:

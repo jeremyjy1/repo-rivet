@@ -4,8 +4,16 @@ import pytest
 from pydantic import SecretStr
 
 from repo_rivet.config import ApiConfig
-from repo_rivet.llm.base import ModelContextLengthError, ModelRequestOptions
-from repo_rivet.llm.openai_compatible import ModelRequestError, OpenAICompatibleClient
+from repo_rivet.llm.base import (
+    ModelContextLengthError,
+    ModelRequestOptions,
+    ModelStreamInterrupted,
+)
+from repo_rivet.llm.openai_compatible import (
+    ModelRequestError,
+    OpenAICompatibleClient,
+    _stream_activity_phase,
+)
 from repo_rivet.llm.protocol import InvalidConversationHistory
 
 
@@ -46,6 +54,17 @@ class FragmentedToolCompletions:
                 stream_chunk(finish_reason="tool_calls"),
             ]
         )
+
+
+class StallingThenCompletes:
+    def __init__(self) -> None:
+        self.requests: list[dict[str, object]] = []
+
+    def create(self, **kwargs):  # type: ignore[no-untyped-def]
+        self.requests.append(kwargs)
+        if len(self.requests) == 1:
+            return iter([stream_chunk(reasoning="still analyzing")])
+        return iter([stream_chunk(content="done", finish_reason="stop")])
 
 
 class RecordingSink:
@@ -137,16 +156,34 @@ class InterruptedStreamCompletions:
         raise APITimeoutError("stream stalled")
 
 
-class StalledReasoningCompletions:
-    def __init__(self, *, recover: bool = True) -> None:
-        self.recover = recover
+class RedirectedStreamCompletions:
+    def __init__(self, redirected: dict[str, bool]) -> None:
+        self.redirected = redirected
+        self.calls = 0
+
+    def create(self, **kwargs):  # type: ignore[no-untyped-def]
+        del kwargs
+        self.calls += 1
+        return self._stream()
+
+    def _stream(self):  # type: ignore[no-untyped-def]
+        yield stream_chunk(content="discarded partial response")
+        self.redirected["value"] = True
+        yield stream_chunk(content="must not be consumed", finish_reason="stop")
+
+
+class ContinuousReasoningCompletions:
+    def __init__(self) -> None:
         self.requests: list[dict[str, object]] = []
 
     def create(self, **kwargs):  # type: ignore[no-untyped-def]
         self.requests.append(kwargs)
-        if len(self.requests) == 1 or not self.recover:
-            return iter([stream_chunk(content=""), stream_chunk(reasoning="x" * 100)])
-        return iter([stream_chunk(content="direct result", finish_reason="stop")])
+        return iter(
+            [
+                stream_chunk(reasoning="x" * 25_000),
+                stream_chunk(content="considered result", finish_reason="stop"),
+            ]
+        )
 
 
 class ReasoningProtocolError(RuntimeError):
@@ -220,6 +257,42 @@ def test_complete_reassembles_streamed_reasoning_and_tool_arguments() -> None:
     assert progress[-1]["tool_argument_chars"] > 0
 
 
+def test_reasoning_only_stream_downgrades_effort_and_restarts(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    completions = StallingThenCompletes()
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    events = RecordingSink()
+    ticks = iter(range(0, 1_000, 100))
+    monkeypatch.setattr(
+        "repo_rivet.llm.openai_compatible.time.monotonic",
+        lambda: next(ticks),
+    )
+    config = ApiConfig(
+        api_key=SecretStr("test-key"),
+        base_url="https://example.com/v1",
+        model="test-model",
+        context_window_tokens=32768,
+        reasoning_effort="max",
+        reasoning_stall_seconds=45,
+    )
+    adapter = OpenAICompatibleClient(config, client=client, event_logger=events)
+
+    result = adapter.complete(messages=[{"role": "user", "content": "task"}], tools=[])
+
+    assert result.content == "done"
+    assert [request["reasoning_effort"] for request in completions.requests] == [
+        "max",
+        "high",
+    ]
+    downgrade = next(
+        data
+        for name, data in events.events
+        if name == "model_reasoning_effort_downgraded"
+    )
+    assert downgrade["previous_effort"] == "max"
+    assert downgrade["reasoning_effort"] == "high"
+    assert downgrade["elapsed_seconds"] == 100
+
+
 def test_streaming_falls_back_when_provider_rejects_usage_options() -> None:
     completions = StreamOptionsFallbackCompletions()
     client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
@@ -267,8 +340,28 @@ def test_interrupted_stream_retries_from_a_clean_accumulator(
     assert retry["max_attempts"] == 2
 
 
-def test_hidden_reasoning_stall_restarts_once_with_thinking_disabled() -> None:
-    completions = StalledReasoningCompletions()
+def test_user_redirect_abandons_stream_without_provider_retry() -> None:
+    redirected = {"value": False}
+    completions = RedirectedStreamCompletions(redirected)
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    config = ApiConfig(
+        api_key=SecretStr("test-key"),
+        base_url="https://example.com/v1",
+        model="test-model",
+        context_window_tokens=32768,
+        max_retries=2,
+    )
+    adapter = OpenAICompatibleClient(config, client=client)
+    adapter.set_interrupt_checker(lambda: redirected["value"])
+
+    with pytest.raises(ModelStreamInterrupted):
+        adapter.complete(messages=[{"role": "user", "content": "task"}], tools=[])
+
+    assert completions.calls == 1
+
+
+def test_continuous_hidden_reasoning_is_allowed_to_finish() -> None:
+    completions = ContinuousReasoningCompletions()
     client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
     events = RecordingSink()
     config = ApiConfig(
@@ -277,45 +370,39 @@ def test_hidden_reasoning_stall_restarts_once_with_thinking_disabled() -> None:
         model="test-model",
         context_window_tokens=32768,
         max_retries=0,
-        reasoning_stall_seconds=0,
-        reasoning_stall_chars=100,
     )
     adapter = OpenAICompatibleClient(config, client=client, event_logger=events)
 
     result = adapter.complete(messages=[{"role": "user", "content": "task"}], tools=[])
 
-    assert result.content == "direct result"
-    assert result.provider_thinking_disabled is True
-    assert result.reasoning_context_restart_required is True
-    assert len(completions.requests) == 2
-    assert "extra_body" not in completions.requests[0]
-    assert completions.requests[1]["extra_body"] == {"thinking": {"type": "disabled"}}
-    assert all("max_tokens" not in request for request in completions.requests)
-    recovery = next(
-        data for name, data in events.events if name == "model_stream_reasoning_recovery"
-    )
-    assert recovery["reasoning_chars"] == 100
-    assert recovery["recovery"] == "restart_with_thinking_disabled"
+    assert result.content == "considered result"
+    assert result.reasoning_content == "x" * 25_000
+    assert result.provider_thinking_disabled is False
+    assert result.reasoning_context_restart_required is False
+    assert len(completions.requests) == 1
+    assert any(name == "model_stream_progress" for name, _ in events.events)
 
 
-def test_hidden_reasoning_stall_recovery_is_bounded() -> None:
-    completions = StalledReasoningCompletions(recover=False)
-    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
-    config = ApiConfig(
-        api_key=SecretStr("test-key"),
-        base_url="https://example.com/v1",
-        model="test-model",
-        context_window_tokens=32768,
-        max_retries=0,
-        reasoning_stall_seconds=0,
-        reasoning_stall_chars=100,
-    )
-    adapter = OpenAICompatibleClient(config, client=client)
-
-    with pytest.raises(ModelRequestError, match="only hidden reasoning"):
-        adapter.complete(messages=[{"role": "user", "content": "task"}], tools=[])
-
-    assert len(completions.requests) == 2
+@pytest.mark.parametrize(
+    ("reasoning_chars", "expected"),
+    [
+        (0, "waiting"),
+        (1, "understanding_task"),
+        (2_000, "analyzing_context"),
+        (8_000, "evaluating_options"),
+        (20_000, "refining_action"),
+    ],
+)
+def test_stream_activity_phase_describes_reasoning_progress(
+    reasoning_chars: int,
+    expected: str,
+) -> None:
+    assert _stream_activity_phase(
+        content_chars=0,
+        reasoning_chars=reasoning_chars,
+        tool_argument_chars=0,
+        completed=False,
+    ) == expected
 
 
 def test_missing_reasoning_protocol_state_retries_once_without_thinking() -> None:

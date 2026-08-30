@@ -129,26 +129,33 @@ class SessionState:
 
     def record_tool_result(self, call: ToolCall, result: ToolResult) -> None:
         """Update counters and file-change state after one ordered tool call."""
-        self._record_tool_outcome(call, result)
+        self._record_tool_outcome(call, result, track_repetition=True)
         self.messages.append(result.as_tool_message(call.id))
 
     def record_automatic_tool_result(self, call: ToolCall, result: ToolResult) -> None:
         """Track a controller-scheduled tool without inventing an assistant Tool Call."""
-        self._record_tool_outcome(call, result)
+        self._record_tool_outcome(call, result, track_repetition=False)
 
-    def _record_tool_outcome(self, call: ToolCall, result: ToolResult) -> None:
+    def _record_tool_outcome(
+        self,
+        call: ToolCall,
+        result: ToolResult,
+        *,
+        track_repetition: bool,
+    ) -> None:
         self.tool_call_count += 1
-        signature = json.dumps(
-            {"name": call.name, "arguments": call.arguments},
-            ensure_ascii=False,
-            sort_keys=True,
-            default=str,
-        )
-        if signature == self.last_tool_signature:
-            self.repeated_tool_calls += 1
-        else:
-            self.last_tool_signature = signature
-            self.repeated_tool_calls = 1
+        if track_repetition:
+            signature = json.dumps(
+                {"name": call.name, "arguments": call.arguments},
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )
+            if signature == self.last_tool_signature:
+                self.repeated_tool_calls += 1
+            else:
+                self.last_tool_signature = signature
+                self.repeated_tool_calls = 1
 
         if result.ok:
             self.consecutive_failures = 0
@@ -174,6 +181,10 @@ class SessionState:
         """Record a new successful observation without trusting model claims."""
         if not result.ok or call.name in _PROGRESS_NEUTRAL_TOOLS:
             return
+        if call.name == "run_verification":
+            verification = (result.metadata or {}).get("verification_result")
+            if not isinstance(verification, dict) or verification.get("status") != "passed":
+                return
         serialized = json.dumps(
             {
                 "name": call.name,

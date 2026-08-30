@@ -111,7 +111,9 @@ button:focus-visible, textarea:focus-visible, select:focus-visible { outline: 2p
 .event-card time { padding-top: 3px; color: #5f6877; white-space: nowrap; font: 9px "JetBrains Mono", monospace; }
 .event-card.approval-requested { border-color: #5b4723; background: #211c14; }
 .event-card.approval-requested .event-icon { color: var(--amber); background: #342715; }
-.generating { display: flex; gap: 8px; align-items: center; color: #a7b0bd; font-size: 11px; margin: 16px 0; }
+.generating { display: flex; gap: 8px; align-items: center; color: #a7b0bd; font-size: 11px; line-height: 1.45; margin: 16px 0; min-width: 0; }
+.generating span { min-width: 0; overflow-wrap: anywhere; }
+.generating svg, .generating i { flex: none; }
 .generating i { width: 4px; height: 4px; border-radius: 50%; background: var(--accent); animation: blink 1.2s infinite; }
 .generating i:nth-child(3) { animation-delay: .2s; }.generating i:nth-child(4) { animation-delay: .4s; }
 .spin { animation: spin 1s linear infinite; }

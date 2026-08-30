@@ -109,6 +109,17 @@ class WebHumanApprover:
                 pending.decision = self._decision(pending.request, "stop", None)
                 pending.ready.set()
 
+    def redirect_pending(self, guidance: str) -> bool:
+        """Deny the pending action so a newly supplied user direction can take over."""
+        with self._condition:
+            pending = self._pending
+            if pending is None or pending.decision is not None:
+                return False
+            pending.decision = self._decision(pending.request, "deny", guidance)
+            pending.ready.set()
+            self._condition.notify_all()
+            return True
+
     def snapshot(self) -> dict[str, object] | None:
         with self._condition:
             pending = self._pending

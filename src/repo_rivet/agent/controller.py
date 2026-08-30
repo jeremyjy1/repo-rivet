@@ -2,6 +2,7 @@
 
 import json
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -21,6 +22,7 @@ from repo_rivet.llm.base import (
     ModelContextLengthError,
     ModelRequestOptions,
     ModelResponse,
+    ModelStreamInterrupted,
 )
 from repo_rivet.llm.openai_compatible import ModelRequestError
 from repo_rivet.llm.parser import ResponseParseError
@@ -63,6 +65,16 @@ from repo_rivet.verification.runtime import VerificationRuntime
 
 _MAX_VERIFICATION_PLAN_RECOVERY_ATTEMPTS = 3
 _MAX_VERIFICATION_PLAN_REVISION_ATTEMPTS = 3
+_REASONING_EFFORT_RANK = {"low": 0, "high": 1, "max": 2}
+
+
+def _bounded_effort(
+    desired: Literal["low", "high", "max"],
+    ceiling: Literal["low", "high", "max"],
+) -> Literal["low", "high", "max"]:
+    if _REASONING_EFFORT_RANK[desired] <= _REASONING_EFFORT_RANK[ceiling]:
+        return desired
+    return ceiling
 
 
 class EventSink(Protocol):
@@ -115,6 +127,7 @@ class AgentController:
         self.skill_runtime = skill_runtime
         self.auto_plan_policy = auto_plan_policy or AutoPlanPolicy()
         self.plan_classifier = plan_classifier
+        self._steering_source: Callable[[], list[str]] | None = None
         runtime = getattr(tool_registry, "verification_runtime", None)
         workspace = getattr(tool_registry, "workspace", None) or Path.cwd().resolve()
         self.verification_runtime = (
@@ -128,6 +141,10 @@ class AgentController:
             if isinstance(plan_runtime, PlanRuntime)
             else PlanRuntime(WorkspacePathPolicy(workspace))
         )
+
+    def set_steering_source(self, source: Callable[[], list[str]] | None) -> None:
+        """Attach a thread-safe source of user redirects for the current run."""
+        self._steering_source = source
 
     def run(
         self,
@@ -341,6 +358,8 @@ class AgentController:
         self._save_memory(memory, state, status=state.status.value)
         try:
             while True:
+                if self._apply_pending_steering(state=state, memory=memory):
+                    self._save_memory(memory, state, status=state.status.value)
                 terminal_result = self._check_termination(state=state, memory=memory)
                 if terminal_result is not None:
                     return terminal_result
@@ -360,6 +379,17 @@ class AgentController:
                             [] if state.status == AgentStatus.FINALIZING else tool_schemas
                         ),
                     )
+                except ModelStreamInterrupted:
+                    if not self._apply_pending_steering(state=state, memory=memory):
+                        return self._finish(
+                            state,
+                            memory,
+                            status="error",
+                            reason="model stream was interrupted without a replacement request",
+                        )
+                    self._log("model_redirected", step=state.step_count + 1)
+                    self._save_memory(memory, state, status=state.status.value)
+                    continue
                 except ResponseParseError as error:
                     bounded_edit_recovery = (
                         error.code == "invalid_tool_arguments_json"
@@ -469,6 +499,14 @@ class AgentController:
                         status="error",
                         reason=f"model request failed: {type(error).__name__}",
                     )
+
+                if self._apply_pending_steering(state=state, memory=memory):
+                    self._log(
+                        "model_response_discarded_for_redirect",
+                        step=state.step_count + 1,
+                    )
+                    self._save_memory(memory, state, status=state.status.value)
+                    continue
 
                 raw_assistant_message = response.as_assistant_message()
                 leaked_tool_protocol = (
@@ -707,6 +745,58 @@ class AgentController:
         if warning not in memory.summary.unresolved_issues:
             memory.summary.unresolved_issues.append(warning)
         return descriptions
+
+    def _apply_pending_steering(
+        self,
+        *,
+        state: SessionState,
+        memory: MemoryState,
+    ) -> bool:
+        source = self._steering_source
+        instructions = source() if source is not None else []
+        normalized = [value.strip() for value in instructions if value.strip()]
+        if not normalized:
+            return False
+
+        for instruction in normalized:
+            memory.append_user_update(instruction)
+            self._log(
+                "user_steer_applied",
+                step=state.step_count + 1,
+            )
+        state.task = normalized[-1]
+        state.pending_decision = None
+        state.reflection_required = False
+        state.candidate_final_assessment = None
+        state.consecutive_failures = 0
+        state.consecutive_protocol_failures = 0
+        state.empty_model_responses = 0
+        state.renew_step_checkpoint(self.termination_policy.config.max_steps)
+        state.started_at = time.monotonic()
+        if state.workflow_mode == WorkflowMode.PLANNING:
+            state.status = AgentStatus.PLANNING
+        elif (
+            memory.plan_artifact is not None
+            and memory.plan_artifact.status == PlanStatus.EXECUTING
+        ):
+            state.status = AgentStatus.EXECUTING
+        else:
+            state.status = AgentStatus.RUNNING
+            state.verification_plan = None
+            state.verification_results.clear()
+            state.verification_plan_recovery_attempts = 0
+            state.verification_plan_revision_required = False
+            state.verification_plan_revision_reason = None
+            state.verification_plan_revision_guidance = None
+            state.verification_plan_revision_attempts = 0
+            memory.verification_plan = None
+            memory.verification_results.clear()
+            memory.verification_plan_recovery_attempts = 0
+            memory.verification_plan_revision_required = False
+            memory.verification_plan_revision_reason = None
+            memory.verification_plan_revision_guidance = None
+            memory.verification_plan_revision_attempts = 0
+        return True
 
     @staticmethod
     def _can_start_new_plan(memory: MemoryState) -> bool:
@@ -1080,6 +1170,7 @@ class AgentController:
         validation_error = reasoning_error or registration_error
         plan_step_validation_error = False
         verification_plan_missing_for_file_change = False
+        unchanged_verification_retry: VerificationResult | None = None
         if plan_calls and action_calls:
             validation_error = plan_error
         if (
@@ -1098,6 +1189,21 @@ class AgentController:
                 "The previous action failed or was denied. Record a reflection in a separate "
                 "turn before declaring another state-changing action."
             )
+        if validation_error is None:
+            for call in action_calls:
+                unchanged_verification_retry = self._unchanged_failed_verification(call, state)
+                if unchanged_verification_retry is None:
+                    continue
+                check_id = unchanged_verification_retry.check_id
+                validation_error = (
+                    f"Verification check {check_id} already "
+                    f"{unchanged_verification_retry.status.value} at workspace revision "
+                    f"{state.workspace_revision}. Do not rerun it before relevant workspace "
+                    "changes. Inspect the existing failure evidence with read-only tools. If "
+                    "the approved plan has no repair step for the cause, call update_plan alone "
+                    "to add one before editing."
+                )
+                break
         if validation_error is None:
             try:
                 validate_decision_for_actions(
@@ -1270,6 +1376,8 @@ class AgentController:
                     error_code=(
                         "plan_step_violation"
                         if plan_step_validation_error
+                        else "verification_retry_without_change"
+                        if unchanged_verification_retry is not None
                         else "verification_plan_missing"
                         if verification_plan_missing_for_file_change
                         else "decision_validation_failed"
@@ -1410,6 +1518,25 @@ class AgentController:
                         "inspection if more evidence is needed, then call one allowed tool for "
                         "the current step; call update_plan alone if the approved scope must "
                         "change."
+                    ),
+                },
+            )
+            self._save_memory(memory, state, status=state.status.value)
+        if unchanged_verification_retry is not None:
+            self._append_system_feedback(
+                state,
+                memory,
+                {
+                    "error": "verification_retry_without_change",
+                    "check_id": unchanged_verification_retry.check_id,
+                    "verification_status": unchanged_verification_retry.status.value,
+                    "workspace_revision": state.workspace_revision,
+                    "reasons": unchanged_verification_retry.reasons,
+                    "instruction": (
+                        "Do not run this check again at the unchanged workspace revision. "
+                        "Inspect the recorded failure and relevant files. If a repair falls "
+                        "outside the current approved plan step, call update_plan alone to add "
+                        "the required repair step."
                     ),
                 },
             )
@@ -1654,6 +1781,51 @@ class AgentController:
             )
             self.verifier.record(state, persisted_result)
             verification_result = persisted_result
+            if (
+                verification_result.workspace_revision == state.workspace_revision
+                and verification_result.status
+                in {VerificationStatus.FAILED, VerificationStatus.ERROR}
+            ):
+                plan_step = (
+                    memory.plan_artifact.current_step
+                    if memory.plan_artifact is not None
+                    and memory.plan_artifact.status == PlanStatus.EXECUTING
+                    else None
+                )
+                self._append_system_feedback(
+                    state,
+                    memory,
+                    {
+                        "event": "verification_failed",
+                        "check_id": verification_result.check_id,
+                        "verification_status": verification_result.status.value,
+                        "workspace_revision": state.workspace_revision,
+                        "reasons": verification_result.reasons,
+                        "current_plan_step": (
+                            {
+                                "step_id": plan_step.step_id,
+                                "operation": plan_step.operation.value,
+                                "status": plan_step.status.value,
+                            }
+                            if plan_step is not None
+                            else None
+                        ),
+                        "instruction": (
+                            "Do not rerun this check at the unchanged workspace revision. "
+                            "Inspect the saved failure evidence and relevant source with "
+                            "read-only tools. Repair the cause before rerunning. If the repair "
+                            "is outside the current approved plan step, call update_plan alone "
+                            "to add the repair step."
+                        ),
+                    },
+                )
+                self._log(
+                    "verification_repair_required",
+                    check_id=verification_result.check_id,
+                    status=verification_result.status.value,
+                    workspace_revision=state.workspace_revision,
+                    plan_step_id=plan_step.step_id if plan_step is not None else None,
+                )
             if verification_result.status == VerificationStatus.INCONCLUSIVE:
                 # An inconclusive result changes the next valid action from rerunning the check
                 # to replacing its verification plan. Do not let the generic repeated-call guard
@@ -1763,6 +1935,25 @@ class AgentController:
             return VerificationResult.model_validate(value)
         except ValueError:
             return None
+
+    @staticmethod
+    def _unchanged_failed_verification(
+        call: ToolCall,
+        state: SessionState,
+    ) -> VerificationResult | None:
+        if call.name != "run_verification":
+            return None
+        check_id = call.arguments.get("check_id")
+        if not isinstance(check_id, str):
+            return None
+        result = state.verification_results.get(check_id)
+        if (
+            result is None
+            or result.workspace_revision != state.workspace_revision
+            or result.status not in {VerificationStatus.FAILED, VerificationStatus.ERROR}
+        ):
+            return None
+        return result
 
     def _handle_final_response(
         self,
@@ -2380,6 +2571,7 @@ class AgentController:
                     )
 
             estimate = self.context_manager.last_estimate
+            selected_reasoning_effort = options.reasoning_effort if options else None
             self._log(
                 "model_call",
                 step=state.step_count + 1,
@@ -2387,6 +2579,12 @@ class AgentController:
                 context_recovery_attempt=attempt,
                 raw_estimated_prompt_tokens=estimate.raw,
                 effective_estimated_prompt_tokens=estimate.effective,
+                reasoning_effort=selected_reasoning_effort,
+                reasoning_effort_ceiling=getattr(
+                    self.model_client,
+                    "reasoning_effort_ceiling",
+                    None,
+                ),
             )
             try:
                 response = self.model_client.complete(
@@ -2437,15 +2635,33 @@ class AgentController:
             f"Context could not be made safe after {max_retries} compression retries: {last_reason}"
         )
 
-    @staticmethod
-    def _model_request_options(state: SessionState) -> ModelRequestOptions | None:
+    def _model_request_options(self, state: SessionState) -> ModelRequestOptions | None:
         if state.force_thinking_disabled:
             return ModelRequestOptions(thinking_enabled=False)
         if state.provider_reasoning_detected and state.consecutive_length_responses >= 2:
             return ModelRequestOptions(thinking_enabled=False)
         if state.provider_reasoning_detected and state.consecutive_length_responses >= 1:
             return ModelRequestOptions(reasoning_effort="low")
+        ceiling = getattr(self.model_client, "reasoning_effort_ceiling", None)
+        if ceiling in {"low", "high", "max"}:
+            desired = self._automatic_reasoning_effort(state)
+            return ModelRequestOptions(reasoning_effort=_bounded_effort(desired, ceiling))
         return None
+
+    @staticmethod
+    def _automatic_reasoning_effort(state: SessionState) -> Literal["low", "high", "max"]:
+        """Use deeper reasoning only for analysis-heavy controller states."""
+        if state.workflow_mode == WorkflowMode.PLANNING:
+            return "max"
+        if state.reflection_required or state.verification_plan_revision_required:
+            return "high"
+        if any(
+            result.workspace_revision == state.workspace_revision
+            and result.status in {VerificationStatus.FAILED, VerificationStatus.ERROR}
+            for result in state.verification_results.values()
+        ):
+            return "high"
+        return "low"
 
     @staticmethod
     def _history_requires_reasoning_checkpoint(memory: MemoryState) -> bool:

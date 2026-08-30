@@ -338,6 +338,23 @@ class MemoryState(BaseModel):
         self.workflow_mode = WorkflowMode.EXECUTE
         self.last_agent_outcome = None
 
+    def append_user_update(self, instruction: str) -> None:
+        """Add a user redirect without resetting the active run's evidence or counters."""
+        normalized = instruction.strip()
+        if not normalized:
+            raise ValueError("User instruction must not be empty")
+        if (
+            self.fixed is not None
+            and normalized != self.fixed.original_task
+            and normalized not in self.task_updates
+        ):
+            self.task_updates.append(normalized)
+        self.messages.append(Message(role="user", content=normalized, step=self.tool_event_step))
+        self.working.current_focus = normalized
+        self.working.pending_actions.clear()
+        self.candidate_final_assessment = None
+        self.reflection_required = False
+
     def repair_interrupted_tool_history(
         self,
         *,

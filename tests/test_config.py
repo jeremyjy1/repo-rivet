@@ -44,6 +44,8 @@ max_context_overflow_retries = 1
     assert str(config.api.base_url) == "https://example.com/v1"
     assert config.api.model == "test-model"
     assert config.api.context_window_tokens == 32768
+    assert config.api.reasoning_effort == "max"
+    assert config.api.reasoning_stall_seconds == 45
     assert config.api.tokenizer_encoding == "cl100k_base"
     assert config.api.timeout_seconds == 30
     assert config.api.max_retries == 2
