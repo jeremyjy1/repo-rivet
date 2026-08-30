@@ -121,10 +121,7 @@ def test_delete_session_permanently_removes_saved_conversation(
         "session_id": session_id,
         "permanent": True,
     }
-    assert all(
-        item["session_id"] != session_id
-        for item in client.get("/api/v1/sessions").json()
-    )
+    assert all(item["session_id"] != session_id for item in client.get("/api/v1/sessions").json())
     assert not (tmp_path / "home" / "sessions" / session_id).exists()
     assert not (tmp_path / "home" / "trash").exists()
 

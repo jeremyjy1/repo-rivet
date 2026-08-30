@@ -210,9 +210,7 @@ class AppConfig(BaseModel):
             raise ValueError(
                 "output, tool-result, and safety reserves must leave a positive prompt budget"
             )
-        if effort_index(self.reasoning.effort_floor) > effort_index(
-            self.api.reasoning_effort
-        ):
+        if effort_index(self.reasoning.effort_floor) > effort_index(self.api.reasoning_effort):
             raise ValueError("reasoning effort_floor must not exceed api.reasoning_effort")
         return self
 

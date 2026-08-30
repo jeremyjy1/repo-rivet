@@ -130,12 +130,8 @@ def create_app(
         reasoning=reasoning,
         default_approval_mode=default_approval_mode,
         default_auto_plan=default_auto_plan,
-        default_reasoning_policy=(
-            default_reasoning_policy or config.reasoning.effort_policy
-        ),
-        default_reasoning_effort=(
-            default_reasoning_effort or config.api.reasoning_effort
-        ),
+        default_reasoning_policy=(default_reasoning_policy or config.reasoning.effort_policy),
+        default_reasoning_effort=(default_reasoning_effort or config.api.reasoning_effort),
         default_skill=default_skill,
         no_skills=no_skills,
     )

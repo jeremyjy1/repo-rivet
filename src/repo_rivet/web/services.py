@@ -63,9 +63,7 @@ class AgentQueryService:
                 "auto_plan_llm": config.planning.llm.enabled,
                 "reasoning_policy": manager.default_reasoning_policy.value,
                 "reasoning_effort": manager.default_reasoning_effort,
-                "reasoning_supported_efforts": list(
-                    config.api.reasoning_supported_efforts
-                ),
+                "reasoning_supported_efforts": list(config.api.reasoning_supported_efforts),
             },
             "capabilities": {"terminal": False, "websocket": False, "sse": True},
         }
@@ -253,9 +251,7 @@ class AgentCommandService:
                 resolved_id,
                 mode=mode,
                 approval_mode=(
-                    approval_mode
-                    or current_run.approval_mode
-                    or ApprovalMode.SAFE_AUTO
+                    approval_mode or current_run.approval_mode or ApprovalMode.SAFE_AUTO
                 ),
                 auto_plan=auto_plan or current_run.auto_plan or AutoPlanMode.ADAPTIVE,
                 skill=skill,

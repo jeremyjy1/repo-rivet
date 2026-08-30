@@ -84,9 +84,7 @@ class RunInputMailbox:
     def drain_redirects(self) -> list[str]:
         with self._lock:
             redirects = [
-                message.instruction
-                for message in self._messages
-                if message.delivery == "redirect"
+                message.instruction for message in self._messages if message.delivery == "redirect"
             ]
             self._messages[:] = [
                 message for message in self._messages if message.delivery != "redirect"
@@ -447,9 +445,7 @@ class RuntimeManager:
             set_reasoning_effort(reasoning_effort)
         runtime.controller.set_reasoning_policy_mode(run.reasoning_policy)
         runtime.controller.set_steering_source(run.inputs.drain_redirects)
-        runtime.controller.set_runtime_settings_source(
-            lambda: self._drain_live_settings(run)
-        )
+        runtime.controller.set_runtime_settings_source(lambda: self._drain_live_settings(run))
         set_interrupt_checker = getattr(
             runtime.controller.model_client,
             "set_interrupt_checker",

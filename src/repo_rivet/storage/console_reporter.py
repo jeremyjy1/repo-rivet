@@ -266,9 +266,7 @@ class ConsoleEventReporter:
         if effort:
             configured = "fixed" if policy == "fixed" else f"adaptive up to {ceiling or effort}"
             reasoning = f" · {effort} reasoning ({configured})"
-        self._start_status(
-            f"[cyan]Model is generating the next action{reasoning}…[/cyan]"
-        )
+        self._start_status(f"[cyan]Model is generating the next action{reasoning}…[/cyan]")
 
     def _update_model_status(self, data: dict[str, Any]) -> None:
         phase = self._safe(data.get("activity_phase", "waiting"), limit=40)

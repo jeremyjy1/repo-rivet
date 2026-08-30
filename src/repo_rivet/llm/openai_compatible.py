@@ -108,9 +108,7 @@ class OpenAICompatibleClient:
         validate_tool_call_protocol(messages)
         request_options = options or ModelRequestOptions()
         requested_effort = request_options.reasoning_effort or self.reasoning_effort_ceiling
-        requested_effort = _cap_reasoning_effort(
-            requested_effort, self.reasoning_effort_ceiling
-        )
+        requested_effort = _cap_reasoning_effort(requested_effort, self.reasoning_effort_ceiling)
         reasoning_effort = map_to_supported_effort(
             requested_effort, self._reasoning_supported_efforts
         )
@@ -331,19 +329,14 @@ class OpenAICompatibleClient:
             now = time.monotonic()
             elapsed_seconds = now - started_at
             tool_argument_chars = sum(
-                len("".join(fragment["arguments"]))
-                for fragment in tool_fragments.values()
+                len("".join(fragment["arguments"])) for fragment in tool_fragments.values()
             )
             current_ceiling = self.reasoning_effort_ceiling
             bounded_effort = map_to_supported_effort(
                 _cap_reasoning_effort(reasoning_effort, current_ceiling),
                 self._reasoning_supported_efforts,
             )
-            if (
-                bounded_effort != reasoning_effort
-                and not content_chars
-                and not tool_argument_chars
-            ):
+            if bounded_effort != reasoning_effort and not content_chars and not tool_argument_chars:
                 raise ModelReasoningCeilingChanged(bounded_effort)
             if (
                 reasoning_chars

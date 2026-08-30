@@ -12,9 +12,7 @@ def test_adaptive_policy_selects_each_call_from_phase_and_facts() -> None:
     policy = AdaptiveReasoningPolicy()
     settings = ReasoningPolicySettings(ceiling="max")
 
-    discovering = policy.choose(
-        ReasoningContext(phase="discovering"), settings, ReasoningUsage()
-    )
+    discovering = policy.choose(ReasoningContext(phase="discovering"), settings, ReasoningUsage())
     planning = policy.choose(
         ReasoningContext(
             phase="planning",

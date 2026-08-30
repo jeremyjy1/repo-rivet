@@ -333,11 +333,7 @@ class PlanRuntime:
         """Allow a bounded follow-up edit without reopening broader plan scope."""
         artifact = self._require_plan()
         current = artifact.current_step
-        if (
-            call.name != "edit_file"
-            or current is None
-            or current.operation != PlanOperation.EDIT
-        ):
+        if call.name != "edit_file" or current is None or current.operation != PlanOperation.EDIT:
             return None
         return next(
             (

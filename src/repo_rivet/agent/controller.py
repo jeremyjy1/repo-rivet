@@ -76,6 +76,8 @@ from repo_rivet.verification.runtime import VerificationRuntime
 _MAX_VERIFICATION_PLAN_RECOVERY_ATTEMPTS = 3
 _MAX_VERIFICATION_PLAN_REVISION_ATTEMPTS = 3
 _MAX_PLAN_SCOPE_REVISION_ATTEMPTS = 3
+
+
 class EventSink(Protocol):
     """Minimal logging interface accepted by the controller."""
 
@@ -391,8 +393,7 @@ class AgentController:
                     state.verification_plan is None
                     and state.verification_plan_recovery_attempts == 0
                     and current_plan_step is not None
-                    and current_plan_step.operation
-                    in {PlanOperation.COMMAND, PlanOperation.VERIFY}
+                    and current_plan_step.operation in {PlanOperation.COMMAND, PlanOperation.VERIFY}
                     and current_plan_step.verification_ids
                 ):
                     terminal_result = self._request_verification_plan_recovery(
@@ -840,8 +841,7 @@ class AgentController:
         if state.workflow_mode == WorkflowMode.PLANNING:
             state.status = AgentStatus.PLANNING
         elif (
-            memory.plan_artifact is not None
-            and memory.plan_artifact.status == PlanStatus.EXECUTING
+            memory.plan_artifact is not None and memory.plan_artifact.status == PlanStatus.EXECUTING
         ):
             state.status = AgentStatus.EXECUTING
         else:
@@ -1161,8 +1161,7 @@ class AgentController:
             not in {"record_decision", "register_verification", "submit_plan", "update_plan"}
         ]
         awaiting_plan_recovery = (
-            state.verification_plan_recovery_attempts >= 1
-            and state.verification_plan is None
+            state.verification_plan_recovery_attempts >= 1 and state.verification_plan is None
         )
         if awaiting_plan_recovery and not registration_calls:
             error = (
@@ -1595,9 +1594,7 @@ class AgentController:
                         if duplicate_successful_command is call
                         else ""
                     ),
-                    error=(
-                        None if duplicate_successful_command is call else validation_error
-                    ),
+                    error=(None if duplicate_successful_command is call else validation_error),
                     error_code=(
                         "plan_step_violation"
                         if plan_step_validation_error
@@ -1820,8 +1817,7 @@ class AgentController:
             if repeated_count > 1 and not require_plan_update:
                 instruction = (
                     f"This same plan-step violation has now occurred {repeated_count} times. "
-                    "Do not repeat or slightly rewrite the rejected request. "
-                    + instruction
+                    "Do not repeat or slightly rewrite the rejected request. " + instruction
                 )
             self._append_system_feedback(
                 state,
@@ -1842,9 +1838,7 @@ class AgentController:
                     "allowed_side_effect_tools": sorted(allowed_side_effects),
                     "required_next_action": required_action,
                     "plan_scope_revision_required": require_plan_update,
-                    "allowed_next_actions": (
-                        ["update_plan"] if require_plan_update else None
-                    ),
+                    "allowed_next_actions": (["update_plan"] if require_plan_update else None),
                     "rejected_action": (
                         {
                             "tool": plan_step_violation_call.name,
@@ -3158,17 +3152,14 @@ class AgentController:
                 if call.name == "delete_path"
                 else self.plan_runtime.path_policy.resolve(path)
             )
-            normalized = resolved.relative_to(
-                self.plan_runtime.path_policy.workspace
-            ).as_posix()
+            normalized = resolved.relative_to(self.plan_runtime.path_policy.workspace).as_posix()
         except (OSError, ValueError):
             return None
         return next(
             (
                 step
                 for step in artifact.steps
-                if step.status == PlanStepStatus.COMPLETED
-                and normalized in step.target_files
+                if step.status == PlanStepStatus.COMPLETED and normalized in step.target_files
             ),
             None,
         )
@@ -3500,16 +3491,13 @@ class AgentController:
         affected_files = set(state.modified_files)
         if artifact is not None:
             affected_files.update(artifact.affected_files)
-        top_level_modules = {
-            path.split("/", 1)[0] for path in affected_files if "/" in path
-        }
+        top_level_modules = {path.split("/", 1)[0] for path in affected_files if "/" in path}
         errors = " ".join(state.recent_errors).lower()
         latest_reasoning = (
             memory.reasoning_events[-1] if memory and memory.reasoning_events else None
         )
         next_action_known = current_step is not None or (
-            state.pending_decision is not None
-            and state.pending_decision.next_action is not None
+            state.pending_decision is not None and state.pending_decision.next_action is not None
         )
         return ReasoningContext(
             phase=phase,
@@ -3518,9 +3506,7 @@ class AgentController:
                 len(latest_reasoning.open_questions) if latest_reasoning is not None else 0
             ),
             failed_hypothesis_count=max(failed_checks, min(2, state.consecutive_failures)),
-            cross_module_change=(
-                len(affected_files) >= 3 or len(top_level_modules) >= 2
-            ),
+            cross_module_change=(len(affected_files) >= 3 or len(top_level_modules) >= 2),
             architectural_decision=any(
                 marker in state.task.lower()
                 for marker in ("architecture", "architectural", "架构", "重构")

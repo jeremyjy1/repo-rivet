@@ -270,11 +270,7 @@ def test_complete_maps_adaptive_effort_to_provider_capabilities() -> None:
     )
 
     assert completions.kwargs["reasoning_effort"] == "high"
-    mapped = next(
-        data
-        for name, data in events.events
-        if name == "model_reasoning_effort_mapped"
-    )
+    mapped = next(data for name, data in events.events if name == "model_reasoning_effort_mapped")
     assert mapped["requested_effort"] == "xhigh"
     assert mapped["applied_effort"] == "high"
 
@@ -331,9 +327,7 @@ def test_reasoning_only_stream_downgrades_effort_and_restarts(monkeypatch) -> No
         "xhigh",
     ]
     downgrade = next(
-        data
-        for name, data in events.events
-        if name == "model_reasoning_effort_downgraded"
+        data for name, data in events.events if name == "model_reasoning_effort_downgraded"
     )
     assert downgrade["previous_effort"] == "max"
     assert downgrade["reasoning_effort"] == "xhigh"
@@ -362,9 +356,7 @@ def test_lowering_live_reasoning_ceiling_restarts_unfinished_stream() -> None:
         "low",
     ]
     downgrade = next(
-        data
-        for name, data in events.events
-        if name == "model_reasoning_effort_downgraded"
+        data for name, data in events.events if name == "model_reasoning_effort_downgraded"
     )
     assert downgrade["reason"] == "reasoning ceiling changed during active stream"
     assert downgrade["previous_effort"] == "max"
@@ -475,12 +467,15 @@ def test_stream_activity_phase_describes_reasoning_progress(
     reasoning_chars: int,
     expected: str,
 ) -> None:
-    assert _stream_activity_phase(
-        content_chars=0,
-        reasoning_chars=reasoning_chars,
-        tool_argument_chars=0,
-        completed=False,
-    ) == expected
+    assert (
+        _stream_activity_phase(
+            content_chars=0,
+            reasoning_chars=reasoning_chars,
+            tool_argument_chars=0,
+            completed=False,
+        )
+        == expected
+    )
 
 
 def test_missing_reasoning_protocol_state_retries_once_without_thinking() -> None:

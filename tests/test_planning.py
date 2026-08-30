@@ -370,9 +370,7 @@ def test_completed_file_target_can_be_refined_during_the_next_edit_step(
     if header_operation == "edit":
         header_path.write_text("class Board {};\n", encoding="utf-8")
     source_path.write_text('#include "Board.h"\n', encoding="utf-8")
-    source_snapshot = TextDocument.load(source_path).to_snapshot(
-        relative_path="src/Board.cpp"
-    )
+    source_snapshot = TextDocument.load(source_path).to_snapshot(relative_path="src/Board.cpp")
     memory = MemoryState(session_id="multi-edit")
     memory.observation_events.append(observation("multi-edit"))
     memory.current_snapshots = {"src/Board.cpp": source_snapshot.snapshot_id}
@@ -473,9 +471,7 @@ def test_completed_file_target_can_be_refined_during_the_next_edit_step(
     assert runtime.start_action(refinement) is artifact.steps[0]
     assert artifact.steps[0].status == PlanStepStatus.COMPLETED
     header_path.write_text("class Board { public: int width; int height; };\n", encoding="utf-8")
-    refined_snapshot = TextDocument.load(header_path).to_snapshot(
-        relative_path="include/Board.h"
-    )
+    refined_snapshot = TextDocument.load(header_path).to_snapshot(relative_path="include/Board.h")
     runtime.observe_action(
         refinement,
         ToolResult(
@@ -720,9 +716,7 @@ def test_out_of_scope_edit_forces_one_plan_update_turn(tmp_path: Path) -> None:
     assert memory.plan_artifact.status == PlanStatus.READY
     assert "Makefile" in memory.plan_artifact.affected_files
     assert memory.plan_scope_revision_required is False
-    second_request_tools = {
-        schema["function"]["name"] for schema in model.requests[1]["tools"]
-    }
+    second_request_tools = {schema["function"]["name"] for schema in model.requests[1]["tools"]}
     assert second_request_tools == {"update_plan"}
     recovery = next(
         json.loads(message["content"])
@@ -873,9 +867,7 @@ def test_plan_step_transition_corrects_replay_of_completed_create(tmp_path: Path
         and isinstance(message.get("content"), str)
         and '"error":"multiple_state_changing_actions"' in message["content"]
     ]
-    assert batch_payloads[-1]["required_next_action"]["arguments"] == {
-        "path": "first.py"
-    }
+    assert batch_payloads[-1]["required_next_action"]["arguments"] == {"path": "first.py"}
     assert len(batch_payloads[-1]["rejected_tools"]) == 2
 
     transition_payloads = [
@@ -1029,11 +1021,11 @@ def test_failed_controller_plan_check_blocks_same_revision_model_retry(
     events = RecordingSink()
     result = AgentController(
         model_client=FakeModelClient(
-                [
-                    ModelResponse(tool_calls=[stale_edit]),
-                    ModelResponse(tool_calls=[repeated]),
-                    ModelResponse(tool_calls=[repair_plan]),
-                ]
+            [
+                ModelResponse(tool_calls=[stale_edit]),
+                ModelResponse(tool_calls=[repeated]),
+                ModelResponse(tool_calls=[repair_plan]),
+            ]
         ),
         tool_registry=registry,
         event_logger=events,

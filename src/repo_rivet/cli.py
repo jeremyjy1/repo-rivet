@@ -986,8 +986,7 @@ def _build_runtime(
     reasoning_config = reasoning_config.model_copy(
         update={
             "effort_policy": ReasoningPolicyMode(
-                getattr(arguments, "reasoning_policy", None)
-                or reasoning_config.effort_policy
+                getattr(arguments, "reasoning_policy", None) or reasoning_config.effort_policy
             )
         }
     )
@@ -995,8 +994,7 @@ def _build_runtime(
     api_config = config.api.model_copy(
         update={
             "reasoning_effort": (
-                getattr(arguments, "reasoning_effort", None)
-                or config.api.reasoning_effort
+                getattr(arguments, "reasoning_effort", None) or config.api.reasoning_effort
             )
         }
     )

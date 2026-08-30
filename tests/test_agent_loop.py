@@ -289,9 +289,7 @@ def test_user_redirect_restarts_current_model_turn_without_ending_run() -> None:
         "Use C++ instead.",
     ]
     assert "Use C++ instead." in [
-        message["content"]
-        for message in model.requests[1]["messages"]
-        if message["role"] == "user"
+        message["content"] for message in model.requests[1]["messages"] if message["role"] == "user"
     ]
     assert any(name == "model_redirected" for name, _data in events.events)
 
@@ -936,8 +934,7 @@ def test_executing_verify_step_requests_plan_registration_before_model_action() 
     assert [executed.id for executed in tools.calls] == ["registered-plan-check"]
     assert tools.calls[0].arguments == {"check_id": "tests"}
     assert any(
-        "current approved plan step requires verification checks"
-        in str(message.get("content"))
+        "current approved plan step requires verification checks" in str(message.get("content"))
         for message in model.requests[0]["messages"]
     )
     assert any(
@@ -1193,17 +1190,11 @@ def test_successful_command_is_not_executed_twice_at_same_workspace_revision() -
     assert len(tools.calls) == 1
     assert not any(name == "action_blocked" for name, _ in events.events)
     assert not any(
-        name == "tool_result"
-        and data.get("error_code") == "duplicate_successful_command"
+        name == "tool_result" and data.get("error_code") == "duplicate_successful_command"
         for name, data in events.events
     )
-    assert any(
-        name == "duplicate_successful_command_suppressed"
-        for name, _ in events.events
-    )
-    assert {
-        schema["function"]["name"] for schema in model.requests[2]["tools"]
-    } == set()
+    assert any(name == "duplicate_successful_command_suppressed" for name, _ in events.events)
+    assert {schema["function"]["name"] for schema in model.requests[2]["tools"]} == set()
 
 
 def test_stale_edit_snapshot_is_refreshed_without_consuming_repetition_budget() -> None:
