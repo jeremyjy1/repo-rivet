@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -357,6 +358,146 @@ def test_plan_runtime_advances_only_from_typed_success_observations(tmp_path: Pa
     assert artifact.current_step is None
 
 
+@pytest.mark.parametrize("header_operation", ["create", "edit"])
+def test_completed_file_target_can_be_refined_during_the_next_edit_step(
+    tmp_path: Path,
+    header_operation: str,
+) -> None:
+    header_path = tmp_path / "include" / "Board.h"
+    source_path = tmp_path / "src" / "Board.cpp"
+    header_path.parent.mkdir()
+    source_path.parent.mkdir()
+    if header_operation == "edit":
+        header_path.write_text("class Board {};\n", encoding="utf-8")
+    source_path.write_text('#include "Board.h"\n', encoding="utf-8")
+    source_snapshot = TextDocument.load(source_path).to_snapshot(
+        relative_path="src/Board.cpp"
+    )
+    memory = MemoryState(session_id="multi-edit")
+    memory.observation_events.append(observation("multi-edit"))
+    memory.current_snapshots = {"src/Board.cpp": source_snapshot.snapshot_id}
+    if header_operation == "edit":
+        header_snapshot = TextDocument.load(header_path).to_snapshot(
+            relative_path="include/Board.h"
+        )
+        memory.current_snapshots["include/Board.h"] = header_snapshot.snapshot_id
+    runtime = PlanRuntime(WorkspacePathPolicy(tmp_path))
+    runtime.bind(memory)
+    artifact = runtime.submit(
+        {
+            "plan": {
+                "goal": "Update the Board interface and implementation",
+                "evidence_refs": ["obs-read"],
+                "steps": [
+                    {
+                        "step_id": "edit-board-header",
+                        "title": "Edit Board header",
+                        "intent": "Update the Board declarations",
+                        "evidence_refs": ["obs-read"],
+                        "operation": header_operation,
+                        "target_files": ["include/Board.h"],
+                        "risk": "low",
+                    },
+                    {
+                        "step_id": "edit-board-source",
+                        "title": "Edit Board source",
+                        "intent": "Update the Board implementation",
+                        "evidence_refs": ["obs-read"],
+                        "operation": "edit",
+                        "target_files": ["src/Board.cpp"],
+                        "depends_on": ["edit-board-header"],
+                        "risk": "low",
+                    },
+                    {
+                        "step_id": "verify-board",
+                        "title": "Verify Board changes",
+                        "intent": "Run the registered Board checks",
+                        "evidence_refs": ["obs-read"],
+                        "operation": "verify",
+                        "verification_ids": ["board-tests"],
+                        "depends_on": ["edit-board-source"],
+                        "risk": "low",
+                    },
+                ],
+                "verification": [
+                    {
+                        "check_id": "board-tests",
+                        "title": "Board tests",
+                        "success_criteria": "The Board checks pass",
+                    }
+                ],
+            }
+        }
+    )
+    runtime.approve()
+
+    first_edit = ToolCall(
+        id="edit-header-1",
+        name="write_file" if header_operation == "create" else "edit_file",
+        arguments={
+            "path": "include/Board.h",
+            **(
+                {"content": "class Board { public: int width; };\n"}
+                if header_operation == "create"
+                else {}
+            ),
+        },
+    )
+    runtime.start_action(first_edit)
+    header_path.write_text("class Board { public: int width; };\n", encoding="utf-8")
+    first_edit_snapshot = TextDocument.load(header_path).to_snapshot(
+        relative_path="include/Board.h"
+    )
+    runtime.observe_action(
+        first_edit,
+        ToolResult(
+            ok=True,
+            output="edited",
+            metadata={
+                "path": "include/Board.h",
+                "workspace_revision": 1,
+                "new_snapshot_id": first_edit_snapshot.snapshot_id,
+            },
+        ),
+        evidence_ref="obs-header-1",
+    )
+    memory.workspace_revision = 1
+    assert artifact.current_step is artifact.steps[1]
+
+    refinement = ToolCall(
+        id="edit-header-2",
+        name="edit_file",
+        arguments={"path": "include/Board.h"},
+    )
+    assert runtime.validate_action(refinement) is None
+    assert runtime.start_action(refinement) is artifact.steps[0]
+    assert artifact.steps[0].status == PlanStepStatus.COMPLETED
+    header_path.write_text("class Board { public: int width; int height; };\n", encoding="utf-8")
+    refined_snapshot = TextDocument.load(header_path).to_snapshot(
+        relative_path="include/Board.h"
+    )
+    runtime.observe_action(
+        refinement,
+        ToolResult(
+            ok=True,
+            output="refined",
+            metadata={
+                "path": "include/Board.h",
+                "workspace_revision": 2,
+                "new_snapshot_id": refined_snapshot.snapshot_id,
+            },
+        ),
+        evidence_ref="obs-header-2",
+    )
+    memory.workspace_revision = 2
+
+    assert artifact.steps[0].status == PlanStepStatus.COMPLETED
+    assert artifact.current_step is artifact.steps[1]
+    assert artifact.execution_workspace_revision == 2
+    assert artifact.execution_snapshots["include/Board.h"] == refined_snapshot.snapshot_id
+    assert runtime.stale_reasons() == []
+
+
 def test_registered_check_satisfies_command_step_and_duplicate_verify_step(
     tmp_path: Path,
 ) -> None:
@@ -495,6 +636,274 @@ def test_execute_plan_exposes_only_current_step_side_effect_capability(tmp_path:
     assert "run_command" not in names
     assert "run_verification" not in names
     assert "write_file" not in names
+
+
+def test_out_of_scope_edit_forces_one_plan_update_turn(tmp_path: Path) -> None:
+    memory = inspected_memory(tmp_path)
+    makefile = tmp_path / "Makefile"
+    makefile.write_text("build:\n\ttrue\n", encoding="utf-8")
+    makefile_snapshot = TextDocument.load(makefile).to_snapshot(relative_path="Makefile")
+    memory.current_snapshots["Makefile"] = makefile_snapshot.snapshot_id
+    memory.observation_events.append(
+        ObservationEvent(
+            event_id="obs-makefile",
+            session_id=memory.session_id,
+            step=2,
+            tool_call_id="read-makefile",
+            tool_name="read_file",
+            ok=True,
+            result_summary="Read Makefile:1-2.",
+            affected_paths=["Makefile"],
+        )
+    )
+    registry = create_default_registry(tmp_path)
+    registry.plan_runtime.bind(memory)
+    registry.plan_runtime.submit({"plan": plan_payload()})
+    registry.plan_runtime.approve()
+    out_of_scope_edit = ToolCall(
+        id="edit-makefile",
+        name="edit_file",
+        arguments={
+            "path": "Makefile",
+            "snapshot_id": makefile_snapshot.snapshot_id,
+            "operations": [
+                {
+                    "op": "replace",
+                    "start_line": 2,
+                    "end_line": 2,
+                    "new_lines": ["\t$(CXX) app.cpp"],
+                }
+            ],
+        },
+    )
+    replacement = plan_payload()
+    replacement["evidence_refs"] = ["obs-read", "obs-makefile"]
+    steps = replacement["steps"]
+    assert isinstance(steps, list)
+    steps.insert(
+        1,
+        {
+            "step_id": "repair-build",
+            "title": "Repair the build recipe",
+            "intent": "Update the inspected Makefile for the changed source layout",
+            "evidence_refs": ["obs-makefile"],
+            "operation": "edit",
+            "target_files": ["Makefile"],
+            "verification_ids": ["tests"],
+            "depends_on": ["change"],
+            "risk": "low",
+        },
+    )
+    steps[2]["depends_on"] = ["repair-build"]  # type: ignore[index]
+    update = ToolCall(
+        id="update-plan",
+        name="update_plan",
+        arguments={
+            "reason": "The inspected Makefile also requires a build recipe repair.",
+            "plan": replacement,
+        },
+    )
+    model = FakeModelClient(
+        [
+            ModelResponse(tool_calls=[out_of_scope_edit]),
+            ModelResponse(tool_calls=[update]),
+        ]
+    )
+
+    result = AgentController(model_client=model, tool_registry=registry).run(
+        "Execute the approved plan",
+        memory=memory,
+    )
+
+    assert result.status == "plan_ready"
+    assert memory.plan_artifact is not None
+    assert memory.plan_artifact.status == PlanStatus.READY
+    assert "Makefile" in memory.plan_artifact.affected_files
+    assert memory.plan_scope_revision_required is False
+    second_request_tools = {
+        schema["function"]["name"] for schema in model.requests[1]["tools"]
+    }
+    assert second_request_tools == {"update_plan"}
+    recovery = next(
+        json.loads(message["content"])
+        for message in model.requests[1]["messages"]
+        if message.get("role") == "system"
+        and isinstance(message.get("content"), str)
+        and '"plan_scope_revision_required":true' in message["content"]
+    )
+    assert recovery["allowed_next_actions"] == ["update_plan"]
+    assert makefile.read_text(encoding="utf-8") == "build:\n\ttrue\n"
+
+
+def test_plan_step_transition_corrects_replay_of_completed_create(tmp_path: Path) -> None:
+    memory = MemoryState(session_id="plan-transition")
+    memory.observation_events.append(observation("plan-transition"))
+    registry = create_default_registry(tmp_path)
+    registry.plan_runtime.bind(memory)
+    artifact = registry.plan_runtime.submit(
+        {
+            "plan": {
+                "goal": "Create two files in their approved order",
+                "constraints": ["Only create the approved files"],
+                "assumptions": ["The workspace starts empty"],
+                "evidence_refs": ["obs-read"],
+                "steps": [
+                    {
+                        "step_id": "create-first",
+                        "title": "Create first.py",
+                        "intent": "Create the first approved file",
+                        "evidence_refs": ["obs-read"],
+                        "operation": "create",
+                        "target_files": ["first.py"],
+                        "verification_ids": ["tests"],
+                        "risk": "low",
+                    },
+                    {
+                        "step_id": "create-second",
+                        "title": "Create second.py",
+                        "intent": "Create the second approved file",
+                        "evidence_refs": ["obs-read"],
+                        "operation": "create",
+                        "target_files": ["second.py"],
+                        "verification_ids": ["tests"],
+                        "depends_on": ["create-first"],
+                        "risk": "low",
+                    },
+                    {
+                        "step_id": "verify",
+                        "title": "Verify both files",
+                        "intent": "Run the registered deterministic check",
+                        "evidence_refs": ["obs-read"],
+                        "operation": "verify",
+                        "verification_ids": ["tests"],
+                        "depends_on": ["create-second"],
+                        "risk": "low",
+                    },
+                ],
+                "verification": [
+                    {
+                        "check_id": "tests",
+                        "title": "Files created",
+                        "success_criteria": "The registered check exits successfully",
+                    }
+                ],
+                "risks": ["The model may replay a completed create step"],
+            }
+        }
+    )
+    registry.plan_runtime.approve()
+    registry.verification_runtime.bind(memory)
+    registry.verification_runtime.register_plan(
+        {
+            "requirements": ["tests"],
+            "checks": [
+                {
+                    "check_id": "tests",
+                    "title": "Files created",
+                    "kind": "test",
+                    "command": {"program": "true", "args": [], "cwd": "."},
+                    "criteria": {"expected_exit_codes": [0]},
+                    "required": True,
+                    "provenance": "model",
+                }
+            ],
+        }
+    )
+    model = FakeModelClient(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="batched-first",
+                        name="write_file",
+                        arguments={"path": "first.py", "content": "batched first\n"},
+                    ),
+                    ToolCall(
+                        id="batched-second",
+                        name="write_file",
+                        arguments={"path": "second.py", "content": "batched second\n"},
+                    ),
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="write-first",
+                        name="write_file",
+                        arguments={"path": "first.py", "content": "first\n"},
+                    )
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="replay-first",
+                        name="write_file",
+                        arguments={"path": "first.py", "content": "first again\n"},
+                    )
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="write-second",
+                        name="write_file",
+                        arguments={"path": "second.py", "content": "second\n"},
+                    )
+                ]
+            ),
+            ModelResponse(content="Both files were created and verified."),
+        ]
+    )
+
+    result = AgentController(model_client=model, tool_registry=registry).run(
+        "Execute the approved plan",
+        memory=memory,
+    )
+
+    assert result.status == "success"
+    assert artifact.status == PlanStatus.COMPLETED
+    assert (tmp_path / "first.py").read_text(encoding="utf-8") == "first\n"
+    assert (tmp_path / "second.py").read_text(encoding="utf-8") == "second\n"
+
+    batch_payloads = [
+        json.loads(message["content"])
+        for message in model.requests[1]["messages"]
+        if message.get("role") == "system"
+        and isinstance(message.get("content"), str)
+        and '"error":"multiple_state_changing_actions"' in message["content"]
+    ]
+    assert batch_payloads[-1]["required_next_action"]["arguments"] == {
+        "path": "first.py"
+    }
+    assert len(batch_payloads[-1]["rejected_tools"]) == 2
+
+    transition_payloads = [
+        json.loads(message["content"])
+        for message in model.requests[2]["messages"]
+        if message.get("role") == "system"
+        and isinstance(message.get("content"), str)
+        and '"event":"plan_step_completed"' in message["content"]
+    ]
+    assert transition_payloads[-1]["completed_step"]["step_id"] == "create-first"
+    assert transition_payloads[-1]["required_next_action"] == {
+        "step_id": "create-second",
+        "tool": "write_file",
+        "arguments": {"path": "second.py"},
+        "one_state_changing_call_only": True,
+    }
+
+    violation_payloads = [
+        json.loads(message["content"])
+        for message in model.requests[3]["messages"]
+        if message.get("role") == "system"
+        and isinstance(message.get("content"), str)
+        and '"error":"plan_step_violation"' in message["content"]
+    ]
+    violation = violation_payloads[-1]
+    assert violation["already_completed_step"]["step_id"] == "create-first"
+    assert violation["rejected_action"]["path"] == "first.py"
+    assert violation["required_next_action"]["arguments"] == {"path": "second.py"}
 
 
 def test_stale_previous_step_tool_triggers_controller_scheduled_plan_check(

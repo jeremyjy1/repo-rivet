@@ -299,6 +299,14 @@ class FileSessionStore:
         self._clear_pointers_to(metadata.session_id)
         return destination
 
+    def purge(self, reference: str) -> None:
+        """Permanently remove a session and every artifact stored with it."""
+        metadata = self.read_metadata(reference)
+        self._ensure_unlocked(metadata.session_id)
+        session_dir = self.sessions_dir / metadata.session_id
+        shutil.rmtree(session_dir)
+        self._clear_pointers_to(metadata.session_id)
+
     def ensure_resumable(self, metadata: SessionMetadata) -> None:
         if metadata.status == SessionStatus.ARCHIVED:
             raise SessionNotResumable("Archived sessions cannot be resumed; fork it first")

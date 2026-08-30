@@ -59,7 +59,8 @@ class PlanStepSpec(BaseModel):
         description=(
             "Exact workspace paths affected by this step. Create steps represent one new file; "
             "delete steps represent one existing file or directory; parent directories are "
-            "implicit and a create target must not be repeated."
+            "implicit and a create target must not be repeated. Created or edited files may "
+            "receive bounded corrective edit calls while the plan remains in its edit phase."
         ),
     )
     verification_ids: list[str] = Field(default_factory=list, max_length=50)

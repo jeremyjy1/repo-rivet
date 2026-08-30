@@ -8,9 +8,11 @@ from typing import Any, Literal
 from repo_rivet.approval.models import ApprovalMode
 from repo_rivet.config import load_config
 from repo_rivet.editing.document import TextDocument
+from repo_rivet.llm.base import ReasoningEffort
 from repo_rivet.planning.models import WorkflowMode
 from repo_rivet.planning.policy import AutoPlanMode
 from repo_rivet.planning.runtime import PlanRuntime
+from repo_rivet.reasoning.policy import ReasoningPolicyMode
 from repo_rivet.safety.path_policy import WorkspacePathPolicy
 from repo_rivet.session.models import SessionMetadata, SessionStatus
 from repo_rivet.session.store import FileSessionStore
@@ -59,6 +61,11 @@ class AgentQueryService:
                 "approval_mode": config.approval.mode.value,
                 "auto_plan": (manager.default_auto_plan or config.planning.auto_plan).value,
                 "auto_plan_llm": config.planning.llm.enabled,
+                "reasoning_policy": manager.default_reasoning_policy.value,
+                "reasoning_effort": manager.default_reasoning_effort,
+                "reasoning_supported_efforts": list(
+                    config.api.reasoning_supported_efforts
+                ),
             },
             "capabilities": {"terminal": False, "websocket": False, "sse": True},
         }
@@ -205,6 +212,23 @@ class AgentCommandService:
     def archive_session(self, session_id: str) -> SessionMetadata:
         return self.sessions.archive(session_id)
 
+    def delete_session(self, session_id: str) -> dict[str, object]:
+        resolved_id = self.sessions.resolve_id(session_id)
+        run = self.manager.get(resolved_id)
+        if run is not None and run.status in {
+            "queued",
+            "running",
+            "awaiting_approval",
+            "stopping",
+        }:
+            raise ValueError("Stop the active run before deleting this conversation")
+        self.sessions.purge(resolved_id)
+        return {
+            "deleted": True,
+            "session_id": resolved_id,
+            "permanent": True,
+        }
+
     async def submit(
         self,
         session_id: str,
@@ -215,6 +239,9 @@ class AgentCommandService:
         skill: str | None,
         no_skills: bool,
         auto_plan: AutoPlanMode | None,
+        clear_skill: bool = False,
+        reasoning_policy: ReasoningPolicyMode | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
         delivery: Literal["redirect", "queue"] = "redirect",
     ) -> dict[str, Any]:
         resolved_id = self.sessions.resolve_id(session_id)
@@ -222,6 +249,20 @@ class AgentCommandService:
         self.sessions.ensure_resumable(self.sessions.read_metadata(resolved_id))
         current_run = self.manager.get(resolved_id)
         if current_run is not None and current_run.status in _ACTIVE_RUN_STATUSES:
+            self.manager.update_settings(
+                resolved_id,
+                mode=mode,
+                approval_mode=(
+                    approval_mode
+                    or current_run.approval_mode
+                    or ApprovalMode.SAFE_AUTO
+                ),
+                auto_plan=auto_plan or current_run.auto_plan or AutoPlanMode.ADAPTIVE,
+                skill=skill,
+                skill_provided=True,
+                reasoning_policy=reasoning_policy or current_run.reasoning_policy,
+                reasoning_effort=reasoning_effort or current_run.reasoning_effort,
+            )
             if delivery == "queue":
                 return run_view(await self.manager.enqueue(resolved_id, task)) or {}
             return run_view(await self.manager.steer(resolved_id, task)) or {}
@@ -239,8 +280,11 @@ class AgentCommandService:
             mode=mode,
             approval_mode=approval_mode,
             skill=skill,
+            clear_skill=clear_skill,
             no_skills=no_skills,
             auto_plan=auto_plan,
+            reasoning_policy=reasoning_policy,
+            reasoning_effort=reasoning_effort,
         )
         return run_view(run) or {}
 
@@ -272,6 +316,13 @@ class AgentCommandService:
         self.sessions.set_active(self.workspace, resolved_id)
         self.sessions.ensure_resumable(self.sessions.read_metadata(resolved_id))
 
+        loaded_settings = self.sessions.load(resolved_id)
+        selected_skill = (
+            loaded_settings.memory.active_skill.id
+            if loaded_settings.memory.active_skill is not None
+            else None
+        )
+
         def prepare() -> None:
             loaded = self.sessions.load(resolved_id)
             runtime = PlanRuntime(WorkspacePathPolicy(self.workspace))
@@ -284,6 +335,7 @@ class AgentCommandService:
             session_id=resolved_id,
             task="Execute the approved plan from its current step, verify it, and finish.",
             mode=WorkflowMode.EXECUTE,
+            skill=selected_skill,
             auto_plan=AutoPlanMode.OFF,
             prepare=prepare,
         )
@@ -303,6 +355,31 @@ class AgentCommandService:
         loaded = self.sessions.load(session_id)
         loaded.memory.approval_mode_override = mode
         loaded.store.save_state(loaded.memory, status=loaded.memory.status)
+
+    def set_runtime_settings(
+        self,
+        session_id: str,
+        *,
+        mode: WorkflowMode | None,
+        approval_mode: ApprovalMode | None,
+        auto_plan: AutoPlanMode | None,
+        skill: str | None,
+        skill_provided: bool,
+        reasoning_policy: ReasoningPolicyMode | None,
+        reasoning_effort: ReasoningEffort | None,
+    ) -> dict[str, Any]:
+        resolved_id = self.sessions.resolve_id(session_id)
+        run = self.manager.update_settings(
+            resolved_id,
+            mode=mode,
+            approval_mode=approval_mode,
+            auto_plan=auto_plan,
+            skill=skill,
+            skill_provided=skill_provided,
+            reasoning_policy=reasoning_policy,
+            reasoning_effort=reasoning_effort,
+        )
+        return run_view(run) or {}
 
     def clear_skill(self, session_id: str) -> None:
         self._ensure_idle(session_id)

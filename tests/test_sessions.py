@@ -15,6 +15,7 @@ from repo_rivet.memory.models import Message
 from repo_rivet.session.errors import (
     AmbiguousSessionId,
     SessionAlreadyRunning,
+    SessionNotFound,
     SessionNotResumable,
 )
 from repo_rivet.session.models import SessionStatus
@@ -200,6 +201,22 @@ def test_delete_moves_session_to_trash_and_clears_pointer(tmp_path: Path) -> Non
     assert destination.is_dir()
     assert not loaded.store.session_dir.exists()
     assert manager.get_active(workspace) is None
+
+
+def test_purge_permanently_deletes_session_and_clears_pointer(tmp_path: Path) -> None:
+    manager = make_store(tmp_path)
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    loaded = manager.create(workspace=workspace)
+    session_id = loaded.metadata.session_id
+
+    manager.purge(session_id)
+
+    assert not loaded.store.session_dir.exists()
+    assert not manager.trash_dir.exists()
+    assert manager.get_active(workspace) is None
+    with pytest.raises(SessionNotFound):
+        manager.read_metadata(session_id)
 
 
 def test_live_session_lock_prevents_second_owner(tmp_path: Path) -> None:

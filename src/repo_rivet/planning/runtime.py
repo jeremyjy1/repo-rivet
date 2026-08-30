@@ -185,6 +185,8 @@ class PlanRuntime:
             )
             normalized = resolved.relative_to(self.path_policy.workspace).as_posix()
             if normalized not in step.target_files:
+                if self._completed_file_refinement_step(call, normalized) is not None:
+                    return None
                 return f"{normalized} is outside current plan step {step.step_id}."
         if call.name == "run_verification":
             check_id = call.arguments.get("check_id")
@@ -192,10 +194,58 @@ class PlanRuntime:
                 return f"verification {check_id} is outside current plan step {step.step_id}."
         return None
 
-    def start_action(self) -> None:
-        step = self._require_plan().current_step
-        if step is not None:
+    def requires_scope_revision(self, call: ToolCall) -> bool:
+        """Return whether an invalid action expands the user-approved plan boundary."""
+        artifact = self._require_plan()
+        step = artifact.current_step
+        if step is None:
+            return False
+        expected_file_tool = {
+            PlanOperation.EDIT: "edit_file",
+            PlanOperation.CREATE: "write_file",
+            PlanOperation.DELETE: "delete_path",
+        }.get(step.operation)
+        path = call.arguments.get("path")
+        if isinstance(path, str):
+            if call.name != expected_file_tool:
+                return False
+            resolved = (
+                self.path_policy.resolve_entry(path)
+                if call.name == "delete_path"
+                else self.path_policy.resolve(path)
+            )
+            normalized = resolved.relative_to(self.path_policy.workspace).as_posix()
+            return normalized not in artifact.affected_files
+        if call.name == "run_verification":
+            check_id = call.arguments.get("check_id")
+            return isinstance(check_id, str) and check_id not in {
+                check.check_id for check in artifact.verification
+            }
+        return False
+
+    def matching_step(self, call: ToolCall) -> PlanStep | None:
+        """Return the approved step that authorizes an already validated action."""
+        artifact = self._require_plan()
+        step = artifact.current_step
+        if step is None:
+            return None
+        path = call.arguments.get("path")
+        if isinstance(path, str) and step.target_files:
+            resolved = (
+                self.path_policy.resolve_entry(path)
+                if step.operation == PlanOperation.DELETE
+                else self.path_policy.resolve(path)
+            )
+            normalized = resolved.relative_to(self.path_policy.workspace).as_posix()
+            if normalized not in step.target_files:
+                return self._completed_file_refinement_step(call, normalized)
+        return step
+
+    def start_action(self, call: ToolCall | None = None) -> PlanStep | None:
+        step = self.matching_step(call) if call is not None else self._require_plan().current_step
+        if step is not None and step.status != PlanStepStatus.COMPLETED:
             step.status = PlanStepStatus.RUNNING
+        return step
 
     def observe_action(
         self,
@@ -205,8 +255,11 @@ class PlanRuntime:
         evidence_ref: str | None,
     ) -> None:
         artifact = self._require_plan()
-        step = artifact.current_step
-        if step is None or step.status != PlanStepStatus.RUNNING:
+        step = self.matching_step(call)
+        if step is None:
+            return
+        refinement = step.status == PlanStepStatus.COMPLETED
+        if not refinement and step.status != PlanStepStatus.RUNNING:
             return
         passed = result.ok
         metadata = result.metadata or {}
@@ -234,7 +287,8 @@ class PlanRuntime:
             )
         step.last_observation_ref = evidence_ref
         if passed:
-            step.status = PlanStepStatus.COMPLETED
+            if not refinement:
+                step.status = PlanStepStatus.COMPLETED
             step.last_error = None
             revision = metadata.get("workspace_revision")
             if isinstance(revision, int):
@@ -256,19 +310,45 @@ class PlanRuntime:
                         evidence_ref=evidence_ref,
                     )
         else:
-            step.status = (
-                PlanStepStatus.BLOCKED
-                if result.error_code
-                in {
-                    "approval_denied",
-                    "approval_stale",
-                    "hard_policy_denied",
-                }
-                else PlanStepStatus.FAILED
-            )
+            if not refinement:
+                step.status = (
+                    PlanStepStatus.BLOCKED
+                    if result.error_code
+                    in {
+                        "approval_denied",
+                        "approval_stale",
+                        "hard_policy_denied",
+                    }
+                    else PlanStepStatus.FAILED
+                )
             step.last_error = result.error or "tool result did not satisfy the step"
         if all(item.status == PlanStepStatus.COMPLETED for item in artifact.steps):
             artifact.status = PlanStatus.COMPLETED
+
+    def _completed_file_refinement_step(
+        self,
+        call: ToolCall,
+        normalized_path: str,
+    ) -> PlanStep | None:
+        """Allow a bounded follow-up edit without reopening broader plan scope."""
+        artifact = self._require_plan()
+        current = artifact.current_step
+        if (
+            call.name != "edit_file"
+            or current is None
+            or current.operation != PlanOperation.EDIT
+        ):
+            return None
+        return next(
+            (
+                step
+                for step in artifact.steps
+                if step.status == PlanStepStatus.COMPLETED
+                and step.operation in {PlanOperation.CREATE, PlanOperation.EDIT}
+                and normalized_path in step.target_files
+            ),
+            None,
+        )
 
     @staticmethod
     def _complete_consecutive_verified_steps(

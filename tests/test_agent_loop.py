@@ -5,13 +5,14 @@ from typing import cast
 from repo_rivet.agent.controller import AgentController
 from repo_rivet.agent.state import SessionState
 from repo_rivet.agent.termination import TerminationConfig, TerminationPolicy
+from repo_rivet.approval.models import ApprovalMode
 from repo_rivet.llm.base import ModelContextLengthError, ModelResponse, ModelStreamInterrupted
 from repo_rivet.llm.openai_compatible import ModelRequestError
 from repo_rivet.llm.parser import ResponseParseError
 from repo_rivet.llm.protocol import validate_tool_call_protocol
 from repo_rivet.memory.models import MemoryState, Message
 from repo_rivet.memory.store import MemoryStore
-from repo_rivet.planning.models import WorkflowMode
+from repo_rivet.planning.models import PlanArtifact, PlanStatus, WorkflowMode
 from repo_rivet.tools.base import ToolCall, ToolResult
 from repo_rivet.tools.registry import ToolRegistry
 from repo_rivet.verification.models import ModelErrorRecord
@@ -196,8 +197,30 @@ def test_reasoning_effort_is_selected_by_task_phase_with_configured_ceiling() ->
     )
 
     assert routine and routine.reasoning_effort == "low"
-    assert planning and planning.reasoning_effort == "high"
+    assert planning and planning.reasoning_effort == "medium"
     assert recovery and recovery.reasoning_effort == "high"
+
+
+def test_live_approval_mode_is_applied_at_controller_boundary() -> None:
+    class MutableApprovalEngine:
+        def __init__(self) -> None:
+            self.mode = ApprovalMode.SAFE_AUTO
+
+        def set_mode(self, mode: ApprovalMode) -> None:
+            self.mode = mode
+
+    tools = FakeToolRegistry([])
+    tools.approval_engine = MutableApprovalEngine()  # type: ignore[attr-defined]
+    agent = controller(FakeModelClient([]), tools)
+    agent.set_runtime_settings_source(lambda: {"approval_mode": "llm-auto"})
+    state = SessionState(task="continue")
+    memory = MemoryState(session_id="live-settings")
+
+    changed = agent._apply_runtime_settings(state=state, memory=memory)
+
+    assert changed
+    assert tools.approval_engine.mode == ApprovalMode.LLM_AUTO  # type: ignore[attr-defined]
+    assert memory.approval_mode_override == ApprovalMode.LLM_AUTO
 
 
 def test_long_final_response_is_bounded_only_in_assessment_memory() -> None:
@@ -822,6 +845,108 @@ def test_resumed_missing_plan_recovery_allows_protocol_correction() -> None:
     )
 
 
+def test_run_verification_without_plan_recovers_before_execution() -> None:
+    run_before_plan = call("missing-plan-check", "run_verification", {"check_id": "tests"})
+    run_after_plan = call("registered-check", "run_verification", {"check_id": "tests"})
+    model = FakeModelClient(
+        [
+            ModelResponse(tool_calls=[run_before_plan]),
+            ModelResponse(tool_calls=[verification_plan()]),
+            ModelResponse(tool_calls=[run_after_plan]),
+            ModelResponse(content="The registered verification passed."),
+        ]
+    )
+    tools = FakeToolRegistry([passed_verification_result(check_id="tests", revision=0)])
+    memory = MemoryState(session_id="verification-request-without-plan")
+    events = RecordingSink()
+
+    result = controller(
+        model,
+        tools,
+        termination=TerminationPolicy(TerminationConfig(max_repeated_tool_calls=2)),
+        event_logger=events,
+    ).run("verify the current project", memory=memory)
+
+    assert result.status == "success"
+    assert [executed.id for executed in tools.calls] == ["registered-check"]
+    rejected = next(
+        message
+        for message in memory.messages
+        if message.role == "tool" and message.tool_call_id == "missing-plan-check"
+    )
+    assert "verification_plan_missing" in (rejected.content or "")
+    assert memory.verification_plan_recovery_attempts == 0
+    assert any(
+        event_type == "verification_plan_recovery_started"
+        and data.get("requested_check_ids") == ["tests"]
+        for event_type, data in events.events
+    )
+
+
+def test_executing_verify_step_requests_plan_registration_before_model_action() -> None:
+    memory = MemoryState(session_id="planned-verification-without-runtime-plan")
+    memory.workflow_mode = WorkflowMode.EXECUTE
+    memory.plan_artifact = PlanArtifact.model_validate(
+        {
+            "goal": "Verify the current project",
+            "evidence_refs": ["obs-project"],
+            "steps": [
+                {
+                    "step_id": "verify-tests",
+                    "title": "Run tests",
+                    "intent": "Confirm project behavior",
+                    "evidence_refs": ["obs-project"],
+                    "operation": "verify",
+                    "verification_ids": ["tests"],
+                    "risk": "low",
+                }
+            ],
+            "verification": [
+                {
+                    "check_id": "tests",
+                    "title": "Run tests",
+                    "success_criteria": "The test process exits successfully",
+                }
+            ],
+            "plan_id": "plan-tests",
+            "status": PlanStatus.EXECUTING,
+            "workspace_revision": 0,
+        }
+    )
+    model = FakeModelClient(
+        [
+            ModelResponse(tool_calls=[verification_plan()]),
+            ModelResponse(
+                tool_calls=[
+                    call("registered-plan-check", "run_verification", {"check_id": "tests"})
+                ]
+            ),
+            ModelResponse(content="The planned verification passed."),
+        ]
+    )
+    tools = FakeToolRegistry([passed_verification_result(check_id="tests", revision=0)])
+    events = RecordingSink()
+
+    result = controller(model, tools, event_logger=events).run(
+        "continue the approved plan",
+        memory=memory,
+    )
+
+    assert result.status == "success", result.reason
+    assert [executed.id for executed in tools.calls] == ["registered-plan-check"]
+    assert tools.calls[0].arguments == {"check_id": "tests"}
+    assert any(
+        "current approved plan step requires verification checks"
+        in str(message.get("content"))
+        for message in model.requests[0]["messages"]
+    )
+    assert any(
+        event_type == "verification_plan_recovery_started"
+        and data.get("requested_check_ids") == ["tests"]
+        for event_type, data in events.events
+    )
+
+
 def test_missing_plan_recovery_is_bounded() -> None:
     model = FakeModelClient(
         [
@@ -1031,6 +1156,128 @@ def test_agent_stops_repeated_identical_tool_calls() -> None:
     assert result.status == "stopped"
     assert "repeated identical tool call" in (result.reason or "")
     assert result.tool_call_count == 3
+
+
+def test_successful_command_is_not_executed_twice_at_same_workspace_revision() -> None:
+    first = call(
+        "command-1",
+        "run_command",
+        {"command": "make test", "cwd": ".", "timeout_seconds": 60},
+    )
+    duplicate = call(
+        "command-2",
+        "run_command",
+        {"command": "make test", "cwd": ".", "timeout_seconds": 60},
+    )
+    model = FakeModelClient(
+        [
+            ModelResponse(tool_calls=[decision("decision-1", "run_command"), first]),
+            ModelResponse(tool_calls=[decision("decision-2", "run_command"), duplicate]),
+            ModelResponse(content="The command succeeded; no further action is required."),
+        ]
+    )
+    tools = FakeToolRegistry(
+        [
+            ToolResult(
+                ok=True,
+                output="Command finished with exit code 0.",
+                metadata={"exit_code": 0},
+            )
+        ]
+    )
+    events = RecordingSink()
+
+    result = controller(model, tools, event_logger=events).run("run the requested check")
+
+    assert result.status == "success"
+    assert len(tools.calls) == 1
+    assert not any(name == "action_blocked" for name, _ in events.events)
+    assert not any(
+        name == "tool_result"
+        and data.get("error_code") == "duplicate_successful_command"
+        for name, data in events.events
+    )
+    assert any(
+        name == "duplicate_successful_command_suppressed"
+        for name, _ in events.events
+    )
+    assert {
+        schema["function"]["name"] for schema in model.requests[2]["tools"]
+    } == set()
+
+
+def test_stale_edit_snapshot_is_refreshed_without_consuming_repetition_budget() -> None:
+    fresh_snapshot = "b" * 64
+    stale = ToolResult(
+        ok=False,
+        output="",
+        error="File changed after it was read; read it again before editing",
+        error_code="stale_snapshot",
+        retryable=True,
+        metadata={
+            "execution_attempted": False,
+            "current_total_lines": 500,
+        },
+    )
+    refreshed = ToolResult(
+        ok=True,
+        output="[src/Board.cpp#FRESH lines=50-349 total=500]\n50│ current line",
+        metadata={
+            "path": "src/Board.cpp",
+            "sha256": "fresh-content-hash",
+            "snapshot_id": fresh_snapshot,
+            "snapshot_tag": "FRESH",
+            "start_line": 50,
+            "end_line": 349,
+            "fully_visible_end_line": 349,
+        },
+    )
+    tools = FakeToolRegistry([refreshed])
+    agent = controller(FakeModelClient([]), tools)
+    state = SessionState(task="update Board")
+    state.repeated_tool_calls = 2
+    state.last_tool_signature = "stale-edit"
+    memory = MemoryState(session_id="stale-edit-recovery")
+    edit = call(
+        "stale-edit",
+        "edit_file",
+        {
+            "path": "src/Board.cpp",
+            "snapshot_id": "a" * 64,
+            "operations": [
+                {
+                    "op": "replace",
+                    "start_line": 70,
+                    "end_line": 72,
+                    "new_lines": ["replacement"],
+                }
+            ],
+        },
+    )
+
+    terminal = agent._record_action_result(edit, stale, state=state, memory=memory)
+
+    assert terminal is None
+    assert len(tools.calls) == 1
+    assert tools.calls[0].name == "read_file"
+    assert tools.calls[0].arguments == {
+        "path": "src/Board.cpp",
+        "start_line": 50,
+        "end_line": 349,
+    }
+    assert state.repeated_tool_calls == 0
+    assert state.last_tool_signature is None
+    assert state.consecutive_failures == 0
+    assert state.reflection_required is False
+    assert memory.current_snapshots["src/Board.cpp"] == fresh_snapshot
+    recovery = next(
+        message
+        for message in reversed(state.messages)
+        if message.get("role") == "system"
+        and "stale_snapshot_recovered" in str(message.get("content"))
+    )
+    assert fresh_snapshot in recovery["content"]
+    assert "do not repeat the stale request verbatim" in recovery["content"]
 
 
 def test_agent_renews_step_checkpoint_once_for_observed_progress() -> None:

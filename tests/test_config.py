@@ -45,6 +45,13 @@ max_context_overflow_retries = 1
     assert config.api.model == "test-model"
     assert config.api.context_window_tokens == 32768
     assert config.api.reasoning_effort == "max"
+    assert config.api.reasoning_supported_efforts == (
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+    )
     assert config.api.reasoning_stall_seconds == 45
     assert config.api.tokenizer_encoding == "cl100k_base"
     assert config.api.timeout_seconds == 30
@@ -63,6 +70,10 @@ max_context_overflow_retries = 1
     assert config.skills.global_enabled
     assert config.skills.default_global is None
     assert config.planning.auto_plan.value == "adaptive"
+    assert config.reasoning.effort_policy.value == "adaptive"
+    assert config.reasoning.effort_floor == "low"
+    assert config.reasoning.max_calls_per_run == 1
+    assert config.reasoning.xhigh_calls_per_run == 3
 
 
 def test_load_config_accepts_auto_plan_mode(tmp_path: Path) -> None:
@@ -92,6 +103,38 @@ confidence_threshold = 0.80
     assert config.planning.llm.model == "plan-classifier"
     assert config.planning.llm.timeout_seconds == 7
     assert config.planning.llm.confidence_threshold == 0.80
+
+
+def test_load_config_accepts_reasoning_policy_and_provider_capabilities(
+    tmp_path: Path,
+) -> None:
+    config_path = write_config(
+        tmp_path / "reporivet.toml",
+        """
+[api]
+api_key = "test-secret"
+base_url = "https://example.com/v1"
+model = "test-model"
+context_window_tokens = 32768
+reasoning_effort = "high"
+reasoning_supported_efforts = ["high", "low"]
+
+[reasoning]
+effort_policy = "fixed"
+effort_floor = "medium"
+max_calls_per_run = 2
+xhigh_calls_per_run = 4
+""",
+    )
+
+    config = load_config(config_path)
+
+    assert config.api.reasoning_effort == "high"
+    assert config.api.reasoning_supported_efforts == ("low", "high")
+    assert config.reasoning.effort_policy.value == "fixed"
+    assert config.reasoning.effort_floor == "medium"
+    assert config.reasoning.max_calls_per_run == 2
+    assert config.reasoning.xhigh_calls_per_run == 4
 
 
 def test_load_config_accepts_approval_settings(tmp_path: Path) -> None:
@@ -236,4 +279,24 @@ reserved_output_tokens = 4096
     )
 
     with pytest.raises(ConfigurationError, match="must leave a positive prompt budget"):
+        load_config(config_path)
+
+
+def test_load_config_rejects_reasoning_floor_above_ceiling(tmp_path: Path) -> None:
+    config_path = write_config(
+        tmp_path / "reporivet.toml",
+        """
+[api]
+api_key = "test-secret"
+base_url = "https://example.com/v1"
+model = "test-model"
+context_window_tokens = 32768
+reasoning_effort = "medium"
+
+[reasoning]
+effort_floor = "high"
+""",
+    )
+
+    with pytest.raises(ConfigurationError, match="effort_floor"):
         load_config(config_path)

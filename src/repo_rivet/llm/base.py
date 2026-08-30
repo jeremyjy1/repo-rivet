@@ -6,6 +6,15 @@ from typing import Any, Literal, Protocol
 
 from repo_rivet.tools.base import ToolCall
 
+type ReasoningEffort = Literal["low", "medium", "high", "xhigh", "max"]
+REASONING_EFFORTS: tuple[ReasoningEffort, ...] = (
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+)
+
 
 class ModelContextLengthError(RuntimeError):
     """A provider rejected the request because its context was too large."""
@@ -19,7 +28,7 @@ class ModelStreamInterrupted(RuntimeError):
 class ModelRequestOptions:
     """Per-request provider controls used for bounded recovery."""
 
-    reasoning_effort: Literal["low", "high", "max"] | None = None
+    reasoning_effort: ReasoningEffort | None = None
     thinking_enabled: bool | None = None
 
 

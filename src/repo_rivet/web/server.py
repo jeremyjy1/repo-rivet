@@ -6,12 +6,15 @@ import socket
 import threading
 import webbrowser
 from pathlib import Path
+from typing import cast
 
 import uvicorn
 from rich.console import Console
 
 from repo_rivet.approval.models import ApprovalMode
+from repo_rivet.llm.base import ReasoningEffort
 from repo_rivet.planning.policy import AutoPlanMode
+from repo_rivet.reasoning.policy import ReasoningPolicyMode
 from repo_rivet.web.app import create_app
 
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
@@ -45,6 +48,16 @@ def run_gui(arguments, console: Console) -> int:  # type: ignore[no-untyped-def]
                 ApprovalMode(arguments.approval_mode) if arguments.approval_mode else None
             ),
             default_auto_plan=(AutoPlanMode(arguments.auto_plan) if arguments.auto_plan else None),
+            default_reasoning_policy=(
+                ReasoningPolicyMode(arguments.reasoning_policy)
+                if arguments.reasoning_policy
+                else None
+            ),
+            default_reasoning_effort=(
+                cast(ReasoningEffort, arguments.reasoning_effort)
+                if arguments.reasoning_effort
+                else None
+            ),
             default_skill=arguments.skill,
             no_skills=arguments.no_skills,
         )

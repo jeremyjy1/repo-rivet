@@ -13,8 +13,10 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from repo_rivet.approval.models import ApprovalMode
 from repo_rivet.config import load_config
+from repo_rivet.llm.base import ReasoningEffort
 from repo_rivet.planning.models import WorkflowMode
 from repo_rivet.planning.policy import AutoPlanMode
+from repo_rivet.reasoning.policy import ReasoningPolicyMode
 from repo_rivet.session.store import FileSessionStore
 from repo_rivet.web.auth import LocalAuth
 from repo_rivet.web.events import EventBroker, event_stream, read_event_page
@@ -44,8 +46,11 @@ class SubmitRequest(BaseModel):
     mode: WorkflowMode = WorkflowMode.EXECUTE
     approval_mode: ApprovalMode | None = None
     skill: str | None = Field(default=None, max_length=100)
+    clear_skill: bool = False
     no_skills: bool = False
     auto_plan: AutoPlanMode | None = None
+    reasoning_policy: ReasoningPolicyMode | None = None
+    reasoning_effort: ReasoningEffort | None = None
     delivery: Literal["redirect", "queue"] = "redirect"
 
 
@@ -65,6 +70,17 @@ class PlanPromptRequest(BaseModel):
 class ApprovalModeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     mode: ApprovalMode
+
+
+class RuntimeSettingsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    mode: WorkflowMode | None = None
+    approval_mode: ApprovalMode | None = None
+    auto_plan: AutoPlanMode | None = None
+    skill: str | None = Field(default=None, max_length=100)
+    clear_skill: bool = False
+    reasoning_policy: ReasoningPolicyMode | None = None
+    reasoning_effort: ReasoningEffort | None = None
 
 
 @dataclass(slots=True)
@@ -90,6 +106,8 @@ def create_app(
     reasoning: str | None = None,
     default_approval_mode: ApprovalMode | None = None,
     default_auto_plan: AutoPlanMode | None = None,
+    default_reasoning_policy: ReasoningPolicyMode | None = None,
+    default_reasoning_effort: ReasoningEffort | None = None,
     default_skill: str | None = None,
     no_skills: bool = False,
 ) -> FastAPI:
@@ -112,6 +130,12 @@ def create_app(
         reasoning=reasoning,
         default_approval_mode=default_approval_mode,
         default_auto_plan=default_auto_plan,
+        default_reasoning_policy=(
+            default_reasoning_policy or config.reasoning.effort_policy
+        ),
+        default_reasoning_effort=(
+            default_reasoning_effort or config.api.reasoning_effort
+        ),
         default_skill=default_skill,
         no_skills=no_skills,
     )
@@ -175,6 +199,10 @@ def create_app(
     def session_get(session_id: str) -> dict[str, object]:
         return context.queries.session(session_id, context.manager)
 
+    @app.delete("/api/v1/sessions/{session_id}", dependencies=[Depends(require_write)])
+    def session_delete(session_id: str) -> dict[str, object]:
+        return context.commands.delete_session(session_id)
+
     @app.post("/api/v1/sessions/{session_id}/use", dependencies=[Depends(require_write)])
     def session_use(session_id: str) -> dict[str, object]:
         return context.queries._metadata(context.commands.use_session(session_id))
@@ -197,8 +225,11 @@ def create_app(
             mode=payload.mode,
             approval_mode=payload.approval_mode,
             skill=payload.skill,
+            clear_skill=payload.clear_skill,
             no_skills=payload.no_skills,
             auto_plan=payload.auto_plan,
+            reasoning_policy=payload.reasoning_policy,
+            reasoning_effort=payload.reasoning_effort,
             delivery=payload.delivery,
         )
 
@@ -257,6 +288,25 @@ def create_app(
     def approval_mode(session_id: str, payload: ApprovalModeRequest) -> dict[str, str]:
         context.commands.set_approval_mode(session_id, payload.mode)
         return {"mode": payload.mode.value}
+
+    @app.put(
+        "/api/v1/sessions/{session_id}/runtime-settings",
+        dependencies=[Depends(require_write)],
+    )
+    def runtime_settings(
+        session_id: str,
+        payload: RuntimeSettingsRequest,
+    ) -> dict[str, object]:
+        return context.commands.set_runtime_settings(
+            session_id,
+            mode=payload.mode,
+            approval_mode=payload.approval_mode,
+            auto_plan=payload.auto_plan,
+            skill=payload.skill,
+            skill_provided="skill" in payload.model_fields_set or payload.clear_skill,
+            reasoning_policy=payload.reasoning_policy,
+            reasoning_effort=payload.reasoning_effort,
+        )
 
     @app.delete("/api/v1/sessions/{session_id}/skill", dependencies=[Depends(require_write)])
     def skill_clear(session_id: str) -> dict[str, bool]:

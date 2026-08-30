@@ -2,6 +2,7 @@
 
 import json
 import re
+import threading
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import replace
@@ -12,13 +13,16 @@ from openai import OpenAI
 
 from repo_rivet.config import ApiConfig
 from repo_rivet.llm.base import (
+    REASONING_EFFORTS,
     ModelContextLengthError,
     ModelRequestOptions,
     ModelResponse,
     ModelStreamInterrupted,
+    ReasoningEffort,
 )
 from repo_rivet.llm.parser import ResponseParseError, ResponseParser
 from repo_rivet.llm.protocol import find_pending_tool_calls, validate_tool_call_protocol
+from repo_rivet.reasoning.policy import clamp_effort, map_to_supported_effort
 from repo_rivet.verification.models import ModelErrorRecord
 
 _INLINE_SECRET_PATTERN = re.compile(
@@ -26,11 +30,18 @@ _INLINE_SECRET_PATTERN = re.compile(
     r"(\s*[:=]\s*)(?:bearer\s+)?[^\s,;]+"
 )
 _STREAM_PROGRESS_INTERVAL_SECONDS = 2.0
-_REASONING_EFFORT_ORDER = ("low", "high", "max")
 
 
 class ModelReasoningStalled(RuntimeError):
     """A stream produced private reasoning but no actionable response for too long."""
+
+
+class ModelReasoningCeilingChanged(RuntimeError):
+    """The user lowered the reasoning ceiling while a response was streaming."""
+
+    def __init__(self, reasoning_effort: ReasoningEffort) -> None:
+        super().__init__(reasoning_effort)
+        self.reasoning_effort = reasoning_effort
 
 
 class EventSink(Protocol):
@@ -66,15 +77,26 @@ class OpenAICompatibleClient:
         self._parser = parser or ResponseParser()
         self._event_logger = event_logger
         self._interrupt_checker: Callable[[], bool] | None = None
+        self._reasoning_effort_ceiling = config.reasoning_effort
+        self._reasoning_supported_efforts = config.reasoning_supported_efforts
+        self._reasoning_effort_lock = threading.Lock()
 
     def set_interrupt_checker(self, checker: Callable[[], bool] | None) -> None:
         """Install a cheap thread-safe check used to abandon an in-flight stream."""
         self._interrupt_checker = checker
 
     @property
-    def reasoning_effort_ceiling(self) -> str:
+    def reasoning_effort_ceiling(self) -> ReasoningEffort:
         """Expose the configured controller ceiling without leaking provider credentials."""
-        return self._config.reasoning_effort
+        with self._reasoning_effort_lock:
+            return self._reasoning_effort_ceiling
+
+    def set_reasoning_effort_ceiling(self, effort: str) -> None:
+        """Update the ceiling safely; an active higher-effort stream restarts on its next chunk."""
+        if effort not in REASONING_EFFORTS:
+            raise ValueError(f"Unsupported reasoning effort: {effort}")
+        with self._reasoning_effort_lock:
+            self._reasoning_effort_ceiling = cast(ReasoningEffort, effort)
 
     def complete(
         self,
@@ -85,7 +107,21 @@ class OpenAICompatibleClient:
     ) -> ModelResponse:
         validate_tool_call_protocol(messages)
         request_options = options or ModelRequestOptions()
-        reasoning_effort = request_options.reasoning_effort or self._config.reasoning_effort
+        requested_effort = request_options.reasoning_effort or self.reasoning_effort_ceiling
+        requested_effort = _cap_reasoning_effort(
+            requested_effort, self.reasoning_effort_ceiling
+        )
+        reasoning_effort = map_to_supported_effort(
+            requested_effort, self._reasoning_supported_efforts
+        )
+        if reasoning_effort != requested_effort:
+            self._log(
+                "model_reasoning_effort_mapped",
+                requested_effort=requested_effort,
+                applied_effort=reasoning_effort,
+                supported_efforts=list(self._reasoning_supported_efforts),
+                reason="selected provider does not support the requested tier",
+            )
         thinking_enabled = request_options.thinking_enabled
         if thinking_enabled is None and self._config.thinking_mode != "provider_default":
             thinking_enabled = self._config.thinking_mode == "enabled"
@@ -116,9 +152,28 @@ class OpenAICompatibleClient:
                             attempt=attempt,
                             reasoning_effort=reasoning_effort,
                         )
+                    except ModelReasoningCeilingChanged as error:
+                        previous_effort = reasoning_effort
+                        reasoning_effort = error.reasoning_effort
+                        provider_options["reasoning_effort"] = reasoning_effort
+                        self._log(
+                            "model_reasoning_effort_downgraded",
+                            attempt=attempt,
+                            previous_effort=previous_effort,
+                            reasoning_effort=reasoning_effort,
+                            elapsed_seconds=None,
+                            reason="reasoning ceiling changed during active stream",
+                        )
+                        continue
                     except ModelReasoningStalled as error:
                         lower_effort = _lower_reasoning_effort(reasoning_effort)
                         if lower_effort is None:
+                            raise
+                        lower_effort = map_to_supported_effort(
+                            lower_effort,
+                            self._reasoning_supported_efforts,
+                        )
+                        if lower_effort == reasoning_effort:
                             raise
                         previous_effort = reasoning_effort
                         reasoning_effort = lower_effort
@@ -279,11 +334,22 @@ class OpenAICompatibleClient:
                 len("".join(fragment["arguments"]))
                 for fragment in tool_fragments.values()
             )
+            current_ceiling = self.reasoning_effort_ceiling
+            bounded_effort = map_to_supported_effort(
+                _cap_reasoning_effort(reasoning_effort, current_ceiling),
+                self._reasoning_supported_efforts,
+            )
+            if (
+                bounded_effort != reasoning_effort
+                and not content_chars
+                and not tool_argument_chars
+            ):
+                raise ModelReasoningCeilingChanged(bounded_effort)
             if (
                 reasoning_chars
                 and not content_chars
                 and not tool_argument_chars
-                and reasoning_effort in {"high", "max"}
+                and reasoning_effort in {"high", "xhigh", "max"}
                 and elapsed_seconds >= self._config.reasoning_stall_seconds
             ):
                 raise ModelReasoningStalled(round(elapsed_seconds, 1))
@@ -393,11 +459,18 @@ def _stream_activity_phase(
     return "waiting"
 
 
-def _lower_reasoning_effort(effort: str | None) -> str | None:
-    if effort not in _REASONING_EFFORT_ORDER:
+def _lower_reasoning_effort(effort: str | None) -> ReasoningEffort | None:
+    if effort not in REASONING_EFFORTS:
         return None
-    index = _REASONING_EFFORT_ORDER.index(effort)
-    return _REASONING_EFFORT_ORDER[index - 1] if index else None
+    index = REASONING_EFFORTS.index(cast(ReasoningEffort, effort))
+    return REASONING_EFFORTS[index - 1] if index else None
+
+
+def _cap_reasoning_effort(
+    effort: ReasoningEffort,
+    ceiling: ReasoningEffort,
+) -> ReasoningEffort:
+    return clamp_effort(effort, "low", ceiling)
 
 
 def _stream_reasoning_text(delta: Any) -> str | None:

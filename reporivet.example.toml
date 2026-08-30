@@ -8,6 +8,9 @@ thinking_mode = "provider_default"
 # Maximum reasoning tier. The controller selects a lower tier for routine turns and
 # automatically downgrades stalled reasoning-only streams.
 reasoning_effort = "max"
+# Declare only tiers accepted by the selected model/provider. Adaptive choices are
+# mapped to the strongest supported tier that does not exceed the requested effort.
+reasoning_supported_efforts = ["low", "medium", "high", "xhigh", "max"]
 reasoning_stall_seconds = 45
 # Optional optimization; unavailable or unknown encodings fall back to conservative estimation.
 # tokenizer_encoding = "o200k_base"
@@ -30,6 +33,11 @@ max_context_overflow_retries = 2
 enabled = true
 # off, summary, or trace; structured summaries never expose raw chain-of-thought.
 display = "summary"
+# adaptive treats api.reasoning_effort as a per-call ceiling; fixed uses it every call.
+effort_policy = "adaptive"
+effort_floor = "low"
+max_calls_per_run = 1
+xhigh_calls_per_run = 3
 max_summary_chars = 1000
 recent_event_limit = 8
 require_for_mutating_tools = true

@@ -59,11 +59,18 @@ def test_console_reporter_shows_transient_status_while_model_generates(
 
     monkeypatch.setattr(console, "status", create_status)
 
-    reporter.log("model_call", step=1)
+    reporter.log(
+        "model_call",
+        step=1,
+        reasoning_effort="medium",
+        reasoning_policy="adaptive",
+        reasoning_effort_ceiling="max",
+    )
 
     assert status.started is True
     assert status.stopped is False
     assert "generating the next action" in captured["message"]
+    assert "medium reasoning (adaptive up to max)" in captured["message"]
     assert captured["spinner"] == "dots"
 
     reporter.log("model_call_finished", step=1)
@@ -95,6 +102,30 @@ def test_console_reporter_updates_model_status_with_safe_reasoning_progress(
     assert "evaluating the next action" in status.message
     assert "24s" in status.message
     assert buffer.getvalue() == ""
+
+
+def test_console_reporter_shows_provider_reasoning_mapping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    console = Console(file=StringIO(), force_terminal=False, color_system=None)
+    reporter = ConsoleEventReporter(console)
+    status = RecordingStatus()
+    captured: dict[str, str] = {}
+
+    def create_status(message: str, *, spinner: str) -> RecordingStatus:
+        captured["message"] = message
+        return status
+
+    monkeypatch.setattr(console, "status", create_status)
+
+    reporter.log(
+        "model_reasoning_effort_mapped",
+        requested_effort="xhigh",
+        applied_effort="high",
+    )
+
+    assert "high reasoning" in captured["message"]
+    assert "provider mapping from xhigh" in captured["message"]
 
 
 def test_console_reporter_shows_approval_model_review_status(

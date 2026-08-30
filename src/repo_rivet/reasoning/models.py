@@ -6,6 +6,9 @@ from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from repo_rivet.llm.base import ReasoningEffort
+from repo_rivet.reasoning.policy import ReasoningPolicyMode
+
 EvidenceRef = Annotated[str, Field(min_length=1, max_length=200)]
 BoundedNote = Annotated[str, Field(min_length=1, max_length=500)]
 
@@ -35,6 +38,10 @@ class ReasoningConfig(BaseModel):
     require_for_mutating_tools: bool = True
     require_for_commands: bool = True
     max_reflection_only_turns: int = Field(default=2, ge=1, le=10)
+    effort_policy: ReasoningPolicyMode = ReasoningPolicyMode.ADAPTIVE
+    effort_floor: ReasoningEffort = "low"
+    max_calls_per_run: int = Field(default=1, ge=0, le=10)
+    xhigh_calls_per_run: int = Field(default=3, ge=0, le=20)
 
 
 class ActionIntent(BaseModel):

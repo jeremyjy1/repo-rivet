@@ -18,8 +18,11 @@ from repo_rivet.agent.state import SessionState
 from repo_rivet.agent.termination import TerminationConfig, TerminationPolicy
 from repo_rivet.approval.models import ApprovalMode
 from repo_rivet.cli import _build_runtime, _idle_session_status
+from repo_rivet.llm.base import ReasoningEffort
+from repo_rivet.planning.classifier import OpenAIPlanClassifier
 from repo_rivet.planning.models import WorkflowMode
-from repo_rivet.planning.policy import AutoPlanMode
+from repo_rivet.planning.policy import AutoPlanMode, AutoPlanPolicy
+from repo_rivet.reasoning.policy import ReasoningPolicyMode
 from repo_rivet.session.models import SessionStatus
 from repo_rivet.storage.event_sink import EventSink
 from repo_rivet.web.approvals import WebHumanApprover
@@ -106,12 +109,24 @@ class ActiveRun:
     workspace: Path
     task: str
     mode: WorkflowMode
+    approval_mode: ApprovalMode | None = None
+    auto_plan: AutoPlanMode | None = None
+    skill: str | None = None
+    no_skills: bool = False
+    reasoning_policy: ReasoningPolicyMode = ReasoningPolicyMode.ADAPTIVE
+    reasoning_effort: ReasoningEffort = "max"
     stop_event: threading.Event = field(default_factory=threading.Event)
     inputs: RunInputMailbox = field(default_factory=RunInputMailbox)
     approver: WebHumanApprover = field(default_factory=WebHumanApprover)
     task_handle: asyncio.Task[None] | None = None
     event_logger: EventSink | None = None
     input_event_lock: threading.Lock = field(default_factory=threading.Lock)
+    settings_lock: threading.Lock = field(default_factory=threading.Lock)
+    pending_approval_mode: ApprovalMode | None = None
+    pending_skill_update: bool = False
+    pending_planning_mode: bool = False
+    pending_reasoning_policy: ReasoningPolicyMode | None = None
+    model_client: Any | None = None
     pending_input_events: list[tuple[str, Literal["redirect", "queue"]]] = field(
         default_factory=list
     )
@@ -134,6 +149,8 @@ class RuntimeManager:
         reasoning: str | None = None,
         default_approval_mode: ApprovalMode | None = None,
         default_auto_plan: AutoPlanMode | None = None,
+        default_reasoning_policy: ReasoningPolicyMode = ReasoningPolicyMode.ADAPTIVE,
+        default_reasoning_effort: ReasoningEffort = "max",
         default_skill: str | None = None,
         no_skills: bool = False,
     ) -> None:
@@ -145,6 +162,8 @@ class RuntimeManager:
         self.reasoning = reasoning
         self.default_approval_mode = default_approval_mode
         self.default_auto_plan = default_auto_plan
+        self.default_reasoning_policy = default_reasoning_policy
+        self.default_reasoning_effort = default_reasoning_effort
         self.default_skill = default_skill
         self.no_skills = no_skills
         self._runs: dict[str, ActiveRun] = {}
@@ -159,8 +178,11 @@ class RuntimeManager:
         mode: WorkflowMode,
         approval_mode: ApprovalMode | None = None,
         skill: str | None = None,
+        clear_skill: bool = False,
         no_skills: bool = False,
         auto_plan: AutoPlanMode | None = None,
+        reasoning_policy: ReasoningPolicyMode | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
         prepare: Callable[[], None] | None = None,
     ) -> ActiveRun:
         normalized = task.strip()
@@ -186,6 +208,12 @@ class RuntimeManager:
                 workspace=self.workspace,
                 task=normalized,
                 mode=mode,
+                approval_mode=approval_mode or self.default_approval_mode,
+                auto_plan=auto_plan or self.default_auto_plan,
+                skill=(None if clear_skill else skill or self.default_skill),
+                no_skills=no_skills or self.no_skills,
+                reasoning_policy=reasoning_policy or self.default_reasoning_policy,
+                reasoning_effort=reasoning_effort or self.default_reasoning_effort,
             )
             self._runs[session_id] = run
             self._workspace_runs[self.workspace] = session_id
@@ -201,6 +229,67 @@ class RuntimeManager:
                 )
             )
             return run
+
+    def update_settings(
+        self,
+        session_id: str,
+        *,
+        mode: WorkflowMode | None = None,
+        approval_mode: ApprovalMode | None = None,
+        auto_plan: AutoPlanMode | None = None,
+        skill: str | None = None,
+        skill_provided: bool = False,
+        reasoning_policy: ReasoningPolicyMode | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
+    ) -> ActiveRun:
+        """Update an active run; live-safe settings apply at the next controller boundary."""
+        run = self._runs.get(session_id)
+        if run is None or run.status not in {"queued", "running", "awaiting_approval"}:
+            raise ValueError("This session has no active run to configure")
+        with run.settings_lock:
+            previous_effort = run.reasoning_effort
+            previous_policy = run.reasoning_policy
+            if mode is not None:
+                run.mode = mode
+                if mode == WorkflowMode.PLANNING:
+                    run.pending_planning_mode = True
+            if approval_mode is not None and approval_mode != run.approval_mode:
+                run.approval_mode = approval_mode
+                run.pending_approval_mode = approval_mode
+            if auto_plan is not None:
+                run.auto_plan = auto_plan
+            if skill_provided:
+                run.skill = skill
+                run.pending_skill_update = True
+            if reasoning_effort is not None:
+                run.reasoning_effort = reasoning_effort
+            if reasoning_policy is not None and reasoning_policy != run.reasoning_policy:
+                run.reasoning_policy = reasoning_policy
+                run.pending_reasoning_policy = reasoning_policy
+            model_client = run.model_client
+            event_logger = run.event_logger
+        setter = getattr(model_client, "set_reasoning_effort_ceiling", None)
+        if reasoning_effort is not None and callable(setter):
+            setter(reasoning_effort)
+        if event_logger is not None:
+            event_logger.log(
+                "runtime_settings_changed",
+                mode=run.mode.value,
+                approval_mode=run.approval_mode.value if run.approval_mode else None,
+                auto_plan=run.auto_plan.value if run.auto_plan else None,
+                skill=run.skill,
+                reasoning_policy=run.reasoning_policy.value,
+                reasoning_effort=run.reasoning_effort,
+                reasoning_effort_changed=(
+                    reasoning_effort is not None and previous_effort != reasoning_effort
+                ),
+                reasoning_policy_changed=(
+                    reasoning_policy is not None and previous_policy != reasoning_policy
+                ),
+                application="live_safe_boundary",
+            )
+        self.broker.notify(session_id)
+        return run
 
     async def stop(self, session_id: str) -> ActiveRun:
         run = self._runs.get(session_id)
@@ -246,6 +335,29 @@ class RuntimeManager:
 
     def get(self, session_id: str) -> ActiveRun | None:
         return self._runs.get(session_id)
+
+    @staticmethod
+    def _drain_live_settings(run: ActiveRun) -> dict[str, str]:
+        with run.settings_lock:
+            mode = run.pending_approval_mode
+            run.pending_approval_mode = None
+            skill_update = run.pending_skill_update
+            run.pending_skill_update = False
+            planning_mode = run.pending_planning_mode
+            run.pending_planning_mode = False
+            reasoning_policy = run.pending_reasoning_policy
+            run.pending_reasoning_policy = None
+            skill = run.skill
+        updates: dict[str, str] = {}
+        if mode is not None:
+            updates["approval_mode"] = mode.value
+        if skill_update:
+            updates["skill"] = skill or ""
+        if planning_mode:
+            updates["workflow_mode"] = WorkflowMode.PLANNING.value
+        if reasoning_policy is not None:
+            updates["reasoning_policy"] = reasoning_policy.value
+        return updates
 
     async def _worker(
         self,
@@ -323,7 +435,21 @@ class RuntimeManager:
                     delivery=delivery,
                 )
         run.approver.bind_event_logger(runtime.controller.event_logger)
+        with run.settings_lock:
+            run.model_client = runtime.controller.model_client
+            reasoning_effort = run.reasoning_effort
+        set_reasoning_effort = getattr(
+            runtime.controller.model_client,
+            "set_reasoning_effort_ceiling",
+            None,
+        )
+        if callable(set_reasoning_effort):
+            set_reasoning_effort(reasoning_effort)
+        runtime.controller.set_reasoning_policy_mode(run.reasoning_policy)
         runtime.controller.set_steering_source(run.inputs.drain_redirects)
+        runtime.controller.set_runtime_settings_source(
+            lambda: self._drain_live_settings(run)
+        )
         set_interrupt_checker = getattr(
             runtime.controller.model_client,
             "set_interrupt_checker",
@@ -334,10 +460,38 @@ class RuntimeManager:
         try:
             task = run.task
             while True:
+                with run.settings_lock:
+                    mode = run.mode
+                    auto_plan_mode = run.auto_plan or runtime.config.planning.auto_plan
+                    selected_skill = run.skill
+                runtime.controller.auto_plan_policy = AutoPlanPolicy(
+                    auto_plan_mode,
+                    classifier_confidence_threshold=(
+                        runtime.config.planning.llm.confidence_threshold
+                    ),
+                )
+                runtime.controller.plan_classifier = (
+                    OpenAIPlanClassifier(
+                        runtime.config.api,
+                        model=runtime.config.planning.llm.model,
+                        timeout_seconds=runtime.config.planning.llm.timeout_seconds,
+                    )
+                    if auto_plan_mode == AutoPlanMode.ADAPTIVE
+                    and runtime.config.planning.llm.enabled
+                    else None
+                )
+                if runtime.skill_runtime is not None:
+                    if selected_skill is None:
+                        runtime.skill_runtime.clear(runtime.memory)
+                    elif (
+                        runtime.memory.active_skill is None
+                        or runtime.memory.active_skill.id != selected_skill
+                    ):
+                        runtime.skill_runtime.activate(runtime.memory, selected_skill)
                 result = runtime.controller.run(
                     task,
                     memory=runtime.memory,
-                    workflow_mode=run.mode,
+                    workflow_mode=mode,
                 )
                 follow_up = run.inputs.pop_or_close()
                 if follow_up is None or run.stop_event.is_set():
@@ -374,9 +528,12 @@ class RuntimeManager:
         finally:
             with run.input_event_lock:
                 run.event_logger = None
+            with run.settings_lock:
+                run.model_client = None
             if callable(set_interrupt_checker):
                 set_interrupt_checker(None)
             runtime.controller.set_steering_source(None)
+            runtime.controller.set_runtime_settings_source(None)
             run.approver.bind_event_logger(None)
             runtime.close()
 
@@ -384,6 +541,15 @@ class RuntimeManager:
 def run_view(run: ActiveRun | None) -> dict[str, Any] | None:
     if run is None:
         return None
+    with run.settings_lock:
+        settings = {
+            "mode": run.mode.value,
+            "approval_mode": run.approval_mode.value if run.approval_mode else None,
+            "auto_plan": run.auto_plan.value if run.auto_plan else None,
+            "skill": run.skill,
+            "reasoning_policy": run.reasoning_policy.value,
+            "reasoning_effort": run.reasoning_effort,
+        }
     pending = run.approver.snapshot()
     status = "awaiting_approval" if pending is not None and run.status == "running" else run.status
     return {
@@ -391,6 +557,7 @@ def run_view(run: ActiveRun | None) -> dict[str, Any] | None:
         "session_id": run.session_id,
         "status": status,
         "mode": run.mode.value,
+        "settings": settings,
         "result": run.result,
         "error": run.error,
         "pending_approval": pending,

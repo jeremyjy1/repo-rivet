@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
-from repo_rivet.llm.base import ModelResponse
+from repo_rivet.llm.base import ModelResponse, ReasoningEffort
 from repo_rivet.planning.models import WorkflowMode
 from repo_rivet.reasoning.models import ReasoningEvent
 from repo_rivet.tools.base import ToolCall, ToolResult
@@ -61,6 +61,9 @@ class SessionState:
     verification_plan_revision_reason: str | None = None
     verification_plan_revision_guidance: str | None = None
     verification_plan_revision_attempts: int = 0
+    plan_scope_revision_required: bool = False
+    plan_scope_revision_reason: str | None = None
+    plan_scope_revision_attempts: int = 0
     candidate_final_assessment: FinalAssessment | None = None
     consecutive_failures: int = 0
     repeated_tool_calls: int = 0
@@ -71,12 +74,20 @@ class SessionState:
     sanitize_unreplayable_provider_history: bool = False
     consecutive_protocol_failures: int = 0
     last_tool_signature: str | None = None
+    last_successful_command_signature: str | None = None
+    last_successful_command_workspace_revision: int | None = None
+    suppress_run_command_once: bool = False
     recent_errors: list[str] = field(default_factory=list)
     started_at: float = field(default_factory=time.monotonic)
     interrupted: bool = False
     reasoning_only_turns: int = 0
     reflection_required: bool = False
     pending_decision: ReasoningEvent | None = None
+    reasoning_max_calls: int = 0
+    reasoning_xhigh_calls: int = 0
+    current_reasoning_effort: ReasoningEffort | None = None
+    current_reasoning_phase: str | None = None
+    current_reasoning_reason: str | None = None
 
     def record_model_response(self, response: ModelResponse) -> bool:
         """Advance one model step and track unusable empty responses."""
@@ -145,12 +156,7 @@ class SessionState:
     ) -> None:
         self.tool_call_count += 1
         if track_repetition:
-            signature = json.dumps(
-                {"name": call.name, "arguments": call.arguments},
-                ensure_ascii=False,
-                sort_keys=True,
-                default=str,
-            )
+            signature = self.tool_signature(call)
             if signature == self.last_tool_signature:
                 self.repeated_tool_calls += 1
             else:
@@ -176,6 +182,30 @@ class SessionState:
                     self.verification_results[check_id] = verification.model_copy(
                         update={"status": VerificationStatus.STALE}
                     )
+        if track_repetition and call.name == "run_command":
+            exit_code = (result.metadata or {}).get("exit_code")
+            if result.ok and exit_code == 0:
+                self.last_successful_command_signature = self.tool_signature(call)
+                self.last_successful_command_workspace_revision = self.workspace_revision
+            else:
+                self.last_successful_command_signature = None
+                self.last_successful_command_workspace_revision = None
+
+    @staticmethod
+    def tool_signature(call: ToolCall) -> str:
+        return json.dumps(
+            {"name": call.name, "arguments": call.arguments},
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+
+    def repeats_successful_command(self, call: ToolCall) -> bool:
+        return (
+            call.name == "run_command"
+            and self.last_successful_command_signature == self.tool_signature(call)
+            and self.last_successful_command_workspace_revision == self.workspace_revision
+        )
 
     def record_meaningful_progress(self, call: ToolCall, result: ToolResult) -> None:
         """Record a new successful observation without trusting model claims."""
@@ -262,8 +292,12 @@ class SessionState:
             "Verification plan revision required: "
             f"{self.verification_plan_revision_required}"
             f" ({self.verification_plan_revision_reason or 'none'}).\n"
+            "Plan scope revision required: "
+            f"{self.plan_scope_revision_required}"
+            f" ({self.plan_scope_revision_reason or 'none'}).\n"
             "Recovery attempts: "
-            f"verification-plan={self.verification_plan_revision_attempts}.\n"
+            f"verification-plan={self.verification_plan_revision_attempts}, "
+            f"plan-scope={self.plan_scope_revision_attempts}.\n"
             f"One-shot pending decision: {pending_decision}.\n"
             f"Recent errors: {errors}."
         )

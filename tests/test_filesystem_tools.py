@@ -340,6 +340,7 @@ def test_stale_snapshot_and_path_mismatch_fail_closed(tmp_path: Path) -> None:
 
     assert mismatch.error_code == "snapshot_path_mismatch"
     assert stale.error_code == "stale_snapshot"
+    assert stale.metadata and stale.metadata["current_total_lines"] == 1
     assert first.read_text(encoding="utf-8") == "external\n"
     assert second.read_text(encoding="utf-8") == "other\n"
 

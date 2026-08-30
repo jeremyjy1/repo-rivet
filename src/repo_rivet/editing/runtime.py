@@ -131,6 +131,7 @@ class EditingRuntime:
                 metadata={
                     "requested_snapshot": snapshot.display_tag,
                     "current_snapshot": current.display_tag,
+                    "current_total_lines": len(live.lines),
                 },
             )
         planned = plan_edit(snapshot, arguments, self.visibility)

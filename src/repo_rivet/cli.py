@@ -31,6 +31,7 @@ from repo_rivet.approval.risk_analyzer import RiskAnalyzer
 from repo_rivet.approval.semantic_analyzer import ApprovalFactAnalyzer
 from repo_rivet.config import AppConfig, ConfigurationError, load_config
 from repo_rivet.context.manager import ContextManager
+from repo_rivet.llm.base import REASONING_EFFORTS
 from repo_rivet.llm.openai_compatible import OpenAICompatibleClient
 from repo_rivet.memory.budget_manager import TokenBudgetConfig, TokenBudgetManager
 from repo_rivet.memory.compactor import ConversationCompactor
@@ -43,6 +44,7 @@ from repo_rivet.planning.models import PlanArtifact, PlanStatus, WorkflowMode
 from repo_rivet.planning.policy import AutoPlanMode, AutoPlanPolicy
 from repo_rivet.reasoning.manager import ReasoningManager
 from repo_rivet.reasoning.models import ReasoningDisplayMode
+from repo_rivet.reasoning.policy import ReasoningPolicyMode
 from repo_rivet.safety.path_policy import PathPolicyError
 from repo_rivet.session.errors import SessionError
 from repo_rivet.session.lock import SessionLock
@@ -285,6 +287,16 @@ def _add_model_runtime_arguments(parser: argparse.ArgumentParser) -> None:
         "--reasoning",
         choices=[mode.value for mode in ReasoningDisplayMode],
         help="Display structured decision records: off, summary, or trace",
+    )
+    parser.add_argument(
+        "--reasoning-policy",
+        choices=[mode.value for mode in ReasoningPolicyMode],
+        help="Select adaptive per-call reasoning or a fixed effort level",
+    )
+    parser.add_argument(
+        "--reasoning-effort",
+        choices=list(REASONING_EFFORTS),
+        help="Set the adaptive reasoning ceiling or the fixed reasoning level",
     )
     parser.add_argument(
         "--approval-mode",
@@ -971,7 +983,23 @@ def _build_runtime(
         configured_reasoning_mode if config.reasoning.enabled else ReasoningDisplayMode.OFF
     )
     reasoning_config = config.reasoning.model_copy(update={"display": reasoning_mode})
+    reasoning_config = reasoning_config.model_copy(
+        update={
+            "effort_policy": ReasoningPolicyMode(
+                getattr(arguments, "reasoning_policy", None)
+                or reasoning_config.effort_policy
+            )
+        }
+    )
     reasoning_manager = ReasoningManager(reasoning_config, secrets=secrets)
+    api_config = config.api.model_copy(
+        update={
+            "reasoning_effort": (
+                getattr(arguments, "reasoning_effort", None)
+                or config.api.reasoning_effort
+            )
+        }
+    )
     calibration_store = TokenCalibrationStore(session_manager.root / "token-calibration.json")
     token_manager = TokenBudgetManager(
         estimator=estimator,
@@ -1094,7 +1122,7 @@ def _build_runtime(
                     activation=memory.active_skill.activation.value,
                 )
         controller = AgentController(
-            model_client=OpenAICompatibleClient(config.api, event_logger=runtime_events),
+            model_client=OpenAICompatibleClient(api_config, event_logger=runtime_events),
             tool_registry=registry,
             context_manager=ContextManager(token_manager=token_manager),
             termination_policy=termination,

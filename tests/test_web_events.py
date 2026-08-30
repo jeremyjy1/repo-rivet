@@ -8,12 +8,14 @@ import pytest
 from repo_rivet.approval.models import (
     ApprovalAction,
     ApprovalFacts,
+    ApprovalMode,
     ApprovalRequest,
     ApprovalScope,
     RiskAssessment,
     RiskLevel,
 )
 from repo_rivet.planning.models import WorkflowMode
+from repo_rivet.planning.policy import AutoPlanMode
 from repo_rivet.session.store import FileSessionStore
 from repo_rivet.web.approvals import WebHumanApprover
 from repo_rivet.web.events import EventBroker, read_event_page, read_events
@@ -264,6 +266,28 @@ def test_first_submission_names_an_empty_browser_session(tmp_path: Path) -> None
     assert metadata.name == "Build a terminal Tetris game"
 
 
+def test_browser_delete_rejects_a_conversation_with_an_active_run(tmp_path: Path) -> None:
+    class StubManager:
+        def get(self, session_id: str) -> ActiveRun:
+            return ActiveRun(
+                run_id="run-1",
+                session_id=session_id,
+                workspace=tmp_path,
+                task="Still working",
+                mode=WorkflowMode.EXECUTE,
+                status="running",
+            )
+
+    sessions = FileSessionStore(root=tmp_path / "home")
+    created = sessions.create(workspace=tmp_path)
+    commands = AgentCommandService(tmp_path, sessions, StubManager())  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="Stop the active run"):
+        commands.delete_session(created.metadata.session_id)
+
+    assert created.store.session_dir.is_dir()
+
+
 def test_runtime_manager_redirects_active_stream_and_queues_instruction(tmp_path: Path) -> None:
     async def scenario() -> None:
         manager = RuntimeManager(
@@ -297,6 +321,66 @@ def test_runtime_manager_redirects_active_stream_and_queues_instruction(tmp_path
             await manager.steer(run.session_id, "This must not be silently lost")
 
     asyncio.run(scenario())
+
+
+def test_runtime_settings_apply_live_safe_values_and_defer_task_scope_values(
+    tmp_path: Path,
+) -> None:
+    class MutableModel:
+        def __init__(self) -> None:
+            self.ceiling = "max"
+
+        def set_reasoning_effort_ceiling(self, effort: str) -> None:
+            self.ceiling = effort
+
+    class RecordingEvents:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, dict[str, object]]] = []
+
+        def log(self, event_type: str, **data: object) -> None:
+            self.events.append((event_type, data))
+
+    manager = RuntimeManager(
+        workspace=tmp_path,
+        config_path=tmp_path / "config.toml",
+        broker=EventBroker(),
+    )
+    model = MutableModel()
+    events = RecordingEvents()
+    run = ActiveRun(
+        run_id="run-1",
+        session_id="session-1",
+        workspace=tmp_path,
+        task="first",
+        mode=WorkflowMode.EXECUTE,
+        model_client=model,
+        event_logger=events,
+        status="running",
+    )
+    manager._runs[run.session_id] = run
+
+    updated = manager.update_settings(
+        run.session_id,
+        mode=WorkflowMode.PLANNING,
+        approval_mode=ApprovalMode.LLM_AUTO,
+        auto_plan=AutoPlanMode.ALWAYS,
+        skill="global:cpp-debug",
+        skill_provided=True,
+        reasoning_effort="low",
+    )
+
+    assert updated is run
+    assert model.ceiling == "low"
+    assert run.mode == WorkflowMode.PLANNING
+    assert run.auto_plan == AutoPlanMode.ALWAYS
+    assert run.skill == "global:cpp-debug"
+    assert manager._drain_live_settings(run) == {
+        "approval_mode": "llm-auto",
+        "skill": "global:cpp-debug",
+        "workflow_mode": "planning",
+    }
+    assert manager._drain_live_settings(run) == {}
+    assert events.events[-1][0] == "runtime_settings_changed"
 
 
 def test_runtime_manager_rejects_a_second_run_while_stopping(tmp_path: Path) -> None:

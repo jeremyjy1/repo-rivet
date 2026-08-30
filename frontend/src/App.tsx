@@ -1,38 +1,57 @@
-import { memo, useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import {
+  Activity,
   Bot,
+  BrainCircuit,
   Check,
   CheckCircle2,
+  ChevronDown,
   ChevronRight,
   CircleStop,
+  CircleOff,
+  ClipboardList,
+  CornerUpRight,
+  Feather,
   FileCode2,
   Files,
   Folder,
+  Gauge,
   GitBranch,
   Hammer,
   ListChecks,
+  ListPlus,
+  ListTodo,
   LoaderCircle,
   MessageSquareText,
   Moon,
   Play,
   Plus,
+  PackageOpen,
+  Puzzle,
   RefreshCw,
+  Route,
   Send,
-  Settings2,
   ShieldAlert,
+  ShieldCheck,
+  ShieldOff,
+  ShieldQuestion,
   Sparkles,
   Sun,
+  Trash2,
   XCircle,
+  Zap,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { AgentEvent, Approval, EventPage, SessionDetail, SessionSummary, api, authenticate } from "./api";
 
+type ReasoningEffort = "low" | "medium" | "high" | "xhigh" | "max";
+type ReasoningPolicy = "adaptive" | "fixed";
 type Bootstrap = {
   workspace: string;
   active_session_id: string | null;
   sessions: SessionSummary[];
-  settings: { model: string; base_url: string; context_limit: number; approval_mode: string; auto_plan: "off" | "adaptive" | "always"; auto_plan_llm: boolean };
+  settings: { model: string; base_url: string; context_limit: number; approval_mode: string; auto_plan: "off" | "adaptive" | "always"; auto_plan_llm: boolean; reasoning_policy: ReasoningPolicy; reasoning_effort: ReasoningEffort; reasoning_supported_efforts: ReasoningEffort[] };
 };
 type FileEntry = { name: string; path: string; kind: "file" | "directory"; size: number | null };
 type Skill = { id: string; name: string; description: string; version: string; source: string };
@@ -68,6 +87,7 @@ const sessionRefreshEvents = new Set([
   "plan.step.finished",
   "auto.plan.started",
   "run.finished",
+  "runtime.settings.changed",
   "session.start",
   "user.input",
   "verification.result",
@@ -107,9 +127,13 @@ function App() {
   const [mode, setMode] = useState<"execute" | "planning">("execute");
   const [approvalMode, setApprovalMode] = useState("safe-auto");
   const [autoPlan, setAutoPlan] = useState<"off" | "adaptive" | "always">("adaptive");
+  const [reasoningPolicy, setReasoningPolicy] = useState<ReasoningPolicy>("adaptive");
+  const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>("max");
   const [theme, setTheme] = useState<Theme>(initialTheme);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
+  const [deleteTarget, setDeleteTarget] = useState<SessionSummary | null>(null);
+  const [deletingSession, setDeletingSession] = useState(false);
   const creatingSession = useRef<Promise<string> | null>(null);
   const selectedSessionId = useRef<string | null>(null);
 
@@ -118,7 +142,14 @@ function App() {
     const detail = await api<SessionDetail>(`/api/v1/sessions/${sessionId}`);
     selectedSessionId.current = detail.session_id;
     setSession(detail);
-    if (detail.approval_mode) setApprovalMode(detail.approval_mode);
+    const runtimeSettings = detail.run?.settings;
+    if (runtimeSettings?.mode) setMode(runtimeSettings.mode);
+    if (runtimeSettings?.approval_mode) setApprovalMode(runtimeSettings.approval_mode);
+    else if (detail.approval_mode) setApprovalMode(detail.approval_mode);
+    if (runtimeSettings?.auto_plan) setAutoPlan(runtimeSettings.auto_plan);
+    setSelectedSkill(runtimeSettings?.skill ?? detail.active_skill?.id ?? "");
+    if (runtimeSettings?.reasoning_policy) setReasoningPolicy(runtimeSettings.reasoning_policy);
+    if (runtimeSettings?.reasoning_effort) setReasoningEffort(runtimeSettings.reasoning_effort);
   }, []);
 
   const initialize = useCallback(async () => {
@@ -129,6 +160,8 @@ function App() {
       setBoot(data);
       setApprovalMode(data.settings.approval_mode);
       setAutoPlan(data.settings.auto_plan);
+      setReasoningPolicy(data.settings.reasoning_policy);
+      setReasoningEffort(data.settings.reasoning_effort);
       await refreshSession(data.active_session_id);
       void Promise.allSettled([
         api<FileEntry[]>("/api/v1/workspace/files").then(setFiles),
@@ -150,12 +183,14 @@ function App() {
   }, [theme]);
 
   useEffect(() => {
-    if (session?.workflow_mode === "planning" || session?.workflow_mode === "plan_ready") {
+    if (session?.run?.settings.mode) {
+      setMode(session.run.settings.mode);
+    } else if (session?.workflow_mode === "planning" || session?.workflow_mode === "plan_ready") {
       setMode("planning");
     } else if (session?.workflow_mode === "execute") {
       setMode("execute");
     }
-  }, [session?.workflow_mode]);
+  }, [session?.workflow_mode, session?.run?.settings.mode]);
 
   const invoke = useCallback(async (work: () => Promise<unknown>) => {
     setError("");
@@ -189,13 +224,41 @@ function App() {
     await refreshSession(id);
   });
 
+  const deleteSession = async () => {
+    if (!deleteTarget || deletingSession) return;
+    const targetId = deleteTarget.session_id;
+    const deletedCurrent = selectedSessionId.current === targetId;
+    setDeletingSession(true);
+    setError("");
+    try {
+      await api(`/api/v1/sessions/${targetId}`, { method: "DELETE" });
+      const data = await api<Bootstrap>("/api/v1/bootstrap");
+      if (deletedCurrent) {
+        selectedSessionId.current = null;
+        setSession(null);
+        const next = data.sessions[0];
+        if (next) {
+          await api(`/api/v1/sessions/${next.session_id}/use`, { method: "POST", body: "{}" });
+          data.active_session_id = next.session_id;
+          await refreshSession(next.session_id);
+        }
+      }
+      setBoot(data);
+      setDeleteTarget(null);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setDeletingSession(false);
+    }
+  };
+
   const submit = async (task: string, delivery: RunDelivery) => {
     setError("");
     try {
       const sessionId = await ensureSession();
       await api(`/api/v1/sessions/${sessionId}/runs`, {
         method: "POST",
-        body: JSON.stringify({ task, mode, approval_mode: approvalMode, auto_plan: autoPlan, skill: selectedSkill || null, delivery }),
+        body: JSON.stringify({ task, mode, approval_mode: approvalMode, auto_plan: autoPlan, skill: selectedSkill || null, clear_skill: !selectedSkill, reasoning_policy: reasoningPolicy, reasoning_effort: reasoningEffort, delivery }),
       });
       const data = await api<Bootstrap>("/api/v1/bootstrap");
       setBoot(data);
@@ -217,6 +280,43 @@ function App() {
 
   const approval = session?.run?.pending_approval || null;
   const isRunning = ["queued", "running", "awaiting_approval", "stopping"].includes(session?.run?.status || "");
+  const updateOptions = (updates: Partial<{
+    mode: "execute" | "planning";
+    approvalMode: string;
+    autoPlan: "off" | "adaptive" | "always";
+    selectedSkill: string;
+    reasoningPolicy: ReasoningPolicy;
+    reasoningEffort: ReasoningEffort;
+  }>) => {
+    const nextApprovalMode = updates.approvalMode ?? approvalMode;
+    if (updates.mode) setMode(updates.mode);
+    if (updates.approvalMode) setApprovalMode(updates.approvalMode);
+    if (updates.autoPlan) setAutoPlan(updates.autoPlan);
+    if (updates.selectedSkill !== undefined) setSelectedSkill(updates.selectedSkill);
+    if (updates.reasoningPolicy) setReasoningPolicy(updates.reasoningPolicy);
+    if (updates.reasoningEffort) setReasoningEffort(updates.reasoningEffort);
+    if (!session) return;
+    if (isRunning) {
+      const payload: Record<string, unknown> = {};
+      if (updates.mode) payload.mode = updates.mode;
+      if (updates.approvalMode) payload.approval_mode = updates.approvalMode;
+      if (updates.autoPlan) payload.auto_plan = updates.autoPlan;
+      if (updates.selectedSkill !== undefined) {
+        payload.skill = updates.selectedSkill || null;
+        payload.clear_skill = !updates.selectedSkill;
+      }
+      if (updates.reasoningPolicy) payload.reasoning_policy = updates.reasoningPolicy;
+      if (updates.reasoningEffort) payload.reasoning_effort = updates.reasoningEffort;
+      void invoke(() => api(`/api/v1/sessions/${session.session_id}/runtime-settings`, {
+        method: "PUT",
+        body: JSON.stringify(payload),
+      }));
+    } else if (updates.approvalMode) {
+      void invoke(() => api(`/api/v1/sessions/${session.session_id}/approval-mode`, { method: "PUT", body: JSON.stringify({ mode: nextApprovalMode }) }));
+    } else if (updates.selectedSkill === "") {
+      void invoke(() => api(`/api/v1/sessions/${session.session_id}/skill`, { method: "DELETE" }));
+    }
+  };
 
   if (loading) return <div className="splash"><LoaderCircle className="spin" /> Loading RepoRivet…</div>;
   if (!boot) return <div className="splash error"><XCircle /> {error || "Authentication required. Open the one-use URL printed by the CLI."}</div>;
@@ -241,9 +341,18 @@ function App() {
       <aside className="sidebar">
         <section className="section-head"><span>SESSIONS</span><button className="icon-button" onClick={createSession} title="New session"><Plus size={16} /></button></section>
         <div className="session-list">
-          {boot.sessions.map((item) => <button key={item.session_id} className={`session-item ${session?.session_id === item.session_id ? "active" : ""}`} onClick={() => selectSession(item.session_id)}>
-            <MessageSquareText size={16} /><span><strong>{item.name}</strong><small>{item.task_preview || item.short_id}</small></span><i className={`status-dot ${item.status}`} />
-          </button>)}
+          {boot.sessions.map((item) => <div key={item.session_id} className={`session-row ${session?.session_id === item.session_id ? "active" : ""}`}>
+            <button className="session-item" onClick={() => selectSession(item.session_id)}>
+              <MessageSquareText size={16} /><span><strong>{item.name}</strong><small>{item.task_preview || item.short_id}</small></span><i className={`status-dot ${item.status}`} />
+            </button>
+            <button
+              className="session-delete"
+              aria-label={`Delete conversation ${item.name}`}
+              title={session?.session_id === item.session_id && isRunning ? "Stop the current run before deleting" : "Delete conversation"}
+              disabled={session?.session_id === item.session_id && isRunning}
+              onClick={() => setDeleteTarget(item)}
+            ><Trash2 size={13} /></button>
+          </div>)}
         </div>
         <section className="section-head file-heading"><span>WORKSPACE</span><button className="icon-button" onClick={() => openDirectory(currentDir)}><RefreshCw size={14} /></button></section>
         <button className="breadcrumb" onClick={() => openDirectory(currentDir.includes("/") ? currentDir.slice(0, currentDir.lastIndexOf("/")) || "." : ".")}>‹ {currentDir}</button>
@@ -264,18 +373,19 @@ function App() {
           disabled={false}
           isRunning={isRunning}
           mode={mode}
-          setMode={setMode}
+          setMode={(value) => updateOptions({ mode: value })}
           planReady={session?.workflow_mode === "plan_ready"}
           autoPlan={autoPlan}
-          setAutoPlan={setAutoPlan}
+          setAutoPlan={(value) => updateOptions({ autoPlan: value })}
           approvalMode={approvalMode}
-          setApprovalMode={(value) => {
-            setApprovalMode(value);
-            if (session) void invoke(() => api(`/api/v1/sessions/${session.session_id}/approval-mode`, { method: "PUT", body: JSON.stringify({ mode: value }) }));
-          }}
+          setApprovalMode={(value) => updateOptions({ approvalMode: value })}
           skills={skills}
           selectedSkill={selectedSkill}
-          setSelectedSkill={setSelectedSkill}
+          setSelectedSkill={(value) => updateOptions({ selectedSkill: value })}
+          reasoningEffort={reasoningEffort}
+          reasoningPolicy={reasoningPolicy}
+          setReasoningPolicy={(value) => updateOptions({ reasoningPolicy: value })}
+          setReasoningEffort={(value) => updateOptions({ reasoningEffort: value })}
           settings={boot.settings}
           onActivate={() => { void invoke(async () => { await ensureSession(); }); }}
           onStop={() => invoke(() => api(`/api/v1/sessions/${session!.session_id}/stop`, { method: "POST", body: "{}" }))}
@@ -290,6 +400,14 @@ function App() {
         await api(`/api/v1/sessions/${session!.session_id}/approvals/decision`, { method: "POST", body: JSON.stringify({ request_id: approval.request_id, state_version: approval.state_version, action, guidance }) });
         await refreshSession(session!.session_id);
       })} />}
+      {deleteTarget && <div className="modal-backdrop delete-backdrop" role="presentation" onMouseDown={(event) => {
+        if (event.target === event.currentTarget && !deletingSession) setDeleteTarget(null);
+      }}><div className="delete-dialog" role="alertdialog" aria-modal="true" aria-labelledby="delete-dialog-title" aria-describedby="delete-dialog-description">
+        <span className="delete-dialog-icon"><Trash2 size={20} /></span>
+        <div><small>DELETE CONVERSATION</small><h2 id="delete-dialog-title">{deleteTarget.name}</h2></div>
+        <p id="delete-dialog-description">This permanently deletes the conversation, its history, and saved run artifacts. This action cannot be undone.</p>
+        <div className="delete-dialog-actions"><button disabled={deletingSession} onClick={() => setDeleteTarget(null)}>Cancel</button><button className="danger" disabled={deletingSession} onClick={() => void deleteSession()}>{deletingSession ? <LoaderCircle className="spin" size={14} /> : <Trash2 size={14} />}{deletingSession ? "Deleting…" : "Delete conversation"}</button></div>
+      </div></div>}
     </div>
   );
 }
@@ -497,7 +615,139 @@ const MessageBlock = memo(function MessageBlock({ message }: { message: SessionD
   </article>;
 }, (previous, next) => previous.message.role === next.message.role && previous.message.content === next.message.content && previous.message.step === next.message.step);
 
-const Composer = memo(function Composer({ disabled, isRunning, mode, setMode, planReady, autoPlan, setAutoPlan, approvalMode, setApprovalMode, skills, selectedSkill, setSelectedSkill, settings, onActivate, onStop, onSubmit }: {
+type ComposerIconOption = {
+  value: string;
+  label: string;
+  icon: ReactNode;
+};
+
+function ComposerIconSelect({ label, value, options, disabled = false, className = "", onChange }: {
+  label: string;
+  value: string;
+  options: ComposerIconOption[];
+  disabled?: boolean;
+  className?: string;
+  onChange: (value: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const current = options.find((option) => option.value === value) || options[0];
+
+  useEffect(() => {
+    if (!open) return;
+    const closeOutside = (event: PointerEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("pointerdown", closeOutside);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOutside);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [open]);
+
+  return <div className="composer-control-wrap" ref={rootRef}>
+    <button
+      type="button"
+      className={`composer-control ${className}`}
+      aria-label={`${label}: ${current.label}`}
+      aria-expanded={open}
+      aria-haspopup="listbox"
+      disabled={disabled}
+      title={`${label}: ${current.label}`}
+      onClick={() => setOpen((currentOpen) => !currentOpen)}
+    >
+      {current.icon}<ChevronDown className="control-chevron" size={8} />
+    </button>
+    {open && <div className="composer-menu" role="listbox" aria-label={label}>
+      <small>{label}</small>
+      {options.map((option) => <button
+        type="button"
+        role="option"
+        aria-selected={option.value === value}
+        className={option.value === value ? "selected" : ""}
+        key={option.value}
+        onClick={() => {
+          onChange(option.value);
+          setOpen(false);
+        }}
+      ><span>{option.icon}</span><strong>{option.label}</strong>{option.value === value && <Check size={13} />}</button>)}
+    </div>}
+  </div>;
+}
+
+function ComposerReasoningSlider({ policy, value, onPolicyChange, onChange }: {
+  policy: ReasoningPolicy;
+  value: ReasoningEffort;
+  onPolicyChange: (value: ReasoningPolicy) => void;
+  onChange: (value: ReasoningEffort) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const levels: ReasoningEffort[] = ["low", "medium", "high", "xhigh", "max"];
+  const labels: Record<ReasoningEffort, string> = { low: "Low", medium: "Medium", high: "High", xhigh: "XHigh", max: "Maximum" };
+  const levelIcons = {
+    low: <Feather size={15} />,
+    medium: <Activity size={15} />,
+    high: <Activity size={15} />,
+    xhigh: <BrainCircuit size={15} />,
+    max: <Zap size={15} />,
+  };
+
+  useEffect(() => {
+    if (!open) return;
+    const closeOutside = (event: PointerEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("pointerdown", closeOutside);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOutside);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [open]);
+
+  return <div className="composer-control-wrap reasoning-control-wrap" ref={rootRef}>
+    <button
+      type="button"
+      className={`composer-control reasoning-trigger ${value}`}
+      aria-label={policy === "adaptive" ? `Adaptive reasoning up to ${labels[value]}` : `Fixed reasoning: ${labels[value]}`}
+      aria-expanded={open}
+      aria-haspopup="dialog"
+      title={policy === "adaptive" ? `Adaptive reasoning · up to ${labels[value]}` : `Fixed reasoning · ${labels[value]}`}
+      onClick={() => setOpen((currentOpen) => !currentOpen)}
+    ><Gauge size={16} /><ChevronDown className="control-chevron" size={8} /></button>
+    {open && <div className="composer-menu reasoning-menu" role="dialog" aria-label="Reasoning policy">
+      <small>Reasoning policy</small>
+      <div className="reasoning-policy-toggle" role="group" aria-label="Reasoning selection mode">
+        <button type="button" className={policy === "adaptive" ? "selected" : ""} onClick={() => onPolicyChange("adaptive")}>Adaptive</button>
+        <button type="button" className={policy === "fixed" ? "selected" : ""} onClick={() => onPolicyChange("fixed")}>Fixed</button>
+      </div>
+      <div className={`reasoning-value ${value}`}>{levelIcons[value]}<span>{policy === "adaptive" ? "Maximum level" : "Fixed level"}</span><strong>{labels[value]}</strong></div>
+      <input
+        className={`reasoning-range ${value}`}
+        type="range"
+        min={0}
+        max={4}
+        step={1}
+        value={levels.indexOf(value)}
+        aria-label={policy === "adaptive" ? "Maximum reasoning effort" : "Fixed reasoning effort"}
+        aria-valuetext={labels[value]}
+        onChange={(event) => onChange(levels[Number(event.target.value)])}
+      />
+      <div className="reasoning-scale"><span>Low</span><span>Med</span><span>High</span><span>XHigh</span><span>Max</span></div>
+      <p>{policy === "adaptive" ? "The controller selects a one-call effort at or below this ceiling." : "Advanced: every model call uses this fixed level unless provider recovery lowers it."}</p>
+    </div>}
+  </div>;
+}
+
+const Composer = memo(function Composer({ disabled, isRunning, mode, setMode, planReady, autoPlan, setAutoPlan, approvalMode, setApprovalMode, skills, selectedSkill, setSelectedSkill, reasoningPolicy, setReasoningPolicy, reasoningEffort, setReasoningEffort, settings, onActivate, onStop, onSubmit }: {
   disabled: boolean;
   isRunning: boolean;
   mode: "execute" | "planning";
@@ -510,6 +760,10 @@ const Composer = memo(function Composer({ disabled, isRunning, mode, setMode, pl
   skills: Skill[];
   selectedSkill: string;
   setSelectedSkill: (skill: string) => void;
+  reasoningPolicy: ReasoningPolicy;
+  setReasoningPolicy: (policy: ReasoningPolicy) => void;
+  reasoningEffort: ReasoningEffort;
+  setReasoningEffort: (effort: ReasoningEffort) => void;
   settings: Bootstrap["settings"];
   onActivate: () => void;
   onStop: () => Promise<void> | void;
@@ -533,6 +787,30 @@ const Composer = memo(function Composer({ disabled, isRunning, mode, setMode, pl
   const sendLabel = isRunning
     ? delivery === "redirect" ? "Redirect current run" : "Queue follow-up"
     : "Send prompt";
+  const iconSize = 14;
+  const deliveryOptions: ComposerIconOption[] = [
+    { value: "redirect", label: "Redirect now", icon: <CornerUpRight size={iconSize} /> },
+    { value: "queue", label: "Queue next", icon: <ListPlus size={iconSize} /> },
+  ];
+  const workflowOptions: ComposerIconOption[] = [
+    { value: "execute", label: "Execute", icon: <Hammer size={iconSize} /> },
+    { value: "planning", label: planReady ? "Plan ready" : "Plan", icon: <ClipboardList size={iconSize} /> },
+  ];
+  const autoPlanOptions: ComposerIconOption[] = [
+    { value: "adaptive", label: "Adaptive plan", icon: <Route size={iconSize} /> },
+    { value: "always", label: "Plan first", icon: <ListTodo size={iconSize} /> },
+    { value: "off", label: "No auto plan", icon: <CircleOff size={iconSize} /> },
+  ];
+  const approvalOptions: ComposerIconOption[] = [
+    { value: "safe-auto", label: "Safe auto", icon: <ShieldCheck size={iconSize} /> },
+    { value: "llm-auto", label: "LLM auto", icon: <BrainCircuit size={iconSize} /> },
+    { value: "always-ask", label: "Always ask", icon: <ShieldQuestion size={iconSize} /> },
+    { value: "allow-all", label: "Allow all", icon: <ShieldOff size={iconSize} /> },
+  ];
+  const skillOptions: ComposerIconOption[] = [
+    { value: "", label: "No skill", icon: <PackageOpen size={iconSize} /> },
+    ...skills.filter((skill) => skill.source === "global").map((skill) => ({ value: skill.id, label: skill.name, icon: <Puzzle size={iconSize} /> })),
+  ];
   return <div className="composer-wrap">
     <div className="composer-shell">
       <div className="composer-input">
@@ -547,12 +825,12 @@ const Composer = memo(function Composer({ disabled, isRunning, mode, setMode, pl
       </div>
       <div className="composer-toolbar">
         <div className="composer-controls">
-          <span className="composer-settings-icon" title="Request settings"><Settings2 size={13} /></span>
-          {isRunning && <label className="composer-control" title="Choose whether this message interrupts the current model response or waits for the current task to finish"><MessageSquareText size={13} /><select aria-label="Message delivery" value={delivery} onChange={(event) => setDelivery(event.target.value as RunDelivery)}><option value="redirect">Redirect now</option><option value="queue">Queue next</option></select></label>}
-          <label className={`composer-control ${mode === "planning" ? "plan" : ""}`} title="Workflow mode">{mode === "planning" ? <ListChecks size={13} /> : <Hammer size={13} />}<select aria-label="Workflow mode" value={mode} disabled={planReady} onChange={(event) => setMode(event.target.value as "execute" | "planning")}><option value="execute">Execute</option><option value="planning">{planReady ? "Plan ready" : "Plan"}</option></select></label>
-          <label className="composer-control" title={settings.auto_plan_llm ? "Automatic planning · Adaptive uses an isolated LLM classifier" : "Automatic planning · LLM classifier disabled"}><RefreshCw size={13} /><select aria-label="Automatic planning" value={autoPlan} onChange={(event) => setAutoPlan(event.target.value as "off" | "adaptive" | "always")}><option value="adaptive">Adaptive plan</option><option value="always">Plan first</option><option value="off">No auto plan</option></select></label>
-          <label className="composer-control" title="Approval mode"><ShieldAlert size={13} /><select aria-label="Approval mode" value={approvalMode} onChange={(event) => setApprovalMode(event.target.value)}><option value="safe-auto">Safe auto</option><option value="llm-auto">LLM auto</option><option value="always-ask">Always ask</option><option value="allow-all">Allow all</option></select></label>
-          <label className="composer-control" title="Global Skill"><Sparkles size={13} /><select aria-label="Global Skill" value={selectedSkill} onChange={(event) => setSelectedSkill(event.target.value)}><option value="">No skill</option>{skills.filter((skill) => skill.source === "global").map((skill) => <option key={skill.id} value={skill.id}>{skill.name}</option>)}</select></label>
+          {isRunning && <ComposerIconSelect label="Message delivery" value={delivery} options={deliveryOptions} className="active" onChange={(next) => setDelivery(next as RunDelivery)} />}
+          <ComposerIconSelect label="Workflow mode" value={mode} options={workflowOptions} disabled={planReady} className={mode === "planning" ? "plan" : ""} onChange={(next) => setMode(next as "execute" | "planning")} />
+          <ComposerIconSelect label={settings.auto_plan_llm ? "Automatic planning" : "Automatic planning · LLM classifier disabled"} value={autoPlan} options={autoPlanOptions} className={autoPlan === "off" ? "muted" : ""} onChange={(next) => setAutoPlan(next as "off" | "adaptive" | "always")} />
+          <ComposerIconSelect label="Approval mode" value={approvalMode} options={approvalOptions} className={approvalMode === "always-ask" ? "warning" : ""} onChange={setApprovalMode} />
+          <ComposerReasoningSlider policy={reasoningPolicy} value={reasoningEffort} onPolicyChange={setReasoningPolicy} onChange={setReasoningEffort} />
+          <ComposerIconSelect label="Global Skill" value={selectedSkill} options={skillOptions} className={selectedSkill ? "active" : "muted"} onChange={setSelectedSkill} />
         </div>
         <div className="composer-model" title={`${settings.base_url} · ${settings.context_limit.toLocaleString()} token context`}><Bot size={13} /><span>{settings.model}</span><i>·</i><span>{settings.context_limit.toLocaleString()}</span></div>
       </div>
@@ -786,12 +1064,16 @@ function presentEvent(event: AgentEvent, pendingApprovalId: string | null): Even
     case "model.call": {
       const effort = textValue(payload.reasoning_effort);
       const ceiling = textValue(payload.reasoning_effort_ceiling);
+      const policy = textValue(payload.reasoning_policy);
+      const phase = textValue(payload.reasoning_phase);
       return {
         title: "Model request",
         summary: numberValue(payload.message_count) !== null ? `${numberValue(payload.message_count)} messages` : "Preparing the next model action",
         detail: [
           numberValue(payload.effective_estimated_prompt_tokens) !== null ? `${numberValue(payload.effective_estimated_prompt_tokens)!.toLocaleString()} estimated prompt tokens` : "",
-          effort ? `${effort} reasoning${ceiling ? ` · ${ceiling} ceiling` : ""}` : "",
+          effort ? `${effort} reasoning · ${policy === "fixed" ? "fixed" : `adaptive up to ${ceiling || effort}`}` : "",
+          phase ? humanize(phase) : "",
+          clipped(textValue(payload.reasoning_reason), 240),
         ].filter(Boolean).join(" · "),
       };
     }
@@ -835,6 +1117,61 @@ function presentEvent(event: AgentEvent, pendingApprovalId: string | null): Even
         title: "Reasoning effort reduced",
         summary: `No actionable response arrived in ${formatElapsed(numberValue(payload.elapsed_seconds) || 0)}; retrying at ${textValue(payload.reasoning_effort) || "a lower tier"}`,
         detail: `${textValue(payload.previous_effort) || "higher"} → ${textValue(payload.reasoning_effort) || "lower"}`,
+      };
+    case "model.reasoning.effort.mapped":
+      return {
+        title: "Reasoning tier mapped",
+        summary: `${textValue(payload.requested_effort)} requested · ${textValue(payload.applied_effort)} applied`,
+        detail: clipped(textValue(payload.reason)),
+      };
+    case "stale.snapshot.recovery.started":
+      return {
+        title: "Refreshing stale edit target",
+        summary: `${textValue(payload.path) || "Workspace file"} · lines ${textValue(payload.start_line)}–${textValue(payload.end_line)}`,
+        detail: "The rejected edit did not change the file; reading its current contents automatically",
+      };
+    case "stale.snapshot.recovery.finished":
+      return {
+        title: payload.ok === true ? "Fresh snapshot ready" : "Snapshot refresh failed",
+        summary: textValue(payload.path) || "Workspace file",
+        detail: payload.ok === true
+          ? `Current lines ${textValue(payload.start_line)}–${textValue(payload.end_line)} are ready for a regenerated edit`
+          : "The agent must read the file before editing again",
+      };
+    case "plan.scope.revision.required":
+      return {
+        title: "Plan revision required",
+        summary: clipped(textValue(payload.reason) || "The required action exceeds the approved plan"),
+        detail: [
+          textValue(payload.current_step_id) ? `current step: ${textValue(payload.current_step_id)}` : "",
+          textValue(payload.rejected_path),
+          "Requesting one updated plan before execution continues",
+        ].filter(Boolean).join(" · "),
+      };
+    case "duplicate.successful.command.suppressed":
+      return {
+        title: "Duplicate command skipped",
+        summary: clipped(textValue(payload.command) || "The command already succeeded"),
+        detail: `The previous exit-0 result remains valid at workspace revision ${textValue(payload.workspace_revision)}`,
+      };
+    case "verification.plan.recovery.started":
+      return {
+        title: "Verification plan required",
+        summary: stringList(payload.requested_check_ids).length
+          ? `Registering ${stringList(payload.requested_check_ids).join(", ")}`
+          : "Registering deterministic checks before verification continues",
+        detail: "The invalid verification request was not executed; only plan registration is available on the next turn",
+      };
+    case "runtime.settings.changed":
+      return {
+        title: "Run settings updated",
+        summary: "Live-safe options apply at the next controller boundary; task routing applies to the next task",
+        detail: [
+          textValue(payload.mode),
+          textValue(payload.approval_mode),
+          textValue(payload.auto_plan),
+          textValue(payload.reasoning_effort) ? `${textValue(payload.reasoning_policy) || "adaptive"} reasoning · ${textValue(payload.reasoning_effort)}` : "",
+        ].filter(Boolean).join(" · "),
       };
     case "model.stream.usage.unavailable":
       return {

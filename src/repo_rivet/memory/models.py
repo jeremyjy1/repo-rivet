@@ -255,6 +255,9 @@ class MemoryState(BaseModel):
     verification_plan_revision_reason: str | None = Field(default=None, max_length=1_000)
     verification_plan_revision_guidance: str | None = Field(default=None, max_length=2_000)
     verification_plan_revision_attempts: int = Field(default=0, ge=0)
+    plan_scope_revision_required: bool = False
+    plan_scope_revision_reason: str | None = Field(default=None, max_length=1_000)
+    plan_scope_revision_attempts: int = Field(default=0, ge=0)
     candidate_final_assessment: FinalAssessment | None = None
     last_model_error: ModelErrorRecord | None = None
     provider_requires_reasoning_content: bool = False
@@ -328,6 +331,9 @@ class MemoryState(BaseModel):
         self.verification_plan_revision_reason = None
         self.verification_plan_revision_guidance = None
         self.verification_plan_revision_attempts = 0
+        self.plan_scope_revision_required = False
+        self.plan_scope_revision_reason = None
+        self.plan_scope_revision_attempts = 0
         self.candidate_final_assessment = None
         self.last_model_error = None
         self.reflection_required = False

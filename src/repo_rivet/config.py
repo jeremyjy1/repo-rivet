@@ -16,8 +16,10 @@ from pydantic import (
 from pydantic.functional_validators import field_validator
 
 from repo_rivet.approval.models import ApprovalMode, NonInteractivePolicy
+from repo_rivet.llm.base import REASONING_EFFORTS, ReasoningEffort
 from repo_rivet.planning.policy import AutoPlanMode
 from repo_rivet.reasoning.models import ReasoningConfig
+from repo_rivet.reasoning.policy import effort_index
 
 DEFAULT_CONFIG_PATH = Path("reporivet.toml")
 _API_KEY_PLACEHOLDER = "replace-with-your-api-key"
@@ -38,7 +40,8 @@ class ApiConfig(BaseModel):
     model: str = Field(min_length=1)
     context_window_tokens: int = Field(ge=1_000)
     thinking_mode: Literal["provider_default", "enabled", "disabled"] = "provider_default"
-    reasoning_effort: Literal["low", "high", "max"] = "max"
+    reasoning_effort: ReasoningEffort = "max"
+    reasoning_supported_efforts: tuple[ReasoningEffort, ...] = REASONING_EFFORTS
     reasoning_stall_seconds: float = Field(default=45, gt=0, le=300)
     tokenizer_encoding: str | None = Field(default=None, min_length=1)
     timeout_seconds: float = Field(default=60, gt=0, le=600)
@@ -68,6 +71,18 @@ class ApiConfig(BaseModel):
         if value == _MODEL_PLACEHOLDER:
             raise ValueError("must be replaced with a real model name")
         return value
+
+    @field_validator("reasoning_supported_efforts")
+    @classmethod
+    def validate_reasoning_efforts(
+        cls,
+        value: tuple[ReasoningEffort, ...],
+    ) -> tuple[ReasoningEffort, ...]:
+        if not value:
+            raise ValueError("must contain at least one provider-supported effort")
+        if len(value) != len(set(value)):
+            raise ValueError("must not contain duplicate effort values")
+        return tuple(effort for effort in REASONING_EFFORTS if effort in value)
 
 
 class TokenConfig(BaseModel):
@@ -195,6 +210,10 @@ class AppConfig(BaseModel):
             raise ValueError(
                 "output, tool-result, and safety reserves must leave a positive prompt budget"
             )
+        if effort_index(self.reasoning.effort_floor) > effort_index(
+            self.api.reasoning_effort
+        ):
+            raise ValueError("reasoning effort_floor must not exceed api.reasoning_effort")
         return self
 
 

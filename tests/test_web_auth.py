@@ -93,6 +93,42 @@ def test_writes_require_csrf_and_exact_origin(web_client: tuple[TestClient, str]
     assert accepted.json()["name"] == "GUI session"
 
 
+def test_delete_session_permanently_removes_saved_conversation(
+    web_client: tuple[TestClient, str],
+    tmp_path: Path,
+) -> None:
+    client, token = web_client
+    csrf = _authenticate(client, token)
+    write_headers = {
+        "Origin": "http://testserver",
+        "X-CSRF-Token": csrf,
+    }
+    created = client.post(
+        "/api/v1/sessions",
+        headers=write_headers,
+        json={"name": "Disposable conversation"},
+    ).json()
+    session_id = created["session_id"]
+
+    response = client.delete(
+        f"/api/v1/sessions/{session_id}",
+        headers=write_headers,
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "deleted": True,
+        "session_id": session_id,
+        "permanent": True,
+    }
+    assert all(
+        item["session_id"] != session_id
+        for item in client.get("/api/v1/sessions").json()
+    )
+    assert not (tmp_path / "home" / "sessions" / session_id).exists()
+    assert not (tmp_path / "home" / "trash").exists()
+
+
 def test_workspace_file_endpoint_rejects_path_traversal(
     web_client: tuple[TestClient, str],
 ) -> None:

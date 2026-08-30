@@ -67,6 +67,23 @@ class StallingThenCompletes:
         return iter([stream_chunk(content="done", finish_reason="stop")])
 
 
+class ReconfiguredThenCompletes:
+    def __init__(self) -> None:
+        self.requests: list[dict[str, object]] = []
+        self.on_first_chunk = lambda: None
+
+    def create(self, **kwargs):  # type: ignore[no-untyped-def]
+        self.requests.append(kwargs)
+        if len(self.requests) > 1:
+            return iter([stream_chunk(content="done", finish_reason="stop")])
+
+        def first_stream():  # type: ignore[no-untyped-def]
+            self.on_first_chunk()
+            yield stream_chunk(reasoning="started at the old ceiling")
+
+        return first_stream()
+
+
 class RecordingSink:
     def __init__(self) -> None:
         self.events: list[tuple[str, dict[str, object]]] = []
@@ -232,6 +249,36 @@ def test_complete_calls_chat_completions_with_configured_model() -> None:
     assert completions.kwargs["stream_options"] == {"include_usage": True}
 
 
+def test_complete_maps_adaptive_effort_to_provider_capabilities() -> None:
+    completions = FakeCompletions()
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    events = RecordingSink()
+    config = ApiConfig(
+        api_key=SecretStr("test-key"),
+        base_url="https://example.com/v1",
+        model="test-model",
+        context_window_tokens=32768,
+        reasoning_effort="max",
+        reasoning_supported_efforts=("low", "high", "max"),
+    )
+    adapter = OpenAICompatibleClient(config, client=client, event_logger=events)
+
+    adapter.complete(
+        messages=[{"role": "user", "content": "task"}],
+        tools=[],
+        options=ModelRequestOptions(reasoning_effort="xhigh"),
+    )
+
+    assert completions.kwargs["reasoning_effort"] == "high"
+    mapped = next(
+        data
+        for name, data in events.events
+        if name == "model_reasoning_effort_mapped"
+    )
+    assert mapped["requested_effort"] == "xhigh"
+    assert mapped["applied_effort"] == "high"
+
+
 def test_complete_reassembles_streamed_reasoning_and_tool_arguments() -> None:
     completions = FragmentedToolCompletions()
     client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
@@ -281,7 +328,7 @@ def test_reasoning_only_stream_downgrades_effort_and_restarts(monkeypatch) -> No
     assert result.content == "done"
     assert [request["reasoning_effort"] for request in completions.requests] == [
         "max",
-        "high",
+        "xhigh",
     ]
     downgrade = next(
         data
@@ -289,8 +336,39 @@ def test_reasoning_only_stream_downgrades_effort_and_restarts(monkeypatch) -> No
         if name == "model_reasoning_effort_downgraded"
     )
     assert downgrade["previous_effort"] == "max"
-    assert downgrade["reasoning_effort"] == "high"
+    assert downgrade["reasoning_effort"] == "xhigh"
     assert downgrade["elapsed_seconds"] == 100
+
+
+def test_lowering_live_reasoning_ceiling_restarts_unfinished_stream() -> None:
+    completions = ReconfiguredThenCompletes()
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    events = RecordingSink()
+    config = ApiConfig(
+        api_key=SecretStr("test-key"),
+        base_url="https://example.com/v1",
+        model="test-model",
+        context_window_tokens=32768,
+        reasoning_effort="max",
+    )
+    adapter = OpenAICompatibleClient(config, client=client, event_logger=events)
+    completions.on_first_chunk = lambda: adapter.set_reasoning_effort_ceiling("low")
+
+    result = adapter.complete(messages=[{"role": "user", "content": "task"}], tools=[])
+
+    assert result.content == "done"
+    assert [request["reasoning_effort"] for request in completions.requests] == [
+        "max",
+        "low",
+    ]
+    downgrade = next(
+        data
+        for name, data in events.events
+        if name == "model_reasoning_effort_downgraded"
+    )
+    assert downgrade["reason"] == "reasoning ceiling changed during active stream"
+    assert downgrade["previous_effort"] == "max"
+    assert downgrade["reasoning_effort"] == "low"
 
 
 def test_streaming_falls_back_when_provider_rejects_usage_options() -> None:

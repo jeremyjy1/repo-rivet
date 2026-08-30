@@ -49,6 +49,14 @@ export type SessionDetail = SessionSummary & {
     result: Record<string, any> | null;
     error: string | null;
     pending_approval: Approval | null;
+    settings: {
+      mode: "execute" | "planning";
+      approval_mode: string | null;
+      auto_plan: "off" | "adaptive" | "always" | null;
+      skill: string | null;
+      reasoning_policy: "adaptive" | "fixed";
+      reasoning_effort: "low" | "medium" | "high" | "xhigh" | "max";
+    };
   } | null;
 };
 

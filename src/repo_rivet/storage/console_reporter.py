@@ -96,11 +96,13 @@ class ConsoleEventReporter:
             self._stop_status()
 
         if event_type == "model_call":
-            self._start_model_status()
+            self._start_model_status(data)
         elif event_type == "model_stream_progress":
             self._update_model_status(data)
         elif event_type == "model_reasoning_effort_downgraded":
             self._reasoning_effort_downgraded(data)
+        elif event_type == "model_reasoning_effort_mapped":
+            self._reasoning_effort_mapped(data)
         elif event_type == "auto_plan_review_started":
             self._start_status("[cyan]Evaluating whether Plan Mode is needed…[/cyan]")
         elif event_type == "llm_approval_review_started":
@@ -256,8 +258,17 @@ class ConsoleEventReporter:
             return
         self._print("…", tool, progress, style="bold cyan")
 
-    def _start_model_status(self) -> None:
-        self._start_status("[cyan]Model is generating the next action…[/cyan]")
+    def _start_model_status(self, data: dict[str, Any]) -> None:
+        effort = self._safe(data.get("reasoning_effort", ""), limit=20)
+        policy = self._safe(data.get("reasoning_policy", ""), limit=20)
+        ceiling = self._safe(data.get("reasoning_effort_ceiling", ""), limit=20)
+        reasoning = ""
+        if effort:
+            configured = "fixed" if policy == "fixed" else f"adaptive up to {ceiling or effort}"
+            reasoning = f" · {effort} reasoning ({configured})"
+        self._start_status(
+            f"[cyan]Model is generating the next action{reasoning}…[/cyan]"
+        )
 
     def _update_model_status(self, data: dict[str, Any]) -> None:
         phase = self._safe(data.get("activity_phase", "waiting"), limit=40)
@@ -274,6 +285,14 @@ class ConsoleEventReporter:
         effort = self._safe(data.get("reasoning_effort", "lower"), limit=20)
         self._start_status(
             f"[cyan]No actionable response yet; retrying with {effort} reasoning…[/cyan]"
+        )
+
+    def _reasoning_effort_mapped(self, data: dict[str, Any]) -> None:
+        requested = self._safe(data.get("requested_effort", "requested"), limit=20)
+        applied = self._safe(data.get("applied_effort", "supported"), limit=20)
+        self._start_status(
+            f"[cyan]Model is generating the next action · {applied} reasoning "
+            f"(provider mapping from {requested})…[/cyan]"
         )
 
     @staticmethod
