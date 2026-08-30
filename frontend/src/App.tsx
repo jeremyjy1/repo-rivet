@@ -1366,7 +1366,7 @@ const EventCard = memo(function EventCard({ event, pendingApprovalId }: { event:
     return <article className="message user timeline-user-message"><div className="message-label">{label}</div><ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml>{task}</ReactMarkdown></article>;
   }
   const presentation = presentEvent(event, pendingApprovalId);
-  return <div className={`event-card ${eventTone(event)}`}><span className="event-icon">{eventIcon(event)}</span><div className="event-copy"><div className="event-heading"><strong>{presentation.title}</strong></div>{presentation.summary && <span>{presentation.summary}</span>}{presentation.detail && <small>{presentation.detail}</small>}</div></div>;
+  return <div className={`status-card event-card ${eventTone(event)}`}><span className="event-icon">{eventIcon(event)}</span><div className="event-copy"><div className="event-heading"><strong>{presentation.title}</strong></div>{presentation.summary && <span>{presentation.summary}</span>}{presentation.detail && <small>{presentation.detail}</small>}</div></div>;
 });
 
 function eventTone(event: AgentEvent): string {
@@ -1389,8 +1389,11 @@ function eventIcon(event: AgentEvent): ReactNode {
 
 const ResultCard = memo(function ResultCard({ result }: { result: Record<string, any> }) {
   const successful = result.status === "success" || result.status === "plan_ready";
+  const tone = successful
+    ? "success"
+    : ["blocked", "incomplete", "stopped"].includes(String(result.status)) ? "warning" : "error";
   const message = successful ? result.summary || result.reason : result.reason || result.summary;
-  return <article className={`result-card ${result.status}`}><div className="result-title">{successful ? <CheckCircle2 /> : <ShieldAlert />}<strong>{result.status}</strong></div><ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml>{String(message || "Run finished")}</ReactMarkdown>{result.modified_files?.length > 0 && <small>Modified: {result.modified_files.join(", ")}</small>}</article>;
+  return <article className={`status-card result-card ${tone}`}><div className="result-title">{successful ? <CheckCircle2 /> : tone === "warning" ? <ShieldAlert /> : <XCircle />}<strong>{humanize(String(result.status))}</strong></div><ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml>{String(message || "Run finished")}</ReactMarkdown>{result.modified_files?.length > 0 && <small>Modified: {result.modified_files.join(", ")}</small>}</article>;
 });
 
 const PlanResultCard = memo(function PlanResultCard({ session, invoke, refresh }: {
@@ -1413,7 +1416,7 @@ const PlanResultCard = memo(function PlanResultCard({ session, invoke, refresh }
       setSubmitting(false);
     }
   };
-  return <article className={`conversation-plan ${stale ? "stale" : ""}`}>
+  return <article className={`status-card conversation-plan ${stale ? "warning stale" : "success"}`}>
     <div className="conversation-plan-header">
       <span><ListChecks size={18} /></span>
       <div><small>{stale ? "PLAN NEEDS REVIEW" : "PLAN READY"}</small><h2>{String(plan.goal)}</h2></div>
