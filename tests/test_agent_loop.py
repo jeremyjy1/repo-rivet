@@ -199,33 +199,6 @@ def test_empty_model_response_is_replaced_with_local_feedback() -> None:
     )
 
 
-def test_resume_removes_legacy_empty_assistant_before_request() -> None:
-    model = FakeModelClient([ModelResponse(content="The resumed task can continue.")])
-    tools = FakeToolRegistry([])
-    events = RecordingSink()
-    memory = MemoryState(
-        session_id="legacy-empty-history",
-        messages=[
-            Message(role="user", content="previous task"),
-            Message(role="assistant", content=None),
-        ],
-    )
-
-    result = controller(model, tools, event_logger=events).run(
-        "continue after resume",
-        memory=memory,
-    )
-
-    assert result.status == "success"
-    validate_tool_call_protocol(model.requests[0]["messages"])
-    assert not any(
-        message.role == "assistant" and not message.is_valid_provider_message()
-        for message in memory.messages
-    )
-    repair_events = [data for event, data in events.events if event == "invalid_history_repaired"]
-    assert repair_events == [{"removed_empty_assistant_messages": 1}]
-
-
 def test_interrupted_tool_call_is_closed_before_same_process_continues(tmp_path: Path) -> None:
     read = call("interrupted-read", "read_file", {"path": "app.py"})
     model = FakeModelClient(
@@ -439,7 +412,7 @@ def test_inconclusive_verification_requires_direct_complete_plan_revision() -> N
     second_check = call("run-2", "run_verification", {"check_id": "script_syntax"})
     model = FakeModelClient(
         [
-            ModelResponse(tool_calls=[script_syntax_plan("plan-1", deterministic_oracle=False)]),
+            ModelResponse(tool_calls=[script_syntax_plan("plan-1", deterministic_oracle=True)]),
             ModelResponse(tool_calls=[first_check]),
             ModelResponse(tool_calls=[decision("unneeded-decision", "register_verification")]),
             ModelResponse(tool_calls=[script_syntax_plan("plan-2", deterministic_oracle=True)]),
@@ -455,7 +428,11 @@ def test_inconclusive_verification_requires_direct_complete_plan_revision() -> N
     )
     memory = MemoryState(session_id="inconclusive-verification-recovery")
 
-    result = controller(model, tools).run("validate the scripts", memory=memory)
+    result = controller(
+        model,
+        tools,
+        termination=TerminationPolicy(TerminationConfig(max_repeated_tool_calls=2)),
+    ).run("validate the scripts", memory=memory)
 
     assert result.status == "success"
     assert [executed.name for executed in tools.calls] == [
@@ -480,7 +457,7 @@ def test_inconclusive_verification_requires_direct_complete_plan_revision() -> N
 def test_automatic_inconclusive_verification_enters_plan_revision_recovery() -> None:
     model = FakeModelClient(
         [
-            ModelResponse(tool_calls=[script_syntax_plan("plan-1", deterministic_oracle=False)]),
+            ModelResponse(tool_calls=[script_syntax_plan("plan-1", deterministic_oracle=True)]),
             ModelResponse(content="The scripts are ready."),
             ModelResponse(tool_calls=[script_syntax_plan("plan-2", deterministic_oracle=True)]),
             ModelResponse(content="The scripts are ready."),
@@ -702,7 +679,7 @@ def test_file_change_without_verification_plan_is_blocked_before_execution() -> 
     assert "verification_plan_missing" in (blocked_result.content or "")
 
 
-def test_legacy_missing_plan_recovery_allows_protocol_correction() -> None:
+def test_resumed_missing_plan_recovery_allows_protocol_correction() -> None:
     model = FakeModelClient(
         [
             ModelResponse(tool_calls=[decision("d1", "edit_file")]),
@@ -711,7 +688,7 @@ def test_legacy_missing_plan_recovery_allows_protocol_correction() -> None:
         ]
     )
     tools = FakeToolRegistry([passed_verification_result(revision=0)])
-    memory = MemoryState(session_id="legacy-missing-plan")
+    memory = MemoryState(session_id="resumed-missing-plan")
     memory.modified_files.add("app.py")
     memory.verification_plan_recovery_attempts = 1
 

@@ -158,27 +158,6 @@ def test_runtime_injects_only_system_skills_matching_the_task(tmp_path: Path) ->
     assert "UNRELATED_BODY" not in request
 
 
-def test_legacy_skill_sources_migrate_to_system_and_global_layers() -> None:
-    base_pin = {
-        "id": "legacy-skill",
-        "version": "1.0.0",
-        "content_hash": "abc",
-        "activation": "explicit",
-    }
-
-    former_system = MemoryState.model_validate(
-        {"session_id": "old-system", "active_skill": {**base_pin, "source": "builtin"}}
-    )
-    former_global = MemoryState.model_validate(
-        {"session_id": "old-global", "active_skill": {**base_pin, "source": "user"}}
-    )
-
-    assert former_system.active_skill is None
-    assert former_global.active_skill is not None
-    assert former_global.active_skill.source.value == "global"
-    assert former_global.active_skill.id == "global:legacy-skill"
-
-
 def test_cli_lists_and_updates_selected_session_skill(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

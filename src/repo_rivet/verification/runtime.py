@@ -192,6 +192,14 @@ class VerificationRuntime:
         self.path_policy.resolve(check.command.cwd)
         for artifact in check.criteria.required_artifacts:
             self.path_policy.resolve(artifact)
+        if check.kind in {VerificationKind.BEHAVIOR, VerificationKind.CUSTOM} and not (
+            check.criteria.has_output_oracle or check.criteria.required_artifacts
+        ):
+            raise ValueError(
+                f"check {check.check_id} ({check.kind.value}) requires a deterministic output "
+                "oracle or required artifact; declare stdout/stderr criteria or "
+                "required_artifacts"
+            )
 
     def _evaluate(
         self,

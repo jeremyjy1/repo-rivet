@@ -95,7 +95,6 @@ class PlanRuntime:
             artifact.status = PlanStatus.STALE
             memory.workflow_mode = WorkflowMode.PLAN_READY
             raise ValueError("Plan is stale: " + "; ".join(stale_reasons))
-        self._recover_observed_completed_creates(artifact)
         artifact.status = PlanStatus.EXECUTING
         if artifact.execution_workspace_revision is None:
             artifact.execution_workspace_revision = memory.workspace_revision
@@ -292,6 +291,7 @@ class PlanRuntime:
         memory = self._memory()
         affected: list[str] = []
         snapshots: dict[str, str] = {}
+        create_steps: dict[str, str] = {}
         for step in draft.steps:
             normalized_targets: list[str] = []
             for target in step.target_files:
@@ -324,6 +324,16 @@ class PlanRuntime:
                 elif step.operation != PlanOperation.CREATE:
                     raise ValueError(f"target file does not exist: {normalized}")
             step.target_files = normalized_targets
+            if step.operation == PlanOperation.CREATE:
+                target = normalized_targets[0]
+                previous_step = create_steps.get(target)
+                if previous_step is not None:
+                    raise ValueError(
+                        f"create target {target} is repeated by steps "
+                        f"{previous_step} and {step.step_id}; write_file creates parent "
+                        "directories automatically, so each new file needs only one create step"
+                    )
+                create_steps[target] = step.step_id
         return affected, snapshots
 
     @classmethod
@@ -381,33 +391,6 @@ class PlanRuntime:
         return all(
             current.get(check_id) == prior.get(check_id) for check_id in step.verification_ids
         )
-
-    def _recover_observed_completed_creates(self, artifact: PlanArtifact) -> None:
-        """Repair plans created after a file was already written by this session."""
-        memory = self._memory()
-        for step in artifact.steps:
-            if step.status != PlanStepStatus.PENDING or step.operation != PlanOperation.CREATE:
-                continue
-            path = step.target_files[0]
-            if path not in artifact.snapshots:
-                continue
-            observation = next(
-                (
-                    event
-                    for event in reversed(memory.observation_events)
-                    if event.ok and event.tool_name == "write_file" and path in event.affected_paths
-                ),
-                None,
-            )
-            if observation is None:
-                artifact.status = PlanStatus.STALE
-                memory.workflow_mode = WorkflowMode.PLAN_READY
-                raise ValueError(
-                    "Plan is stale: create step target already existed without a matching "
-                    f"successful write observation: {path}"
-                )
-            step.status = PlanStepStatus.COMPLETED
-            step.last_observation_ref = observation.event_id
 
     def _require_plan(self) -> PlanArtifact:
         plan = self._memory().plan_artifact

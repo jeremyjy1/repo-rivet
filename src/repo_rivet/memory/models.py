@@ -283,71 +283,6 @@ class MemoryState(BaseModel):
     ) = None
     status: str = "ready"
 
-    @model_validator(mode="before")
-    @classmethod
-    def migrate_legacy_verification_fields(cls, value: Any) -> Any:
-        """Migrate durable fields whose representation changed between runtime versions."""
-        if not isinstance(value, dict):
-            return value
-        migrated = dict(value)
-        migrated.pop("skill_completion_recovery_attempts", None)
-
-        def migrate_skill_pin(pin: Any) -> Any:
-            if not isinstance(pin, dict):
-                return pin
-            source = pin.get("source")
-            if source == "builtin":
-                source = "system"
-            elif source == "user":
-                source = "global"
-            name = str(pin.get("name") or pin.get("id") or "").split(":", 1)[-1]
-            qualified_id = str(pin.get("id") or name)
-            if ":" not in qualified_id and source in {"system", "global"}:
-                qualified_id = f"{source}:{qualified_id}"
-            return {
-                **pin,
-                "id": qualified_id,
-                "name": name,
-                "source": source,
-            }
-
-        migrated.pop("last_file_change_step", None)
-        migrated.pop("last_verification_step", None)
-        migrated.pop("last_verification_success", None)
-        active_skill = migrated.get("active_skill")
-        if isinstance(active_skill, dict):
-            source = active_skill.get("source")
-            if source == "builtin":
-                migrated["active_skill"] = None
-            else:
-                migrated["active_skill"] = migrate_skill_pin(active_skill)
-        system_skills = migrated.get("system_skills")
-        if isinstance(system_skills, list):
-            migrated["system_skills"] = [migrate_skill_pin(item) for item in system_skills]
-        plan_artifact = migrated.get("plan_artifact")
-        if isinstance(plan_artifact, dict):
-            plan_skill = plan_artifact.get("skill")
-            if isinstance(plan_skill, dict):
-                source = plan_skill.get("source")
-                if source == "builtin":
-                    plan_artifact = {**plan_artifact, "skill": None}
-                    migrated["plan_artifact"] = plan_artifact
-                else:
-                    plan_artifact = {
-                        **plan_artifact,
-                        "skill": migrate_skill_pin(plan_skill),
-                    }
-                    migrated["plan_artifact"] = plan_artifact
-            plan_system = plan_artifact.get("system_skills")
-            if isinstance(plan_system, list):
-                migrated["plan_artifact"] = {
-                    **plan_artifact,
-                    "system_skills": [migrate_skill_pin(item) for item in plan_system],
-                }
-        if "workspace_revision" not in migrated and migrated.get("modified_files"):
-            migrated["workspace_revision"] = 1
-        return migrated
-
     def start_task(
         self,
         *,
@@ -402,14 +337,6 @@ class MemoryState(BaseModel):
         self.plan_update_reason = None
         self.workflow_mode = WorkflowMode.EXECUTE
         self.last_agent_outcome = None
-
-    def repair_invalid_assistant_messages(self) -> int:
-        """Remove legacy empty assistant messages rejected by compatible providers."""
-        before = len(self.messages)
-        self.messages[:] = [
-            message for message in self.messages if message.is_valid_provider_message()
-        ]
-        return before - len(self.messages)
 
     def repair_interrupted_tool_history(
         self,

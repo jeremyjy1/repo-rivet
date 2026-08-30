@@ -1615,27 +1615,15 @@ def _print_chat_history(
         for message in memory.messages
         if message.role in {"user", "assistant"} and message.content
     ]
-    has_history = memory.fixed is not None or bool(memory.task_updates) or bool(visible_messages)
-
     if heading:
         console.print(Text("Conversation history", style="bold"))
-    if not has_history:
+    if not visible_messages:
         console.print("No conversation history.")
         return
 
-    if visible_messages:
-        # Memory messages already preserve turn order. Reprinting fixed/task-update layers
-        # ahead of them duplicates user prompts and groups speakers out of chronology.
-        for message in visible_messages:
-            label = "You" if message.role == "user" else "RepoRivet"
-            _print_history_entry(console, label, message.content or "")
-        return
-
-    # Migration fallback for older sessions that predate durable conversation messages.
-    if memory.fixed is not None:
-        _print_history_entry(console, "Original task", memory.fixed.original_task)
-    for update in memory.task_updates:
-        _print_history_entry(console, "Task update", update)
+    for message in visible_messages:
+        label = "You" if message.role == "user" else "RepoRivet"
+        _print_history_entry(console, label, message.content or "")
 
 
 def _print_history_entry(console: Console, label: str, content: str) -> None:

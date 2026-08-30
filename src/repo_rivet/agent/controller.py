@@ -211,7 +211,6 @@ class AgentController:
             )
         step_limit = self.termination_policy.config.max_steps
         repaired_interrupted_calls = self._repair_interrupted_history(memory)
-        repaired_empty_assistant_messages = memory.repair_invalid_assistant_messages()
         memory.start_task(
             task=task,
             workspace=str(workspace),
@@ -229,7 +228,6 @@ class AgentController:
             ],
             max_steps=step_limit,
         )
-        repaired_legacy_reflection = self._repair_legacy_protocol_reflection(memory)
         approval_engine = getattr(self.tool_registry, "approval_engine", None)
         if approval_engine is not None:
             approval_engine.sync_memory_rule()
@@ -330,16 +328,6 @@ class AgentController:
                 "auto_plan_started",
                 source=auto_plan_source,
                 reason=auto_plan_reason,
-            )
-        if repaired_legacy_reflection:
-            self._log(
-                "legacy_decision_state_repaired",
-                reason="trailing decision-validation rejections did not execute tools",
-            )
-        if repaired_empty_assistant_messages:
-            self._log(
-                "invalid_history_repaired",
-                removed_empty_assistant_messages=repaired_empty_assistant_messages,
             )
         if repaired_interrupted_calls:
             self._log(
@@ -753,6 +741,9 @@ class AgentController:
                 "instruction": (
                     "Inspect the workspace using planning tools only. Submit a structured "
                     f"Plan Artifact with {plan_tool} when it is ready for user review. "
+                    "Each create step must name one new file exactly once; write_file creates "
+                    "parent directories automatically, so never add a separate directory-creation "
+                    "step. "
                     "When updating, retain the exact IDs and specifications of completed "
                     "steps that remain valid; the Controller carries their progress forward. "
                     "Do not reintroduce work already completed outside the remaining plan. "
@@ -1646,6 +1637,13 @@ class AgentController:
             )
             self.verifier.record(state, persisted_result)
             verification_result = persisted_result
+            if verification_result.status == VerificationStatus.INCONCLUSIVE:
+                # An inconclusive result changes the next valid action from rerunning the check
+                # to replacing its verification plan. Do not let the generic repeated-call guard
+                # terminate before the bounded plan-revision recovery can be installed by the
+                # caller.
+                state.repeated_tool_calls = 0
+                state.last_tool_signature = None
         self._log("observation", **observation.model_dump(mode="json"))
         if verification_result is not None:
             self._log("verification_result", **verification_result.model_dump(mode="json"))
@@ -2254,24 +2252,6 @@ class AgentController:
         if policy == DecisionPolicy.COMMAND:
             return config.require_for_commands
         return config.require_for_mutating_tools
-
-    @staticmethod
-    def _repair_legacy_protocol_reflection(memory: MemoryState) -> bool:
-        """Clear reflection state created solely by pre-fix protocol observations."""
-        if not memory.reflection_required or memory.invalidated_files:
-            return False
-        saw_legacy_protocol_observation = False
-        for event in reversed(memory.observation_events):
-            if "decision_validation_failed" in event.result_summary:
-                saw_legacy_protocol_observation = True
-                continue
-            if not event.ok:
-                return False
-            break
-        if not saw_legacy_protocol_observation:
-            return False
-        memory.reflection_required = False
-        return True
 
     @staticmethod
     def _action_summary(call: ToolCall) -> str:

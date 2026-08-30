@@ -21,7 +21,9 @@ operations in one edit_file request use the original snapshot line numbers. Keep
 small enough to fit comfortably in one model response. Never replace a large existing file in one
 call; refactor it through small, coherent, snapshot-bound edits and reread after each changed
 section when necessary. Use write_file only to create a new path; it never overwrites. If a
-snapshot is stale, reread instead of guessing.
+snapshot is stale, reread instead of guessing. write_file creates missing parent directories
+automatically. In a Plan Artifact, use exactly one create step per new file; never add a separate
+directory-creation step or repeat a create target.
 Treat command failures as observations, diagnose them, and continue when possible.
 If a tool request is denied, do not repeat the same request; choose a safer alternative or stop.
 When request_plan is available and the task has uncertain, multi-file, architectural, migration,
@@ -356,15 +358,10 @@ class ContextManager:
                 )
             )
         for event in memory.observation_events[-4:]:
-            event_kind = (
-                "legacy blocked action"
-                if "decision_validation_failed" in event.result_summary
-                else "observation"
-            )
             events.append(
                 (
                     event.step,
-                    f"- {event.event_id} {event_kind}: {event.result_summary} ok={event.ok}",
+                    f"- {event.event_id} observation: {event.result_summary} ok={event.ok}",
                 )
             )
         events.sort(key=lambda item: item[0])

@@ -147,6 +147,34 @@ def test_plan_runtime_binds_snapshot_and_rejects_stale_execution(tmp_path: Path)
     assert memory.workflow_mode == WorkflowMode.PLAN_READY
 
 
+def test_plan_runtime_rejects_duplicate_normalized_create_targets(tmp_path: Path) -> None:
+    memory = MemoryState(session_id="duplicate-create")
+    memory.observation_events.append(observation("duplicate-create"))
+    runtime = PlanRuntime(WorkspacePathPolicy(tmp_path))
+    runtime.bind(memory)
+    payload = plan_payload(operation="create", target="new.py")
+    steps = payload["steps"]
+    assert isinstance(steps, list)
+    steps.insert(
+        1,
+        {
+            "step_id": "create-again",
+            "title": "Create the same file again",
+            "intent": "This impossible duplicate must be rejected",
+            "evidence_refs": ["obs-read"],
+            "operation": "create",
+            "target_files": ["./new.py"],
+            "verification_ids": ["tests"],
+            "depends_on": ["change"],
+            "risk": "low",
+        },
+    )
+    steps[2]["depends_on"] = ["create-again"]  # type: ignore[index]
+
+    with pytest.raises(ValueError, match="create target new.py is repeated"):
+        runtime.submit({"plan": payload})
+
+
 def test_plan_runtime_advances_only_from_typed_success_observations(tmp_path: Path) -> None:
     memory = inspected_memory(tmp_path)
     runtime = PlanRuntime(WorkspacePathPolicy(tmp_path))
@@ -500,38 +528,6 @@ def test_plan_update_preserves_completed_steps_and_clears_old_reflection(
     runtime.approve()
     assert updated.current_step is updated.steps[1]
     assert not memory.reflection_required
-
-
-def test_plan_approval_recovers_create_already_observed_in_session(tmp_path: Path) -> None:
-    created_path = tmp_path / "tetris.cpp"
-    created_path.write_text("int main() {}\n", encoding="utf-8")
-    snapshot = TextDocument.load(created_path).to_snapshot(relative_path="tetris.cpp")
-    memory = MemoryState(session_id="legacy-plan")
-    memory.observation_events.extend(
-        [
-            observation("legacy-plan"),
-            ObservationEvent(
-                event_id="obs-write-tetris",
-                session_id="legacy-plan",
-                step=2,
-                tool_call_id="write-tetris",
-                tool_name="write_file",
-                ok=True,
-                result_summary="Wrote tetris.cpp.",
-                affected_paths=["tetris.cpp"],
-            ),
-        ]
-    )
-    memory.current_snapshots["tetris.cpp"] = snapshot.snapshot_id
-    runtime = PlanRuntime(WorkspacePathPolicy(tmp_path))
-    runtime.bind(memory)
-    artifact = runtime.submit({"plan": plan_payload(operation="create", target="tetris.cpp")})
-
-    runtime.approve()
-
-    assert artifact.steps[0].status == PlanStepStatus.COMPLETED
-    assert artifact.steps[0].last_observation_ref == "obs-write-tetris"
-    assert artifact.current_step is artifact.steps[1]
 
 
 def test_plan_mode_hides_and_rejects_mutating_capabilities(tmp_path: Path) -> None:

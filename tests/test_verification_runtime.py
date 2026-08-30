@@ -6,7 +6,6 @@ from repo_rivet.memory.models import MemoryState
 from repo_rivet.safety.command_policy import CommandPolicy
 from repo_rivet.safety.path_policy import WorkspacePathPolicy
 from repo_rivet.tools.shell import ProcessExecution
-from repo_rivet.verification.models import VerificationStatus
 from repo_rivet.verification.runtime import VerificationRuntime
 
 
@@ -157,21 +156,15 @@ def test_smoke_check_can_pass_from_declared_exit_criteria(
     assert result.metadata["verification_result"]["status"] == "passed"
 
 
-def test_behavior_without_oracle_is_inconclusive(
+@pytest.mark.parametrize("kind", ["behavior", "custom"])
+def test_registration_rejects_behavior_or_custom_check_without_oracle(
     tmp_path: Path,
-    monkeypatch,
-) -> None:  # type: ignore[no-untyped-def]
+    kind: str,
+) -> None:
     value = runtime(tmp_path)
-    register(value, kind="behavior")
-    monkeypatch.setattr(
-        "repo_rivet.verification.runtime.execute_process",
-        lambda *args, **kwargs: execution(stdout="1 2 3\n"),
-    )
 
-    result = value.run("check")
-
-    assert result.metadata
-    assert result.metadata["verification_result"]["status"] == VerificationStatus.INCONCLUSIVE.value
+    with pytest.raises(ValueError, match="requires a deterministic output oracle"):
+        register(value, kind=kind)
 
 
 def test_behavior_output_oracle_passes_and_fails_deterministically(

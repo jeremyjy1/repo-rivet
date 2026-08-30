@@ -52,7 +52,14 @@ class PlanStepSpec(BaseModel):
     intent: str = Field(min_length=1, max_length=500)
     evidence_refs: list[str] = Field(min_length=1, max_length=50)
     operation: PlanOperation
-    target_files: list[str] = Field(default_factory=list, max_length=50)
+    target_files: list[str] = Field(
+        default_factory=list,
+        max_length=50,
+        description=(
+            "Exact workspace files affected by this step. Create steps represent one new file; "
+            "parent directories are implicit and a create target must not be repeated."
+        ),
+    )
     verification_ids: list[str] = Field(default_factory=list, max_length=50)
     depends_on: list[str] = Field(default_factory=list, max_length=50)
     risk: str = Field(pattern=r"^(low|medium|high)$")
