@@ -209,11 +209,32 @@ class AgentController:
         memory.begin_task_scope()
         if workflow_mode is not None:
             memory.workflow_mode = workflow_mode
+        remaining_plan_steps = 0
+        if (
+            memory.workflow_mode == WorkflowMode.EXECUTE
+            and memory.plan_artifact is not None
+            and memory.plan_artifact.status == PlanStatus.EXECUTING
+        ):
+            remaining_plan_steps = sum(
+                step.status != PlanStepStatus.COMPLETED for step in memory.plan_artifact.steps
+            )
+        step_limit = self.termination_policy.config.max_steps
         auto_plan_eligible = (
             memory.workflow_mode == WorkflowMode.EXECUTE and self._can_start_new_plan(memory)
         )
         auto_plan_reason = (
             self.auto_plan_policy.preflight_reason(task) if auto_plan_eligible else None
+        )
+        # Persist the user task before classifiers, recovery, or runtime setup can emit
+        # agent activity. The append-only event sequence is the canonical UI chronology.
+        self._log(
+            "session_start",
+            task=task.strip(),
+            progress_checkpoint_window=self.termination_policy.config.max_steps,
+            remaining_plan_steps=remaining_plan_steps,
+            next_step_checkpoint=step_limit,
+            auto_plan_mode=self.auto_plan_policy.mode.value,
+            auto_plan_reason=auto_plan_reason,
         )
         auto_plan_source = "controller"
         if (
@@ -265,16 +286,6 @@ class AgentController:
                 if applied:
                     auto_plan_reason = classification.reason
                     auto_plan_source = "llm_classifier"
-        remaining_plan_steps = 0
-        if (
-            memory.workflow_mode == WorkflowMode.EXECUTE
-            and memory.plan_artifact is not None
-            and memory.plan_artifact.status == PlanStatus.EXECUTING
-        ):
-            remaining_plan_steps = sum(
-                step.status != PlanStepStatus.COMPLETED for step in memory.plan_artifact.steps
-            )
-        step_limit = self.termination_policy.config.max_steps
         repaired_interrupted_calls = self._repair_interrupted_history(memory)
         memory.start_task(
             task=task,
@@ -450,15 +461,6 @@ class AgentController:
                     ),
                 },
             )
-        self._log(
-            "session_start",
-            task=state.task,
-            progress_checkpoint_window=self.termination_policy.config.max_steps,
-            remaining_plan_steps=remaining_plan_steps,
-            next_step_checkpoint=step_limit,
-            auto_plan_mode=self.auto_plan_policy.mode.value,
-            auto_plan_reason=auto_plan_reason if auto_plan_started else None,
-        )
         if auto_plan_started:
             self._log(
                 "auto_plan_started",

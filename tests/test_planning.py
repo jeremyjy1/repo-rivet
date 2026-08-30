@@ -1325,6 +1325,8 @@ def test_adaptive_llm_classification_forces_plan_before_main_agent(tmp_path: Pat
 
     assert result.status == "plan_ready"
     assert len(classifier.calls) == 1
+    event_names = [name for name, _ in events.events]
+    assert event_names.index("session_start") < event_names.index("auto_plan_review_started")
     assert {schema["function"]["name"] for schema in model.requests[0]["tools"]} == (
         PLANNING_TOOL_NAMES
     )

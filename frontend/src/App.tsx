@@ -67,12 +67,22 @@ function initialTheme(): Theme {
   return theme;
 }
 
-const eventLabels: Record<string, string> = {
-  "tool.requested": "Tool requested",
-  "tool.finished": "Tool finished",
-  "run.started": "Run started",
-  "run.finished": "Run finished",
-  "web.run.finished": "Run finished",
+const toolLabels: Record<string, string> = {
+  delete_path: "Delete path",
+  edit_file: "Edit file",
+  git_diff: "Inspect changes",
+  git_status: "Check workspace status",
+  list_files: "Browse files",
+  read_file: "Read file",
+  record_decision: "Record decision",
+  register_verification: "Set up verification",
+  request_plan: "Request planning",
+  run_command: "Run command",
+  run_verification: "Run verification",
+  search_text: "Search code",
+  submit_plan: "Submit plan",
+  update_plan: "Update plan",
+  write_file: "Write file",
 };
 
 const sessionRefreshEvents = new Set([
@@ -95,12 +105,48 @@ const sessionRefreshEvents = new Set([
   "web.run.finished",
 ]);
 
-const hiddenTimelineEvents = new Set([
-  "model.call.finished",
-  "model.stream.progress",
-  "runtime.transition",
-  "run.finished",
-  "web.run.finished",
+const visibleTimelineEvents = new Set([
+  "action.recovery.started",
+  "action.result.reused",
+  "action.retry.scheduled",
+  "approval.awaiting.human",
+  "approval.resolved",
+  "approval.review.failed",
+  "assessment",
+  "auto.plan.review.completed",
+  "auto.plan.review.failed",
+  "auto.plan.started",
+  "context.preflight.overflow",
+  "context.provider.overflow",
+  "context.recovery.compaction",
+  "duplicate.successful.command.suppressed",
+  "external.files.changed",
+  "interrupted.history.repaired",
+  "model.error",
+  "model.reasoning.effort.downgraded",
+  "model.reasoning.protocol.recovery",
+  "model.redirected",
+  "model.response.continuation",
+  "model.response.invalid",
+  "model.stream.retry",
+  "observation",
+  "plan.approved",
+  "plan.cancelled",
+  "plan.ready",
+  "plan.scope.revision.required",
+  "plan.submitted",
+  "plan.updated",
+  "reasoning",
+  "runtime.settings.changed",
+  "session.start",
+  "skill.activated",
+  "skill.deactivated",
+  "skill.load.failed",
+  "stale.snapshot.recovery.finished",
+  "tool.requested",
+  "user.input",
+  "verification.plan.recovery.started",
+  "verification.result",
 ]);
 
 function shouldRefreshSession(eventType: string) {
@@ -108,13 +154,80 @@ function shouldRefreshSession(eventType: string) {
 }
 
 function mergeEvents(left: AgentEvent[], right: AgentEvent[]) {
-  if (left.length === 0) return right;
-  if (right.length === 0) return left;
-  if (left.at(-1)!.seq < right[0].seq) return [...left, ...right];
-  const merged = new Map<number, AgentEvent>();
-  for (const event of left) merged.set(event.seq, event);
-  for (const event of right) merged.set(event.seq, event);
-  return [...merged.values()].sort((first, second) => first.seq - second.seq);
+  const merged = new Map<string, AgentEvent>();
+  for (const event of left) merged.set(event.event_id, event);
+  for (const event of right) merged.set(event.event_id, event);
+  return [...merged.values()].sort(compareEvents);
+}
+
+function compareEvents(first: AgentEvent, second: AgentEvent): number {
+  if (first.seq !== second.seq) return first.seq - second.seq;
+  const timestampOrder = Date.parse(first.timestamp) - Date.parse(second.timestamp);
+  if (Number.isFinite(timestampOrder) && timestampOrder !== 0) return timestampOrder;
+  return first.event_id.localeCompare(second.event_id);
+}
+
+function toolLabel(tool: string): string {
+  return toolLabels[tool] || "Workspace action";
+}
+
+function eventStep(event: AgentEvent): number | null {
+  return numberValue(event.payload.step) ?? numberValue(event.payload.model_step);
+}
+
+function shouldShowApprovalResolution(event: AgentEvent): boolean {
+  const action = textValue(event.payload.action);
+  const source = textValue(event.payload.source);
+  return action !== "allow" || source === "human" || source === "web_human";
+}
+
+function compactTimelineEvents(
+  events: AgentEvent[],
+  pendingApprovalId: string | null,
+): AgentEvent[] {
+  const resolvedApprovalIds = new Set(
+    events
+      .filter((event) => event.type === "approval.resolved")
+      .map((event) => textValue(event.payload.request_id)),
+  );
+  const observedToolCalls = new Set(
+    events
+      .filter((event) => event.type === "observation")
+      .map((event) => textValue(event.payload.tool_call_id))
+      .filter(Boolean),
+  );
+  const compacted: AgentEvent[] = [];
+  const queuedInputs = new Map<string, number>();
+  for (const event of events) {
+    if (!visibleTimelineEvents.has(event.type)) continue;
+    const task = textValue(event.payload.task).trim();
+    if (event.type === "user.input" && textValue(event.payload.delivery) === "queue" && task) {
+      queuedInputs.set(task, (queuedInputs.get(task) || 0) + 1);
+    }
+    if (event.type === "session.start" && task && (queuedInputs.get(task) || 0) > 0) {
+      queuedInputs.set(task, (queuedInputs.get(task) || 0) - 1);
+      continue;
+    }
+    if (
+      event.type === "tool.requested"
+      && observedToolCalls.has(textValue(event.payload.tool_call_id))
+    ) continue;
+    if (event.type === "approval.resolved" && !shouldShowApprovalResolution(event)) continue;
+    if (
+      event.type === "approval.awaiting.human"
+      && textValue(event.payload.request_id) !== pendingApprovalId
+      && resolvedApprovalIds.has(textValue(event.payload.request_id))
+    ) continue;
+
+    const previous = compacted.at(-1);
+    const replaceRepeatedThought = previous
+      && (event.type === "reasoning" || event.type === "assessment")
+      && previous.type === event.type
+      && eventStep(previous) === eventStep(event);
+    if (replaceRepeatedThought) compacted[compacted.length - 1] = event;
+    else compacted.push(event);
+  }
+  return compacted;
 }
 
 function App() {
@@ -443,11 +556,7 @@ const Timeline = memo(function Timeline({ session, isRunning, pendingApprovalId,
   const [historyLoaded, setHistoryLoaded] = useState(false);
   const messages = session?.messages || [];
   const fallbackMessages = historyLoaded && events.length === 0 ? messages : [];
-  const resolvedApprovalIds = new Set(events.filter((event) => event.type === "approval.resolved").map((event) => textValue(event.payload.request_id)));
-  const visibleEvents = events.filter((event) => {
-    if (hiddenTimelineEvents.has(event.type)) return false;
-    return event.type !== "approval.requested" || textValue(event.payload.request_id) === pendingApprovalId || !resolvedApprovalIds.has(textValue(event.payload.request_id));
-  });
+  const visibleEvents = compactTimelineEvents(events, pendingApprovalId);
   const messageStart = Math.max(0, fallbackMessages.length - historyLimit);
   const hasEarlierHistory = messageStart > 0 || hasOlderEvents;
   const latestModelActivity = [...events].reverse().find((event) => [
@@ -499,7 +608,7 @@ const Timeline = memo(function Timeline({ session, isRunning, pendingApprovalId,
   } else if (latestModelActivity?.type === "model.stream.retry") {
     workingLabel = `Retrying model stream · attempt ${textValue(latestModelActivity.payload.attempt)}/${textValue(latestModelActivity.payload.max_attempts)}`;
   } else if (latestModelActivity?.type === "approval.review.started") {
-    workingLabel = `Approval model is reviewing ${humanize(textValue(latestModelActivity.payload.tool) || "the tool request")}`;
+    workingLabel = `Approval model is reviewing ${toolLabel(textValue(latestModelActivity.payload.tool))}`;
   } else if (latestModelActivity?.type === "approval.review.completed") {
     workingLabel = "Approval review completed";
   } else if (latestModelActivity?.type === "approval.review.failed") {
@@ -970,19 +1079,19 @@ function presentEvent(event: AgentEvent, pendingApprovalId: string | null): Even
   const summary = textValue(payload.summary) || textValue(payload.result_summary);
   switch (event.type) {
     case "tool.requested":
-      return { title: `Action · ${humanize(tool || "tool")}`, summary: describeToolRequest(tool, payload.arguments), detail: "" };
+      return { title: toolLabel(tool), summary: describeToolRequest(tool, payload.arguments), detail: "" };
     case "observation": {
       const ok = payload.ok !== false;
       const details = [
         numberValue(payload.exit_code) !== null ? `exit ${numberValue(payload.exit_code)}` : "",
         stringList(payload.affected_paths).length ? `files: ${stringList(payload.affected_paths).join(", ")}` : "",
       ].filter(Boolean).join(" · ");
-      return { title: `${ok ? "Observed" : "Failed"} · ${humanize(tool || "tool")}`, summary, detail: details };
+      return { title: `${ok ? "Completed" : "Failed"} · ${toolLabel(tool)}`, summary, detail: details };
     }
     case "tool.finished": {
       const ok = payload.ok !== false;
       return {
-        title: `${ok ? "Completed" : "Failed"} · ${humanize(tool || "tool")}`,
+        title: `${ok ? "Completed" : "Failed"} · ${toolLabel(tool)}`,
         summary: textValue(payload.error) || (ok ? "Tool completed successfully" : "Tool operation failed"),
         detail: textValue(payload.error_code),
       };
@@ -994,14 +1103,14 @@ function presentEvent(event: AgentEvent, pendingApprovalId: string | null): Even
       const paths = stringList(payload.affected_paths);
       return {
         title: pending ? "Approval required" : "Checking approval policy",
-        summary: `${humanize(tool || "tool")} · ${textValue(payload.risk) || "unknown"} risk`,
+        summary: `${toolLabel(tool)} · ${textValue(payload.risk) || "unknown"} risk`,
         detail: [operation ? humanize(operation) : "", paths.length ? paths.join(", ") : ""].filter(Boolean).join(" · "),
       };
     }
     case "approval.awaiting.human":
       return {
         title: "Approval required",
-        summary: `${humanize(tool || "tool")} · ${textValue(payload.risk) || "unknown"} risk`,
+        summary: `${toolLabel(tool)} · ${textValue(payload.risk) || "unknown"} risk`,
         detail: payload.llm_review_available === true
           ? "Review the request and choose an action"
           : "Automatic review was unavailable; waiting for your decision",
@@ -1011,18 +1120,18 @@ function presentEvent(event: AgentEvent, pendingApprovalId: string | null): Even
       const source = textValue(payload.source);
       return {
         title: approvalTitle(action, source),
-        summary: humanize(tool || "tool"),
+        summary: toolLabel(tool),
         detail: clipped(textValue(payload.reason)),
       };
     }
     case "approval.review.started":
-      return { title: "Approval model review", summary: `Reviewing ${humanize(tool || "tool request")}`, detail: textValue(payload.risk) ? `${textValue(payload.risk)} risk` : "" };
+      return { title: "Approval model review", summary: `Reviewing ${toolLabel(tool)}`, detail: textValue(payload.risk) ? `${textValue(payload.risk)} risk` : "" };
     case "approval.review.completed":
-      return { title: "Approval review complete", summary: `${humanize(textValue(payload.recommendation) || "reviewed")} · ${humanize(tool || "tool request")}`, detail: [textValue(payload.risk) ? `${textValue(payload.risk)} risk` : "", numberValue(payload.duration_seconds) !== null ? `${numberValue(payload.duration_seconds)!.toFixed(1)}s` : ""].filter(Boolean).join(" · ") };
+      return { title: "Approval review complete", summary: `${humanize(textValue(payload.recommendation) || "reviewed")} · ${toolLabel(tool)}`, detail: [textValue(payload.risk) ? `${textValue(payload.risk)} risk` : "", numberValue(payload.duration_seconds) !== null ? `${numberValue(payload.duration_seconds)!.toFixed(1)}s` : ""].filter(Boolean).join(" · ") };
     case "approval.review.failed":
       return {
         title: "Approval review unavailable",
-        summary: `Falling back to human approval for ${humanize(tool || "tool request")}`,
+        summary: `Falling back to human approval for ${toolLabel(tool)}`,
         detail: [
           textValue(payload.error_type) ? humanize(textValue(payload.error_type)) : "",
           textValue(payload.stage) ? `during ${humanize(textValue(payload.stage))}` : "",
@@ -1036,7 +1145,7 @@ function presentEvent(event: AgentEvent, pendingApprovalId: string | null): Even
       return {
         title: humanize(textValue(payload.phase) || "Decision"),
         summary,
-        detail: [textValue(payload.current_goal), nextTool ? `next: ${humanize(nextTool)}${nextSummary ? ` · ${nextSummary}` : ""}` : ""].filter(Boolean).join(" · "),
+        detail: [textValue(payload.current_goal), nextTool ? `next: ${toolLabel(nextTool)}${nextSummary ? ` · ${nextSummary}` : ""}` : ""].filter(Boolean).join(" · "),
       };
     }
     case "assessment":
@@ -1044,19 +1153,19 @@ function presentEvent(event: AgentEvent, pendingApprovalId: string | null): Even
     case "action.result.reused":
       return {
         title: "Previous result reused",
-        summary: `${humanize(textValue(payload.tool) || "tool")} was not executed again`,
+        summary: `${toolLabel(textValue(payload.tool))} was not executed again`,
         detail: humanize(textValue(payload.disposition) || "valid result"),
       };
     case "action.retry.scheduled":
       return {
         title: "Transient action retry",
-        summary: `${humanize(textValue(payload.tool) || "tool")} · attempt ${textValue(payload.attempt)}`,
+        summary: `${toolLabel(textValue(payload.tool))} · attempt ${textValue(payload.attempt)}`,
         detail: humanize(textValue(payload.error_code)),
       };
     case "action.recovery.started":
       return {
         title: "Recovery started",
-        summary: `${humanize(textValue(payload.tool) || "action")} needs a different next action`,
+        summary: `${toolLabel(textValue(payload.tool))} needs a different next action`,
         detail: humanize(textValue(payload.reason_code)),
       };
     case "auto.plan.started":
@@ -1118,7 +1227,7 @@ function presentEvent(event: AgentEvent, pendingApprovalId: string | null): Even
         summary: clipped(textValue(payload.error) || "The model returned a malformed tool call"),
         detail: [
           recovery === "bounded_edit" ? "Retrying as smaller snapshot-bound edits" : "Requesting a corrected response",
-          textValue(payload.tool_name) ? humanize(textValue(payload.tool_name)) : "",
+          textValue(payload.tool_name) ? toolLabel(textValue(payload.tool_name)) : "",
           argumentChars !== null ? `${argumentChars.toLocaleString()} argument characters` : "",
         ].filter(Boolean).join(" · "),
       };
@@ -1202,6 +1311,33 @@ function presentEvent(event: AgentEvent, pendingApprovalId: string | null): Even
           textValue(payload.reasoning_effort) ? `${textValue(payload.reasoning_policy) || "adaptive"} reasoning · ${textValue(payload.reasoning_effort)}` : "",
         ].filter(Boolean).join(" · "),
       };
+    case "plan.submitted":
+    case "plan.updated":
+    case "plan.ready":
+      return {
+        title: event.type === "plan.updated" ? "Plan revised" : "Plan ready for review",
+        summary: clipped(summary || textValue(payload.goal) || "Review the proposed steps before execution"),
+        detail: textValue(payload.artifact_revision) ? `revision ${textValue(payload.artifact_revision)}` : "",
+      };
+    case "plan.approved":
+      return { title: "Plan approved", summary: "Execution can begin under the current approval policy", detail: "" };
+    case "plan.cancelled":
+      return { title: "Plan cancelled", summary: "The session was saved without executing this plan", detail: "" };
+    case "skill.activated":
+      return { title: "Skill enabled", summary: textValue(payload.skill_id) || "Task guidance enabled", detail: textValue(payload.version) ? `version ${textValue(payload.version)}` : "" };
+    case "skill.deactivated":
+      return { title: "Skill disabled", summary: textValue(payload.skill_id) || "No task-specific skill is active", detail: "" };
+    case "skill.load.failed":
+      return { title: "Skill unavailable", summary: textValue(payload.skill_id) || "Task guidance could not be loaded", detail: clipped(textValue(payload.error)) };
+    case "external.files.changed":
+      return { title: "Workspace changed externally", summary: stringList(payload.paths).join(", ") || "Files changed outside the current action", detail: "Snapshots and plans will be revalidated" };
+    case "interrupted.history.repaired":
+      return { title: "Interrupted action history repaired", summary: stringList(payload.calls).join(", ") || "An incomplete tool exchange was closed safely", detail: "Current workspace state will be inspected before retrying" };
+    case "context.preflight.overflow":
+    case "context.provider.overflow":
+      return { title: "Context needs compression", summary: clipped(textValue(payload.reason) || "The request exceeded its safe context budget"), detail: `recovery attempt ${textValue(payload.attempt) || "1"}` };
+    case "context.recovery.compaction":
+      return { title: "Context compressed", summary: `${textValue(payload.removed_messages) || "Some"} older messages summarized or removed`, detail: textValue(payload.remaining_messages) ? `${textValue(payload.remaining_messages)} messages remain` : "" };
     case "model.stream.usage.unavailable":
       return {
         title: "Streaming usage unavailable",
@@ -1218,20 +1354,38 @@ function presentEvent(event: AgentEvent, pendingApprovalId: string | null): Even
       };
     }
     default:
-      return { title: eventLabels[event.type] || humanize(event.type), summary: summary || textValue(payload.status) || humanize(tool), detail: "" };
+      return { title: "Agent update", summary: summary || textValue(payload.status) || (tool ? toolLabel(tool) : "Work progressed"), detail: "" };
   }
 }
 
 const EventCard = memo(function EventCard({ event, pendingApprovalId }: { event: AgentEvent; pendingApprovalId: string | null }) {
-  if (event.type === "session.start" || (event.type === "user.input" && textValue(event.payload.delivery) === "redirect")) {
+  if (event.type === "session.start" || event.type === "user.input") {
     const task = textValue(event.payload.task);
-    return <article className="message user timeline-user-message"><div className="message-label"><span>{event.type === "user.input" ? "YOU · REDIRECT" : "YOU"}</span><time>{new Date(event.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</time></div><ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml>{task}</ReactMarkdown></article>;
+    const delivery = textValue(event.payload.delivery);
+    const label = delivery === "redirect" ? "YOU · DIRECTION" : delivery === "queue" ? "YOU · QUEUED" : "YOU";
+    return <article className="message user timeline-user-message"><div className="message-label">{label}</div><ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml>{task}</ReactMarkdown></article>;
   }
-  const isTool = event.type.startsWith("tool.");
   const presentation = presentEvent(event, pendingApprovalId);
-  const step = numberValue(event.payload.step);
-  return <div className={`event-card ${event.type.replaceAll(".", "-")}`}><span className="event-icon">{isTool ? <Hammer size={14} /> : event.type.includes("approval") ? <ShieldAlert size={14} /> : <CheckCircle2 size={14} />}</span><div className="event-copy"><div className="event-heading"><strong>{presentation.title}</strong>{step !== null && <b>STEP {step}</b>}</div>{presentation.summary && <span>{presentation.summary}</span>}{presentation.detail && <small>{presentation.detail}</small>}</div><time>{new Date(event.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</time></div>;
+  return <div className={`event-card ${eventTone(event)}`}><span className="event-icon">{eventIcon(event)}</span><div className="event-copy"><div className="event-heading"><strong>{presentation.title}</strong></div>{presentation.summary && <span>{presentation.summary}</span>}{presentation.detail && <small>{presentation.detail}</small>}</div></div>;
 });
+
+function eventTone(event: AgentEvent): string {
+  if (event.type === "model.error" || event.type.includes("failed") || event.payload.ok === false) return "error";
+  if (event.type.includes("approval") || event.type.includes("recovery") || event.type.includes("overflow")) return "warning";
+  if (event.type === "tool.requested" || event.type === "reasoning" || event.type.startsWith("plan.")) return "active";
+  return "success";
+}
+
+function eventIcon(event: AgentEvent): ReactNode {
+  if (event.type === "tool.requested") return <Hammer size={14} />;
+  if (event.type === "reasoning") return <BrainCircuit size={14} />;
+  if (event.type === "assessment") return <ClipboardList size={14} />;
+  if (event.type.includes("approval")) return <ShieldAlert size={14} />;
+  if (event.type.startsWith("plan.") || event.type.startsWith("auto.plan")) return <ListChecks size={14} />;
+  if (event.type === "model.error" || event.type.includes("failed") || event.payload.ok === false) return <XCircle size={14} />;
+  if (event.type.includes("recovery") || event.type.includes("overflow")) return <RefreshCw size={14} />;
+  return <CheckCircle2 size={14} />;
+}
 
 const ResultCard = memo(function ResultCard({ result }: { result: Record<string, any> }) {
   const successful = result.status === "success" || result.status === "plan_ready";

@@ -104,24 +104,26 @@ button:focus-visible, textarea:focus-visible, select:focus-visible { outline: 2p
 .message.assistant { border-left: 2px solid #3a4556; padding-left: 15px; }
 .message.tool { display: none; }
 .message-label { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--accent); font-size: 9px; font-weight: 700; letter-spacing: .13em; margin-bottom: 6px; }
-.message-label time { color: #627080; white-space: nowrap; font: 9px "JetBrains Mono", monospace; letter-spacing: 0; }
 .timeline-user-message { margin-top: 20px; }
 .message p { margin: 5px 0; }
 .message pre, .result-card pre { max-width: 100%; overflow-x: auto; padding: 11px; background: #090b0f; border: 1px solid #242a34; border-radius: 7px; }
 .message table { display: block; max-width: 100%; overflow-x: auto; }
 .message code, .result-card code { font-family: "JetBrains Mono", monospace; font-size: 11px; }
-.event-card { display: grid; grid-template-columns: 27px minmax(0, 1fr) auto; align-items: start; gap: 8px; min-height: 42px; margin: 7px 0; padding: 8px 10px; background: #12161d; border: 1px solid #242a34; border-radius: 8px; }
-.event-icon { display: grid; place-items: center; width: 25px; height: 25px; color: #94a0b2; background: #1e2430; border-radius: 6px; }
+.event-card { position: relative; display: grid; grid-template-columns: 23px minmax(0, 1fr); align-items: start; gap: 8px; min-height: 34px; margin: 3px 0; padding: 6px 8px; border-left: 2px solid transparent; border-radius: 6px; }
+.event-card:hover { background: color-mix(in srgb, var(--panel) 72%, transparent); }
+.event-card.active { border-left-color: #526172; }
+.event-card.warning { border-left-color: var(--amber); background: color-mix(in srgb, var(--amber) 5%, transparent); }
+.event-card.error { border-left-color: var(--red); background: color-mix(in srgb, var(--red) 5%, transparent); }
+.event-icon { display: grid; place-items: center; width: 22px; height: 22px; color: #7f8b9b; background: #1b212b; border-radius: 6px; }
+.event-card.success .event-icon { color: var(--accent); }
+.event-card.warning .event-icon { color: var(--amber); }
+.event-card.error .event-icon { color: var(--red); }
 .event-copy { min-width: 0; }
 .event-heading { display: flex; min-width: 0; align-items: center; flex-wrap: wrap; gap: 6px; }
 .event-heading strong { overflow-wrap: anywhere; font-size: 11px; text-transform: capitalize; }
-.event-heading b { flex: none; padding: 2px 5px; color: #758092; background: #1d232d; border-radius: 4px; font: 8px "JetBrains Mono", monospace; }
-.event-copy > span, .event-copy > small { display: block; max-width: 100%; margin-top: 3px; overflow-wrap: anywhere; word-break: break-word; white-space: normal; font: 10px/1.5 "JetBrains Mono", monospace; }
+.event-copy > span, .event-copy > small { display: block; max-width: 100%; margin-top: 2px; overflow-wrap: anywhere; word-break: break-word; white-space: normal; font: 10px/1.45 "JetBrains Mono", monospace; }
 .event-copy > span { color: #aab2bf; }
 .event-copy > small { color: #737e8e; }
-.event-card time { padding-top: 3px; color: #5f6877; white-space: nowrap; font: 9px "JetBrains Mono", monospace; }
-.event-card.approval-requested { border-color: #5b4723; background: #211c14; }
-.event-card.approval-requested .event-icon { color: var(--amber); background: #342715; }
 .generating { display: flex; gap: 8px; align-items: center; color: #a7b0bd; font-size: 11px; line-height: 1.45; margin: 16px 0; min-width: 0; }
 .generating span { min-width: 0; overflow-wrap: anywhere; }
 .generating svg, .generating i { flex: none; }
@@ -283,7 +285,7 @@ button:focus-visible, textarea:focus-visible, select:focus-visible { outline: 2p
 :root[data-theme="light"] .session-delete:hover { color: #a93441; background: #f9e5e8; }
 :root[data-theme="light"] .breadcrumb { color: #526071; background: #f5f7fa; border-color: #d8dee7; }
 :root[data-theme="light"] .file-list button { color: #445163; }
-:root[data-theme="light"] .revision, :root[data-theme="light"] .runtime-state, :root[data-theme="light"] .event-heading b { background: #eef1f5; }
+:root[data-theme="light"] .revision, :root[data-theme="light"] .runtime-state { background: #eef1f5; }
 :root[data-theme="light"] .run-actions button, :root[data-theme="light"] .plan-buttons button { color: #445163; background: #f7f8fa; }
 :root[data-theme="light"] .run-actions button:hover, :root[data-theme="light"] .plan-buttons button:hover { color: #202631; border-color: #9ca8b8; }
 :root[data-theme="light"] .run-actions .mode-button.plan, :root[data-theme="light"] .mode-notice { color: #8c5908; background: #fff7e9; border-color: #dfc48f; }
@@ -293,12 +295,15 @@ button:focus-visible, textarea:focus-visible, select:focus-visible { outline: 2p
 :root[data-theme="light"] .message.user { background: #e8f4ed; border-color: #b8d9c4; }
 :root[data-theme="light"] .message.assistant { border-left-color: #aeb8c6; }
 :root[data-theme="light"] .message pre, :root[data-theme="light"] .result-card pre { color: #303a47; background: #f4f6f8; border-color: #d8dee7; }
-:root[data-theme="light"] .event-card { background: #ffffff; border-color: #dce2e9; box-shadow: 0 1px 2px rgba(31, 40, 52, .04); }
+:root[data-theme="light"] .event-card { background: transparent; box-shadow: none; }
+:root[data-theme="light"] .event-card:hover { background: #f4f6f8; }
+:root[data-theme="light"] .event-card.active { border-left-color: #8794a5; }
+:root[data-theme="light"] .event-card.warning { border-left-color: var(--amber); background: #fffaf0; }
+:root[data-theme="light"] .event-card.error { border-left-color: var(--red); background: #fff5f5; }
 :root[data-theme="light"] .event-icon { color: #667487; background: #edf1f5; }
+:root[data-theme="light"] .event-card.success .event-icon { color: #168653; }
 :root[data-theme="light"] .event-copy > span { color: #4e5b6b; }
-:root[data-theme="light"] .event-copy > small, :root[data-theme="light"] .event-card time { color: #748195; }
-:root[data-theme="light"] .event-card.approval-requested { background: #fff8eb; border-color: #dfc48f; }
-:root[data-theme="light"] .event-card.approval-requested .event-icon { background: #f7e4bd; }
+:root[data-theme="light"] .event-copy > small { color: #748195; }
 :root[data-theme="light"] .result-card, :root[data-theme="light"] .conversation-plan { background: #f1f8f4; border-color: #afd2bd; }
 :root[data-theme="light"] .result-card.error, :root[data-theme="light"] .result-card.blocked { background: #fdf0f1; border-color: #e3b1b6; }
 :root[data-theme="light"] .conversation-plan.stale { background: #fff8eb; border-color: #dfc48f; }
