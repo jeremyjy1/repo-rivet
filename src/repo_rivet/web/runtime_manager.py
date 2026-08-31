@@ -502,12 +502,6 @@ class RuntimeManager:
                 status=idle.value,
                 agent_step=result.step_count,
             )
-            runtime.store.log(
-                "web_run_finished",
-                run_id=run.run_id,
-                status=result.status,
-                reason=result.reason,
-            )
             run.result = {
                 "status": result.status,
                 "summary": result.summary,
@@ -519,6 +513,14 @@ class RuntimeManager:
             }
             run.status = (
                 "completed" if result.status in {"success", "plan_ready"} else result.status
+            )
+            # Publish completion only after the queryable run state is complete. SSE clients
+            # refresh immediately when this event arrives and must never observe result=None.
+            runtime.store.log(
+                "web_run_finished",
+                run_id=run.run_id,
+                status=result.status,
+                reason=result.reason,
             )
         except Exception:
             runtime.memory.status = SessionStatus.FAILED.value

@@ -91,7 +91,6 @@ class ConsoleEventReporter:
         self._secrets = tuple(secret for secret in secrets if secret)
         self.reasoning_mode = reasoning_mode
         self._active_status: Status | None = None
-        self._last_blocked_signature: tuple[object, object, object, object] | None = None
 
     def log(self, event_type: str, **data: Any) -> None:
         if event_type in _STATUS_STOP_EVENTS:
@@ -120,55 +119,12 @@ class ConsoleEventReporter:
             self._assessment(data)
         elif event_type == "action":
             self._action(data)
-        elif event_type == "action_blocked":
-            self._action_blocked(data)
         elif event_type == "action_result_reused":
             tool = self._safe(data.get("tool", "tool"), limit=80)
             self._print_trace_label(
                 "REUSE",
                 f"{tool} · previous valid result reused; tool was not executed",
                 style="bold cyan",
-            )
-        elif event_type == "action_retry_scheduled":
-            tool = self._safe(data.get("tool", "tool"), limit=80)
-            attempt = self._safe(data.get("attempt", "?"), limit=10)
-            self._print_trace_label(
-                "RETRY",
-                f"{tool} · transient infrastructure failure · attempt {attempt}",
-                style="bold yellow",
-            )
-        elif event_type == "action_recovery_started":
-            tool = self._safe(data.get("tool", "tool"), limit=80)
-            reason = self._safe(data.get("reason_code", "action failed"), limit=120)
-            self._print_trace_label(
-                "RECOVER",
-                f"{tool} · {reason} · choose a distinct evidence-based action",
-                style="bold yellow",
-            )
-        elif event_type == "edit_context_recovery_started":
-            path = self._safe(data.get("path", "file"), limit=160)
-            start = self._safe(data.get("start_line", "?"), limit=10)
-            end = self._safe(data.get("end_line", "?"), limit=10)
-            self._print_trace_label(
-                "RECOVER",
-                f"{path}:{start}-{end} · reading required edit context automatically",
-                style="bold yellow",
-            )
-        elif event_type == "edit_context_recovery_finished":
-            path = self._safe(data.get("path", "file"), limit=160)
-            status = "ready" if data.get("ok") else "failed"
-            self._print_trace_label(
-                "RECOVER",
-                f"{path} · edit context {status}",
-                style="bold cyan" if data.get("ok") else "bold red",
-            )
-        elif event_type == "plan_text_response_rejected":
-            attempt = self._safe(data.get("attempt", "?"), limit=10)
-            required_tool = self._safe(data.get("required_tool", "submit_plan"), limit=40)
-            self._print_trace_label(
-                "RECOVER",
-                f"Plan prose was not submitted · attempt {attempt} · requiring {required_tool}",
-                style="bold yellow",
             )
         elif event_type == "observation":
             self._observation(data)
@@ -226,29 +182,15 @@ class ConsoleEventReporter:
         detail = f"{tool} {argument}".rstrip()
         self._print_trace_label("ACTION", detail, style="bold cyan")
 
-    def _action_blocked(self, data: dict[str, Any]) -> None:
-        if self.reasoning_mode == ReasoningDisplayMode.OFF:
-            return
-        if data.get("error_code") == "finalization_tool_disabled":
-            return
-        signature = (
-            data.get("step"),
-            data.get("tool"),
-            data.get("error_code"),
-            data.get("reason"),
-        )
-        if signature == self._last_blocked_signature:
-            return
-        self._last_blocked_signature = signature
-        tool = self._safe(data.get("tool", "unknown tool"))
-        reason = self._safe(data.get("reason", "decision protocol rejected the call"), limit=300)
-        self._print_trace_label("BLOCKED", self._join(tool, reason), style="bold yellow")
-
     def _observation(self, data: dict[str, Any]) -> None:
         if self.reasoning_mode == ReasoningDisplayMode.OFF:
             return
+        if data.get("execution_attempted") is False:
+            return
         summary = self._safe(data.get("result_summary", ""), limit=500)
-        style = "bold green" if data.get("ok") is True else "bold red"
+        exit_code = data.get("exit_code")
+        succeeded = data.get("ok") is True and (not isinstance(exit_code, int) or exit_code == 0)
+        style = "bold green" if succeeded else "bold red"
         self._print_trace_label("OBSERVE", summary, style=style)
 
     def _assessment(self, data: dict[str, Any]) -> None:
@@ -373,6 +315,8 @@ class ConsoleEventReporter:
         self._active_status = None
 
     def _tool_result(self, data: dict[str, Any]) -> None:
+        if data.get("executed") is False:
+            return
         if data.get("name") in {
             "record_decision",
             "register_verification",

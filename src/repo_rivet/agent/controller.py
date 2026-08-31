@@ -597,6 +597,48 @@ class AgentController:
                         model_call_id=model_call_id,
                         succeeded=False,
                     )
+                    awaiting_verification_plan = (
+                        state.verification_plan is None
+                        and state.verification_plan_recovery_attempts > 0
+                    )
+                    if awaiting_verification_plan:
+                        required_tool_instruction = (
+                            "The Controller is waiting for register_verification. Discard the "
+                            "malformed response and call register_verification only; do not "
+                            "start or resume another tool recovery."
+                        )
+                        state.record_model_error(
+                            str(error),
+                            recovery_instruction=required_tool_instruction,
+                            count_as_empty=False,
+                        )
+                        memory.messages.append(
+                            Message.from_chat_message(
+                                state.messages[-1],
+                                step=state.tool_call_count,
+                            )
+                        )
+                        self._log(
+                            "model_response_invalid",
+                            step=state.step_count,
+                            error=str(error),
+                            error_code=error.code,
+                            tool_name=error.tool_name,
+                            argument_chars=error.argument_chars,
+                            recovery="required_tool",
+                            required_tool="register_verification",
+                        )
+                        terminal_result = self._request_verification_plan_recovery(
+                            state=state,
+                            memory=memory,
+                            trigger=(
+                                "the verification-plan recovery response was malformed or "
+                                "requested another tool"
+                            ),
+                        )
+                        if terminal_result is not None:
+                            return terminal_result
+                        continue
                     bounded_edit_recovery = (
                         error.code == "invalid_tool_arguments_json"
                         and error.tool_name in {"edit_file", "write_file"}
@@ -1589,7 +1631,6 @@ class AgentController:
                     self._record_meta_result(call, result, state=state, memory=memory)
                 else:
                     self._record_blocked_action(call, result, state=state, memory=memory)
-            state.record_protocol_failure(recovery_error_message)
             self._log(
                 "model_response_invalid",
                 step=state.step_count,
@@ -1597,20 +1638,11 @@ class AgentController:
                 recovery="required_tool",
                 required_tool="register_verification",
             )
-            self._append_system_feedback(
-                state,
-                memory,
-                {
-                    "error": "verification_plan_recovery_protocol_violation",
-                    "allowed_next_actions": ["register_verification"],
-                    "instruction": (
-                        "Call register_verification only. The Controller still holds the "
-                        "previously authorized action, so do not reproduce it."
-                    ),
-                },
+            return self._request_verification_plan_recovery(
+                state=state,
+                memory=memory,
+                trigger=("verification-plan recovery received a non-registration tool response"),
             )
-            self._save_memory(memory, state, status=self._active_memory_status(state))
-            return None
         missing_plan_verification_calls = [
             call
             for call in action_calls
@@ -2721,6 +2753,7 @@ class AgentController:
             error_code=result.error_code,
             retryable=result.retryable,
             metadata=result.metadata,
+            executed=result.ok,
         )
         self._save_memory(memory, state, status=self._active_memory_status(state))
 
@@ -3369,7 +3402,12 @@ class AgentController:
                     workspace_revision=state.workspace_revision,
                     plan_step_id=plan_step.step_id if plan_step is not None else None,
                 )
-        self._log("observation", **observation.model_dump(mode="json"))
+        execution_attempted = (result.metadata or {}).get("execution_attempted") is not False
+        self._log(
+            "observation",
+            **observation.model_dump(mode="json"),
+            execution_attempted=execution_attempted,
+        )
         if verification_result is not None:
             self._log("verification_result", **verification_result.model_dump(mode="json"))
         self._log(
@@ -3382,6 +3420,7 @@ class AgentController:
             retryable=result.retryable,
             metadata=result.metadata,
             output_ref=output_ref,
+            executed=execution_attempted,
         )
         if action_id is not None:
             memory.applied_action_ids.add(action_id)
@@ -5140,6 +5179,7 @@ class AgentController:
         self._log(
             "session_end",
             status=result.status,
+            summary=result.summary,
             reason=result.reason,
             modified_files=result.modified_files,
             step_count=result.step_count,

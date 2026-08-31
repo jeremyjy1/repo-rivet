@@ -175,15 +175,49 @@ def controller(
 
 def test_agent_executes_tool_then_returns_final_text() -> None:
     read = call("1", "read_file", {"path": "app.py"})
+    events = RecordingSink()
     model = FakeModelClient([ModelResponse(tool_calls=[read]), ModelResponse(content="Done.")])
     tools = FakeToolRegistry([ToolResult(ok=True, output="content")])
 
-    result = controller(model, tools).run("inspect the project")
+    result = controller(model, tools, event_logger=events).run("inspect the project")
 
     assert result.status == "success"
     assert result.summary == "Done."
     assert result.step_count == 2
     assert result.tool_call_count == 1
+    session_end = next(data for name, data in events.events if name == "session_end")
+    assert session_end["summary"] == "Done."
+
+
+def test_events_distinguish_unexecuted_rejections_from_real_failures() -> None:
+    rejected = call("write-rejected", "write_file", {"path": "app.py", "content": "x"})
+    failed_read = call("read-failed", "read_file", {"path": "missing.py"})
+    events = RecordingSink()
+    model = FakeModelClient(
+        [
+            ModelResponse(tool_calls=[rejected]),
+            ModelResponse(tool_calls=[failed_read]),
+            ModelResponse(content="The requested operations did not change the workspace."),
+        ]
+    )
+    tools = FakeToolRegistry([ToolResult(ok=False, output="", error="missing.py does not exist")])
+
+    result = controller(model, tools, event_logger=events).run("inspect and update app.py")
+
+    assert result.status == "success"
+    rejected_result = next(
+        data
+        for name, data in events.events
+        if name == "tool_result" and data.get("tool_call_id") == "write-rejected"
+    )
+    failed_observation = next(
+        data
+        for name, data in events.events
+        if name == "observation" and data.get("tool_call_id") == "read-failed"
+    )
+    assert rejected_result["executed"] is False
+    assert failed_observation["execution_attempted"] is True
+    assert failed_observation["ok"] is False
 
 
 def test_model_wait_state_is_not_persisted_as_session_status(tmp_path: Path) -> None:
@@ -855,7 +889,7 @@ def test_file_change_without_verification_plan_is_blocked_before_execution() -> 
             event_type == "verification_plan_recovery_started"
             for event_type, _data in events.events
         )
-        == 1
+        == 2
     )
 
 
@@ -1044,6 +1078,50 @@ def test_missing_plan_recovery_is_bounded() -> None:
     )
     assert len(model.requests) == 3
     assert memory.verification_plan_recovery_attempts == 3
+
+
+def test_missing_plan_recovery_isolates_malformed_and_wrong_edit_responses() -> None:
+    malformed_edit = ResponseParseError(
+        "Tool call edit_file contains invalid JSON arguments: Extra data",
+        code="invalid_tool_arguments_json",
+        tool_name="edit_file",
+        argument_chars=1_818,
+    )
+    repeated_edit = call(
+        "repeated-edit",
+        "edit_file",
+        {"path": "app.py", "snapshot_id": "snapshot", "operations": []},
+    )
+    model = FakeModelClient(
+        [
+            malformed_edit,
+            ModelResponse(tool_calls=[repeated_edit]),
+            malformed_edit,
+        ]
+    )
+    events = RecordingSink()
+    memory = MemoryState(session_id="bounded-missing-plan-wrong-tool")
+    memory.modified_files.add("app.py")
+    memory.verification_plan_recovery_attempts = 1
+
+    result = controller(
+        model,
+        FakeToolRegistry([]),
+        event_logger=events,
+    ).run("continue", memory=memory)
+
+    assert result.status == "incomplete"
+    assert result.reason == (
+        "no executable verification plan was registered after 3 recovery attempts"
+    )
+    assert memory.verification_plan_recovery_attempts == 3
+    assert all(
+        request["options"].required_tool == "register_verification" for request in model.requests
+    )
+    invalid_responses = [data for name, data in events.events if name == "model_response_invalid"]
+    assert invalid_responses
+    assert all(data["recovery"] == "required_tool" for data in invalid_responses)
+    assert not any(data.get("recovery") == "bounded_edit" for data in invalid_responses)
 
 
 def test_provider_block_preserves_candidate_assessment_and_error_details() -> None:
@@ -1562,20 +1640,22 @@ def test_agent_replaces_truncated_whole_file_edit_with_bounded_recovery() -> Non
     model = FakeModelClient(
         [
             ModelResponse(tool_calls=[decision("decision", "edit_file")]),
+            ModelResponse(tool_calls=[verification_plan()]),
             parse_error,
             ModelResponse(content="Stopped before applying the malformed edit."),
+            ModelResponse(content="No malformed edit was applied; verification passed."),
         ]
     )
     events = RecordingSink()
 
     result = controller(
         model,
-        FakeToolRegistry([]),
+        FakeToolRegistry([passed_verification_result(revision=0)]),
         event_logger=events,
     ).run("refactor the file")
 
     assert result.status == "success"
-    recovery_messages = model.requests[2]["messages"]
+    recovery_messages = model.requests[3]["messages"]
     recovery = next(
         str(message.get("content", ""))
         for message in reversed(recovery_messages)

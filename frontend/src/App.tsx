@@ -140,17 +140,16 @@ const visibleTimelineEvents = new Set([
   "model.reasoning.protocol.recovery",
   "model.redirected",
   "model.response.continuation",
-  "model.response.invalid",
   "model.stream.retry",
   "observation",
   "plan.approved",
   "plan.cancelled",
   "plan.ready",
   "plan.scope.revision.required",
-  "plan.text.response.rejected",
   "plan.submitted",
   "plan.updated",
   "reasoning",
+  "run.finished",
   "runtime.settings.changed",
   "session.start",
   "skill.activated",
@@ -165,6 +164,45 @@ const visibleTimelineEvents = new Set([
   "user.input",
   "verification.plan.recovery.started",
   "verification.result",
+]);
+
+const nonImpactTimelineEvents = new Set([
+  "action.recovery.started",
+  "action.retry.scheduled",
+  "approval.review.failed",
+  "auto.plan.review.failed",
+  "edit.context.recovery.finished",
+  "edit.context.recovery.started",
+  "model.reasoning.protocol.recovery",
+  "model.response.continuation",
+  "model.stream.retry",
+  "model.stream.usage.unavailable",
+  "subagent.blocked",
+  "verification.plan.recovery.started",
+]);
+
+const nonExecutionErrorCodes = new Set([
+  "action_cardinality_violation",
+  "approval_denied",
+  "batch_cancelled",
+  "decision_validation_failed",
+  "finalization_tool_disabled",
+  "invalid_arguments",
+  "invalid_command",
+  "invalid_delete_target",
+  "plan_invalid",
+  "plan_mode_violation",
+  "plan_scope_revision_required",
+  "plan_step_violation",
+  "reasoning_invalid",
+  "stale_snapshot",
+  "structured_tool_recovery_violation",
+  "unseen_range",
+  "verification_check_invalid",
+  "verification_plan_invalid",
+  "verification_plan_missing",
+  "verification_plan_revision_required",
+  "verification_retry_without_change",
 ]);
 
 function shouldRefreshSession(eventType: string) {
@@ -193,10 +231,20 @@ function eventStep(event: AgentEvent): number | null {
   return numberValue(event.payload.step) ?? numberValue(event.payload.model_step);
 }
 
-function eventToolName(event: AgentEvent): string {
-  return textValue(event.payload.name)
-    || textValue(event.payload.tool)
-    || textValue(event.payload.tool_name);
+function eventExecutionAttempted(event: AgentEvent): boolean {
+  if (event.payload.executed === false || event.payload.execution_attempted === false) return false;
+  if (nonExecutionErrorCodes.has(textValue(event.payload.error_code))) return false;
+  return recordValue(event.payload.metadata).execution_attempted !== false;
+}
+
+function eventHasActualFailure(event: AgentEvent): boolean {
+  if (!eventExecutionAttempted(event)) return false;
+  if (event.type === "model.error") return event.payload.retryable !== true;
+  if (event.type === "verification.result") return textValue(event.payload.status) === "failed";
+  if (event.type.includes("failed")) return true;
+  if (event.payload.ok === false) return true;
+  const exitCode = numberValue(event.payload.exit_code);
+  return exitCode !== null && exitCode !== 0;
 }
 
 function shouldShowApprovalResolution(event: AgentEvent): boolean {
@@ -226,10 +274,18 @@ function compactTimelineEvents(
       .map((event) => textValue(event.payload.tool_call_id))
       .filter(Boolean),
   );
+  const nonExecutedToolCalls = new Set(
+    events
+      .filter((event) => event.type === "tool.finished" && !eventExecutionAttempted(event))
+      .map((event) => textValue(event.payload.tool_call_id))
+      .filter(Boolean),
+  );
   const compacted: AgentEvent[] = [];
   const queuedInputs = new Map<string, number>();
   for (const event of events) {
     if (!visibleTimelineEvents.has(event.type)) continue;
+    if (nonImpactTimelineEvents.has(event.type)) continue;
+    if (event.type === "model.error" && event.payload.retryable === true) continue;
     const task = textValue(event.payload.task).trim();
     if (event.type === "user.input" && textValue(event.payload.delivery) === "queue" && task) {
       queuedInputs.set(task, (queuedInputs.get(task) || 0) + 1);
@@ -238,6 +294,13 @@ function compactTimelineEvents(
       queuedInputs.set(task, (queuedInputs.get(task) || 0) - 1);
       continue;
     }
+    if (
+      event.type === "observation"
+      && (
+        !eventExecutionAttempted(event)
+        || nonExecutedToolCalls.has(textValue(event.payload.tool_call_id))
+      )
+    ) continue;
     if (
       event.type === "tool.requested"
       && (
@@ -251,7 +314,7 @@ function compactTimelineEvents(
       if (
         observedToolCalls.has(toolCallId)
         || !failedOrSkipped
-        || textValue(event.payload.error_code) === "finalization_tool_disabled"
+        || !eventExecutionAttempted(event)
       ) continue;
     }
     if (event.type === "approval.resolved" && !shouldShowApprovalResolution(event)) continue;
@@ -266,24 +329,8 @@ function compactTimelineEvents(
       && (event.type === "reasoning" || event.type === "assessment")
       && previous.type === event.type
       && eventStep(previous) === eventStep(event);
-    const aggregateRejectedAction = previous
-      && event.type === "tool.finished"
-      && previous.type === "tool.finished"
-      && event.payload.executed === false
-      && previous.payload.executed === false
-      && eventToolName(previous) === eventToolName(event)
-      && textValue(previous.payload.error_code) === textValue(event.payload.error_code)
-      && textValue(previous.payload.error) === textValue(event.payload.error);
     if (replaceRepeatedThought) compacted[compacted.length - 1] = event;
-    else if (aggregateRejectedAction) {
-      compacted[compacted.length - 1] = {
-        ...previous,
-        payload: {
-          ...previous.payload,
-          repeated_count: (numberValue(previous.payload.repeated_count) || 1) + 1,
-        },
-      };
-    } else compacted.push(event);
+    else compacted.push(event);
   }
   return compacted;
 }
@@ -633,8 +680,13 @@ const Timeline = memo(function Timeline({ session, isRunning, pendingApprovalId,
   const [loadingOlderEvents, setLoadingOlderEvents] = useState(false);
   const [historyLoaded, setHistoryLoaded] = useState(false);
   const messages = session?.messages || [];
-  const fallbackMessages = historyLoaded && events.length === 0 ? messages : [];
+  const fallbackMessages = historyLoaded && events.length === 0
+    ? messages.filter((message) => message.role === "user" || message.role === "assistant")
+    : [];
   const visibleEvents = compactTimelineEvents(events, pendingApprovalId);
+  const latestFinishedEventId = [...visibleEvents]
+    .reverse()
+    .find((event) => event.type === "run.finished")?.event_id;
   const messageStart = Math.max(0, fallbackMessages.length - historyLimit);
   const hasEarlierHistory = messageStart > 0 || hasOlderEvents;
   const latestModelActivity = [...events].reverse().find((event) => [
@@ -798,7 +850,13 @@ const Timeline = memo(function Timeline({ session, isRunning, pendingApprovalId,
     }}>{loadingOlderEvents ? "Loading earlier history…" : "Show earlier history"}</button>}
     {!session && <EmptyState />}
     {fallbackMessages.slice(messageStart).map((message, index) => <MessageBlock message={message} key={`m-${messageStart + index}`} />)}
-    {visibleEvents.map((event) => <EventCard event={event} pendingApprovalId={pendingApprovalId} key={event.event_id} />)}
+    {visibleEvents.map((event) => (
+      event.type === "run.finished"
+      && session?.run?.result
+      && event.event_id === latestFinishedEventId
+        ? null
+        : <EventCard event={event} pendingApprovalId={pendingApprovalId} key={event.event_id} />
+    ))}
     {isRunning && <div className="generating"><LoaderCircle className="spin" size={17} /><span>{pendingApprovalId ? "Waiting for your approval" : workingLabel}</span><i /><i /><i /></div>}
     {!isRunning && session?.plan && (session.plan.status === "ready" || session.plan.status === "stale") && <PlanResultCard session={session} invoke={invoke} refresh={() => onRefresh(session.session_id)} />}
     {session?.run?.result && !(session.run.result.status === "plan_ready" && session.plan && (session.plan.status === "ready" || session.plan.status === "stale")) && <ResultCard result={session.run.result} />}
@@ -1180,7 +1238,7 @@ function presentEvent(event: AgentEvent, pendingApprovalId: string | null): Even
     case "tool.requested":
       return { title: toolLabel(tool), summary: describeToolRequest(tool, payload.arguments), detail: "" };
     case "observation": {
-      const ok = payload.ok !== false;
+      const ok = !eventHasActualFailure(event);
       const details = [
         numberValue(payload.exit_code) !== null ? `exit ${numberValue(payload.exit_code)}` : "",
         stringList(payload.affected_paths).length ? `files: ${stringList(payload.affected_paths).join(", ")}` : "",
@@ -1190,9 +1248,8 @@ function presentEvent(event: AgentEvent, pendingApprovalId: string | null): Even
     case "tool.finished": {
       const ok = payload.ok !== false;
       const executed = payload.executed !== false;
-      const repeatedCount = numberValue(payload.repeated_count) || 1;
       return {
-        title: `${!executed ? "Not executed" : ok ? "Completed" : "Failed"} · ${toolLabel(tool)}${repeatedCount > 1 ? ` ×${repeatedCount}` : ""}`,
+        title: `${!executed ? "Not executed" : ok ? "Completed" : "Failed"} · ${toolLabel(tool)}`,
         summary: textValue(payload.error) || (ok ? "Tool completed successfully" : "Tool operation failed"),
         detail: [textValue(payload.error_code), !executed ? "Workspace unchanged" : ""]
           .filter(Boolean)
@@ -1508,12 +1565,13 @@ const EventCard = memo(function EventCard({ event, pendingApprovalId }: { event:
     const label = delivery === "redirect" ? "YOU · DIRECTION" : delivery === "queue" ? "YOU · QUEUED" : "YOU";
     return <article className="message user timeline-user-message"><div className="message-label">{label}</div><ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml>{task}</ReactMarkdown></article>;
   }
+  if (event.type === "run.finished") return <ResultCard result={event.payload} />;
   const presentation = presentEvent(event, pendingApprovalId);
   return <div className={`status-card event-card ${eventTone(event)}`}><span className="event-icon">{eventIcon(event)}</span><div className="event-copy"><div className="event-heading"><strong>{presentation.title}</strong></div>{presentation.summary && <span>{presentation.summary}</span>}{presentation.detail && <small>{presentation.detail}</small>}</div></div>;
 });
 
 function eventTone(event: AgentEvent): string {
-  if (event.type === "model.error" || event.type.includes("failed") || event.payload.ok === false) return "error";
+  if (eventHasActualFailure(event)) return "error";
   if (event.type.includes("approval") || event.type.includes("recovery") || event.type.includes("overflow")) return "warning";
   if (event.type === "tool.requested" || event.type === "reasoning" || event.type.startsWith("plan.") || event.type === "subagent.started") return "active";
   return "success";
@@ -1526,7 +1584,7 @@ function eventIcon(event: AgentEvent): ReactNode {
   if (event.type.startsWith("subagent.")) return <GitBranch size={14} />;
   if (event.type.includes("approval")) return <ShieldAlert size={14} />;
   if (event.type.startsWith("plan.") || event.type.startsWith("auto.plan")) return <ListChecks size={14} />;
-  if (event.type === "model.error" || event.type.includes("failed") || event.payload.ok === false) return <XCircle size={14} />;
+  if (eventHasActualFailure(event)) return <XCircle size={14} />;
   if (event.type.includes("recovery") || event.type.includes("overflow")) return <RefreshCw size={14} />;
   return <CheckCircle2 size={14} />;
 }

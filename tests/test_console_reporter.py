@@ -619,7 +619,7 @@ def test_semantic_auto_approval_names_the_matched_rule() -> None:
     )
 
 
-def test_console_reporter_labels_unexecuted_action_as_blocked() -> None:
+def test_console_reporter_hides_unexecuted_action_errors() -> None:
     buffer = StringIO()
     reporter = ConsoleEventReporter(
         Console(file=buffer, force_terminal=False, color_system=None, width=240),
@@ -640,30 +640,24 @@ def test_console_reporter_labels_unexecuted_action_as_blocked() -> None:
         executed=False,
     )
 
-    assert buffer.getvalue().splitlines() == [
-        "[BLOCKED] run_command · A matching decision is required."
-    ]
+    assert buffer.getvalue() == ""
 
 
-def test_console_reporter_suppresses_duplicate_blocked_actions_from_one_turn() -> None:
+def test_console_reporter_keeps_real_execution_failures_visible() -> None:
     buffer = StringIO()
     reporter = ConsoleEventReporter(
         Console(file=buffer, force_terminal=False, color_system=None, width=240),
         reasoning_mode=ReasoningDisplayMode.SUMMARY,
     )
-    payload = {
-        "step": 3,
-        "tool": "run_command",
-        "reason": "The model turn contained multiple state-changing actions.",
-        "error_code": "action_cardinality_violation",
-    }
+    reporter.log(
+        "observation",
+        execution_attempted=True,
+        ok=True,
+        exit_code=1,
+        result_summary="Command finished with exit code 1.",
+    )
 
-    reporter.log("action_blocked", **payload)
-    reporter.log("action_blocked", **payload)
-
-    assert buffer.getvalue().splitlines() == [
-        "[BLOCKED] run_command · The model turn contained multiple state-changing actions."
-    ]
+    assert buffer.getvalue().splitlines() == ["[OBSERVE] Command finished with exit code 1."]
 
 
 def test_console_reporter_hides_finalization_tool_fallback() -> None:
