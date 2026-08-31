@@ -71,6 +71,7 @@ class BaseTool[ArgumentsT: BaseModel](ABC):
     arguments_type: ClassVar[type[BaseModel]]
     capabilities: ClassVar[frozenset[Capability]] = frozenset()
     decision_policy: ClassVar[DecisionPolicy] = DecisionPolicy.MUTATION
+    wait_kind: ClassVar[str] = "tool_completion"
 
     @property
     def schema(self) -> dict[str, Any]:

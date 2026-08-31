@@ -32,6 +32,9 @@ dev = [
 [tool.pytest.ini_options]
 addopts = "-ra"
 testpaths = ["tests"]
+markers = [
+    "live_api: calls a configured real OpenAI-compatible API and may incur charges",
+]
 
 [tool.ruff]
 line-length = 100

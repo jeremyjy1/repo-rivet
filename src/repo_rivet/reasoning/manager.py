@@ -208,4 +208,9 @@ class ReasoningManager:
             return f"Command finished with exit code {metadata.get('exit_code', 'unknown')}."
         if call.name == "git_diff":
             return "Inspected the current Git diff."
+        if call.name == "delegate_task":
+            status = metadata.get("report_status", "unknown")
+            profile = metadata.get("profile", "subagent")
+            reused = " Reused a fresh report." if metadata.get("reused") else ""
+            return f"{profile} subagent returned a {status} report.{reused}"
         return f"{call.name} completed successfully."

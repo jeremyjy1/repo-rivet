@@ -65,3 +65,10 @@ def test_progress_checkpoint_can_be_renewed_after_observed_progress() -> None:
     assert state.step_limit == 6
     assert not state.made_progress_since_checkpoint
     assert policy.check(state, now=11) is None
+
+
+def test_optional_tool_call_limit_is_independent_from_model_steps() -> None:
+    state = SessionState(task="bounded child", tool_call_count=10, initial_tool_call_count=2)
+    policy = TerminationPolicy(TerminationConfig(max_tool_calls=8))
+
+    assert policy.check(state) == "maximum tool calls reached (8)"

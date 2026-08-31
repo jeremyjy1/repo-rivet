@@ -95,6 +95,22 @@ def test_context_compaction_events_have_stable_browser_names(tmp_path: Path) -> 
     ]
 
 
+def test_subagent_events_have_stable_browser_names(tmp_path: Path) -> None:
+    path = tmp_path / "events.jsonl"
+    rows = [
+        {"timestamp": "start", "event": "subagent_started", "data": {}},
+        {"timestamp": "done", "event": "subagent_report_accepted", "data": {}},
+        {"timestamp": "stale", "event": "subagent_marked_stale", "data": {}},
+    ]
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+    assert [event.type for event in read_events(path, "session-a")] == [
+        "subagent.started",
+        "subagent.report.accepted",
+        "subagent.marked.stale",
+    ]
+
+
 def test_event_history_is_loaded_in_bounded_pages(tmp_path: Path) -> None:
     path = tmp_path / "events.jsonl"
     rows = [

@@ -63,6 +63,7 @@ from repo_rivet.skills.runtime import SkillRuntime
 from repo_rivet.storage.console_reporter import ConsoleEventReporter
 from repo_rivet.storage.event_sink import CompositeEventSink, EventSink
 from repo_rivet.storage.terminal_text import escape_terminal_controls
+from repo_rivet.subagents.manager import SubagentManager
 from repo_rivet.tools.registry import ToolRegistry, create_default_registry
 
 
@@ -1071,6 +1072,17 @@ def _build_runtime(
             )
         event_sinks.extend(additional_event_sinks)
         runtime_events = CompositeEventSink(*event_sinks)
+        model_client = OpenAICompatibleClient(api_config, event_logger=runtime_events)
+        subagent_manager = SubagentManager(
+            workspace=workspace,
+            parent_store=store,
+            model_client_factory=lambda child_events: OpenAICompatibleClient(
+                api_config,
+                event_logger=child_events,
+            ),
+            event_logger=runtime_events,
+            secrets=secrets,
+        )
         approval_engine = _build_approval_engine(
             config=config,
             arguments=arguments,
@@ -1086,6 +1098,7 @@ def _build_runtime(
             snapshot_dir=store.session_dir / "snapshots",
             event_logger=runtime_events,
             initial_workspace_revision=memory.workspace_revision,
+            subagent_manager=subagent_manager,
         )
         skill_runtime = SkillRuntime(_create_skill_registry(session_manager))
         previous_skill = memory.active_skill
@@ -1134,7 +1147,7 @@ def _build_runtime(
                     activation=memory.active_skill.activation.value,
                 )
         controller = AgentController(
-            model_client=OpenAICompatibleClient(api_config, event_logger=runtime_events),
+            model_client=model_client,
             tool_registry=registry,
             context_manager=ContextManager(token_manager=token_manager),
             termination_policy=termination,

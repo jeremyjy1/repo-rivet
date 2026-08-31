@@ -9,6 +9,7 @@ from repo_rivet.agent.state import SessionState
 @dataclass(frozen=True, slots=True)
 class TerminationConfig:
     max_steps: int = 30
+    max_tool_calls: int | None = None
     max_seconds: float = 600
     max_consecutive_failures: int = 5
     max_consecutive_protocol_failures: int = 5
@@ -26,6 +27,8 @@ class TerminationConfig:
         }
         if any(value <= 0 for value in values.values()):
             raise ValueError("Termination limits must be positive")
+        if self.max_tool_calls is not None and self.max_tool_calls <= 0:
+            raise ValueError("max_tool_calls must be positive when configured")
 
 
 class TerminationPolicy:
@@ -51,6 +54,11 @@ class TerminationPolicy:
         step_limit = self.step_limit(state)
         if include_step_limit and state.step_count >= step_limit:
             return self.step_checkpoint_reason(state)
+        if (
+            self.config.max_tool_calls is not None
+            and state.tool_call_count - state.initial_tool_call_count >= self.config.max_tool_calls
+        ):
+            return f"maximum tool calls reached ({self.config.max_tool_calls})"
 
         current_time = time.monotonic() if now is None else now
         if current_time - state.started_at >= self.config.max_seconds:

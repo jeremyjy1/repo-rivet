@@ -124,6 +124,31 @@ def test_action_lifecycle_persists_approval_execution_and_observation() -> None:
     assert_state_invariants(kernel.state)
 
 
+def test_delegation_dispatch_uses_subagent_result_wait_state() -> None:
+    kernel = RuntimeKernel(AgentRuntimeState.create("session"))
+    kernel.dispatch(
+        DomainEventKind.RUN_ACTIVATED,
+        payload={"phase": WorkflowPhase.DECIDING.value},
+    )
+    record = action(kernel.state)
+    kernel.dispatch(
+        DomainEventKind.ACTION_PROPOSED,
+        correlation_id=record.action_id,
+        payload={"action": record.model_dump(mode="json")},
+    )
+    kernel.dispatch(DomainEventKind.ACTION_PREPARED, correlation_id=record.action_id)
+    kernel.dispatch(
+        DomainEventKind.ACTION_DISPATCHED,
+        correlation_id=record.action_id,
+        payload={"wait_kind": WaitKind.SUBAGENT_RESULTS.value},
+    )
+
+    assert kernel.state.status == RunStatus.WAITING
+    assert kernel.state.wait is not None
+    assert kernel.state.wait.kind == WaitKind.SUBAGENT_RESULTS
+    assert_state_invariants(kernel.state)
+
+
 def test_restart_reconciliation_never_blindly_reexecutes_running_action() -> None:
     kernel = RuntimeKernel(AgentRuntimeState.create("session"))
     kernel.dispatch(

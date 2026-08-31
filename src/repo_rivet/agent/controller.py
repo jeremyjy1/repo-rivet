@@ -71,7 +71,11 @@ from repo_rivet.planning.models import (
     WorkflowMode,
 )
 from repo_rivet.planning.policy import AutoPlanMode, AutoPlanPolicy
-from repo_rivet.planning.runtime import PLANNING_TOOL_NAMES, PlanRuntime
+from repo_rivet.planning.runtime import (
+    PLANNING_AUXILIARY_TOOL_NAMES,
+    PLANNING_TOOL_NAMES,
+    PlanRuntime,
+)
 from repo_rivet.reasoning.manager import ReasoningManager
 from repo_rivet.reasoning.models import ReasoningEvent, ReasoningPhase
 from repo_rivet.reasoning.policy import (
@@ -147,6 +151,10 @@ class AgentController:
         skill_runtime: SkillRuntime | None = None,
         auto_plan_policy: AutoPlanPolicy | None = None,
         plan_classifier: PlanClassifier | None = None,
+        system_prompt: str = SYSTEM_PROMPT,
+        safety_rules: tuple[str, ...] | None = None,
+        completion_rules: tuple[str, ...] | None = None,
+        terminal_tool_names: frozenset[str] = frozenset(),
     ) -> None:
         self.model_client = model_client
         self.tool_registry = tool_registry
@@ -163,6 +171,19 @@ class AgentController:
         self.skill_runtime = skill_runtime
         self.auto_plan_policy = auto_plan_policy or AutoPlanPolicy()
         self.plan_classifier = plan_classifier
+        self.system_prompt = system_prompt
+        self.safety_rules = safety_rules or (
+            "All file operations must stay inside the configured workspace.",
+            "Commands run without a shell and obvious destructive commands are blocked.",
+            "Denied tool requests must not be repeated unchanged.",
+            "Never expose API keys, tokens, passwords, or local configuration contents.",
+        )
+        self.completion_rules = completion_rules or (
+            "Inspect relevant files before editing.",
+            "After file changes, complete a successful verification before finishing.",
+            "Report modified files, verification, and unresolved errors explicitly.",
+        )
+        self.terminal_tool_names = terminal_tool_names
         self._steering_source: Callable[[], list[str]] | None = None
         self._runtime_settings_source: Callable[[], dict[str, str]] | None = None
         runtime = getattr(tool_registry, "verification_runtime", None)
@@ -292,18 +313,9 @@ class AgentController:
         memory.start_task(
             task=task,
             workspace=str(workspace),
-            system_prompt=SYSTEM_PROMPT,
-            safety_rules=[
-                "All file operations must stay inside the configured workspace.",
-                "Commands run without a shell and obvious destructive commands are blocked.",
-                "Denied tool requests must not be repeated unchanged.",
-                "Never expose API keys, tokens, passwords, or local configuration contents.",
-            ],
-            completion_rules=[
-                "Inspect relevant files before editing.",
-                "After file changes, complete a successful verification before finishing.",
-                "Report modified files, verification, and unresolved errors explicitly.",
-            ],
+            system_prompt=self.system_prompt,
+            safety_rules=list(self.safety_rules),
+            completion_rules=list(self.completion_rules),
             max_steps=step_limit,
         )
         approval_engine = getattr(self.tool_registry, "approval_engine", None)
@@ -358,6 +370,9 @@ class AgentController:
         )
         self.verification_runtime.bind(memory)
         self.plan_runtime.bind(memory)
+        subagent_manager = getattr(self.tool_registry, "subagent_manager", None)
+        if subagent_manager is not None:
+            subagent_manager.bind(memory)
         runtime_state = state.runtime
         if runtime_state is None:
             raise RuntimeError("Agent runtime was not initialized")
@@ -1371,7 +1386,11 @@ class AgentController:
                     state=state,
                     memory=memory,
                 )
-            calls = [call for call in calls if call.name in PLANNING_TOOL_NAMES]
+            calls = [
+                call
+                for call in calls
+                if call.name in PLANNING_TOOL_NAMES | PLANNING_AUXILIARY_TOOL_NAMES
+            ]
             if not calls:
                 return None
 
@@ -1956,6 +1975,13 @@ class AgentController:
             )
             if terminal_result is not None:
                 return terminal_result
+            if call.name in self.terminal_tool_names and result.ok:
+                return self._finish(
+                    state,
+                    memory,
+                    status="success",
+                    summary=result.output,
+                )
             if call.name == "edit_file" and result.error_code == "stale_snapshot":
                 recovery_result = self._recover_stale_edit_snapshot(
                     call,
@@ -3876,7 +3902,8 @@ class AgentController:
             schemas = [
                 schema
                 for schema in schemas
-                if schema.get("function", {}).get("name") in PLANNING_TOOL_NAMES
+                if schema.get("function", {}).get("name")
+                in PLANNING_TOOL_NAMES | PLANNING_AUXILIARY_TOOL_NAMES
             ]
         elif workflow_mode == WorkflowMode.EXECUTE:
             has_plan = (

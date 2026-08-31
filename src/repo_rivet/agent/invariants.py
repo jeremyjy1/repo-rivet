@@ -36,6 +36,7 @@ def assert_state_invariants(state: AgentRuntimeState) -> None:
         in {
             WaitKind.APPROVAL,
             WaitKind.TOOL_COMPLETION,
+            WaitKind.SUBAGENT_RESULTS,
         }
         and state.phase in MODEL_PHASES
     ):

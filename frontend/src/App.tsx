@@ -70,6 +70,7 @@ function initialTheme(): Theme {
 
 const toolLabels: Record<string, string> = {
   delete_path: "Delete path",
+  delegate_task: "Delegate investigation",
   edit_file: "Edit file",
   git_diff: "Inspect changes",
   git_status: "Check workspace status",
@@ -100,6 +101,10 @@ const sessionRefreshEvents = new Set([
   "auto.plan.started",
   "run.finished",
   "runtime.settings.changed",
+  "subagent.started",
+  "subagent.report.accepted",
+  "subagent.marked.stale",
+  "subagent.blocked",
   "session.start",
   "user.input",
   "verification.result",
@@ -146,6 +151,10 @@ const visibleTimelineEvents = new Set([
   "skill.deactivated",
   "skill.load.failed",
   "stale.snapshot.recovery.finished",
+  "subagent.blocked",
+  "subagent.marked.stale",
+  "subagent.report.accepted",
+  "subagent.started",
   "tool.finished",
   "tool.requested",
   "user.input",
@@ -1403,6 +1412,25 @@ function presentEvent(event: AgentEvent, pendingApprovalId: string | null): Even
       return payload.changed === false
         ? { title: "Context already compact", summary: "No older messages needed to be removed", detail: `${textValue(payload.remaining_messages) || "0"} messages remain` }
         : { title: "Context compressed manually", summary: `${textValue(payload.removed_messages) || "Some"} older messages summarized or removed`, detail: `${textValue(payload.remaining_messages) || "0"} messages remain` };
+    case "subagent.started":
+      return {
+        title: `${humanize(textValue(payload.profile) || "Subagent")} started`,
+        summary: stringList(payload.scope_paths).join(", ") || "Scoped read-only investigation",
+        detail: "Workspace mutation and nested delegation are disabled",
+      };
+    case "subagent.report.accepted":
+      return {
+        title: `${humanize(textValue(payload.profile) || "Subagent")} report ready`,
+        summary: clipped(textValue(payload.summary) || "Validated evidence returned to the parent agent"),
+        detail: [
+          textValue(payload.status),
+          payload.reused === true ? "reused fresh report" : textValue(payload.freshness),
+        ].filter(Boolean).map((value) => humanize(String(value))).join(" · "),
+      };
+    case "subagent.marked.stale":
+      return { title: "Subagent report became stale", summary: stringList(payload.stale_paths).join(", ") || "Referenced files changed", detail: "The report will not be integrated" };
+    case "subagent.blocked":
+      return { title: "Subagent could not finish", summary: clipped(textValue(payload.reason) || "No acceptable report was produced"), detail: "The parent run remains recoverable" };
     case "model.stream.usage.unavailable":
       return {
         title: "Streaming usage unavailable",
@@ -1437,7 +1465,7 @@ const EventCard = memo(function EventCard({ event, pendingApprovalId }: { event:
 function eventTone(event: AgentEvent): string {
   if (event.type === "model.error" || event.type.includes("failed") || event.payload.ok === false) return "error";
   if (event.type.includes("approval") || event.type.includes("recovery") || event.type.includes("overflow")) return "warning";
-  if (event.type === "tool.requested" || event.type === "reasoning" || event.type.startsWith("plan.")) return "active";
+  if (event.type === "tool.requested" || event.type === "reasoning" || event.type.startsWith("plan.") || event.type === "subagent.started") return "active";
   return "success";
 }
 
@@ -1445,6 +1473,7 @@ function eventIcon(event: AgentEvent): ReactNode {
   if (event.type === "tool.requested") return <Hammer size={14} />;
   if (event.type === "reasoning") return <BrainCircuit size={14} />;
   if (event.type === "assessment") return <ClipboardList size={14} />;
+  if (event.type.startsWith("subagent.")) return <GitBranch size={14} />;
   if (event.type.includes("approval")) return <ShieldAlert size={14} />;
   if (event.type.startsWith("plan.") || event.type.startsWith("auto.plan")) return <ListChecks size={14} />;
   if (event.type === "model.error" || event.type.includes("failed") || event.payload.ok === false) return <XCircle size={14} />;

@@ -34,6 +34,8 @@ PLANNING_TOOL_NAMES = frozenset(
     }
 )
 
+PLANNING_AUXILIARY_TOOL_NAMES = frozenset({"delegate_task"})
+
 
 class PlanRuntime:
     def __init__(self, path_policy: WorkspacePathPolicy) -> None:
@@ -45,7 +47,7 @@ class PlanRuntime:
 
     @staticmethod
     def ensure_tool_allowed(tool_name: str) -> None:
-        if tool_name not in PLANNING_TOOL_NAMES:
+        if tool_name not in PLANNING_TOOL_NAMES | PLANNING_AUXILIARY_TOOL_NAMES:
             raise PlanModeViolation(tool_name)
 
     def submit(

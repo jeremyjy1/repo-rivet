@@ -145,6 +145,7 @@ class OpenAICompatibleClient:
         reasoning_context_restart_required = False
         max_attempts = self._config.max_retries + 1
         reasoning_protocol_recovery_used = False
+        thinking_tool_choice_recovery_used = False
         for attempt in range(1, max_attempts + 1):
             try:
                 while True:
@@ -200,6 +201,22 @@ class OpenAICompatibleClient:
                     except ModelStreamInterrupted:
                         raise
                     except Exception as error:
+                        if (
+                            request_options.required_tool is not None
+                            and not thinking_tool_choice_recovery_used
+                            and _thinking_tool_choice_incompatible(error)
+                        ):
+                            thinking_tool_choice_recovery_used = True
+                            provider_options = _disable_provider_thinking(provider_options)
+                            provider_thinking_disabled = True
+                            self._log(
+                                "model_thinking_tool_choice_recovery",
+                                attempt=attempt,
+                                required_tool=request_options.required_tool,
+                                error_type=type(error).__name__,
+                                recovery="retry_required_tool_with_thinking_disabled",
+                            )
+                            continue
                         if (
                             not _reasoning_content_replay_required(error)
                             or reasoning_protocol_recovery_used
@@ -581,6 +598,24 @@ def _reasoning_content_replay_required(error: Exception) -> bool:
         "reasoning_content" in message
         and "thinking mode" in message
         and ("passed back" in message or "required" in message)
+    )
+
+
+def _thinking_tool_choice_incompatible(error: Exception) -> bool:
+    status_code = getattr(error, "status_code", None)
+    if status_code not in {400, 422}:
+        return False
+    message = str(error).casefold()
+    body = getattr(error, "body", None)
+    if body is not None:
+        message += " " + str(body).casefold()
+    return (
+        "thinking" in message
+        and ("tool_choice" in message or "tool choice" in message)
+        and any(
+            marker in message
+            for marker in ("does not support", "not supported", "unsupported", "incompatible")
+        )
     )
 
 

@@ -3,6 +3,7 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -10,6 +11,12 @@ permissions:
 jobs:
   quality:
     runs-on: ubuntu-latest
+    env:
+      REPORIVET_LIVE_API_KEY: ${{ secrets.REPORIVET_LIVE_API_KEY }}
+      REPORIVET_LIVE_BASE_URL: ${{ vars.REPORIVET_LIVE_BASE_URL }}
+      REPORIVET_LIVE_MODEL: ${{ vars.REPORIVET_LIVE_MODEL }}
+      REPORIVET_LIVE_CONTEXT_WINDOW: ${{ vars.REPORIVET_LIVE_CONTEXT_WINDOW }}
+      REPORIVET_LIVE_REASONING_EFFORTS: ${{ vars.REPORIVET_LIVE_REASONING_EFFORTS }}
 
     steps:
       - name: Check out repository
@@ -35,3 +42,9 @@ jobs:
 
       - name: Test
         run: uv run pytest
+
+      - name: Test real model integration
+        if: env.REPORIVET_LIVE_API_KEY != '' && env.REPORIVET_LIVE_MODEL != ''
+        env:
+          REPORIVET_RUN_LIVE_API: "1"
+        run: uv run pytest -m live_api --run-live-api

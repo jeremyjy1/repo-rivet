@@ -11,6 +11,7 @@ from repo_rivet.editing.tools import EditFileTool
 from repo_rivet.planning.runtime import PlanRuntime
 from repo_rivet.safety.command_policy import CommandPolicy
 from repo_rivet.safety.path_policy import WorkspacePathPolicy
+from repo_rivet.subagents.tools import DelegateTaskTool, DelegationRunner
 from repo_rivet.tools.base import BaseTool, DecisionPolicy, ToolCall, ToolResult
 from repo_rivet.tools.filesystem import (
     DeletePathTool,
@@ -56,12 +57,14 @@ class ToolRegistry:
         approval_engine: ApprovalEngine | None = None,
         verification_runtime: VerificationRuntime | None = None,
         plan_runtime: PlanRuntime | None = None,
+        subagent_manager: DelegationRunner | None = None,
     ) -> None:
         self._tools: dict[str, BaseTool[Any]] = {}
         self.workspace = workspace
         self.approval_engine = approval_engine
         self.verification_runtime = verification_runtime
         self.plan_runtime = plan_runtime
+        self.subagent_manager = subagent_manager
         for tool in tools:
             self.register(tool)
 
@@ -119,7 +122,7 @@ class ToolRegistry:
                 return _before_execution(validated)
             notify("prepared", {"valid": True})
             if self.approval_engine is None:
-                notify("dispatched", {})
+                notify("dispatched", {"wait_kind": tool.wait_kind})
                 notify("running", {})
                 return tool.execute_validated(validated)
 
@@ -183,7 +186,10 @@ class ToolRegistry:
                 )
             tool.approval_granted(validated, source=decision.source)
             self.approval_engine.record_execution_started(outcome)
-            notify("dispatched", {"request_id": outcome.request.request_id})
+            notify(
+                "dispatched",
+                {"request_id": outcome.request.request_id, "wait_kind": tool.wait_kind},
+            )
             notify("running", {"request_id": outcome.request.request_id})
             result = tool.execute_validated(validated)
             self.approval_engine.record_execution(
@@ -218,6 +224,7 @@ def create_default_registry(
     snapshot_dir: Path | None = None,
     event_logger: Any | None = None,
     initial_workspace_revision: int = 0,
+    subagent_manager: DelegationRunner | None = None,
 ) -> ToolRegistry:
     """Create the local workspace tools and the side-effect-free decision meta tool."""
     path_policy = WorkspacePathPolicy(workspace)
@@ -230,26 +237,30 @@ def create_default_registry(
         event_logger=event_logger,
         initial_workspace_revision=initial_workspace_revision,
     )
+    tools: list[BaseTool[Any]] = [
+        RecordDecisionTool(),
+        RegisterVerificationTool(),
+        SubmitPlanTool(),
+        UpdatePlanTool(),
+        RequestPlanTool(),
+        ListFilesTool(path_policy),
+        SearchTextTool(path_policy, editing_runtime),
+        ReadFileTool(path_policy, editing_runtime),
+        WriteFileTool(path_policy, editing_runtime),
+        DeletePathTool(path_policy, editing_runtime),
+        EditFileTool(editing_runtime),
+        RunCommandTool(path_policy, command_policy),
+        RunVerificationTool(verification_runtime),
+        GitStatusTool(path_policy),
+        GitDiffTool(path_policy),
+    ]
+    if subagent_manager is not None:
+        tools.append(DelegateTaskTool(subagent_manager))
     return ToolRegistry(
-        [
-            RecordDecisionTool(),
-            RegisterVerificationTool(),
-            SubmitPlanTool(),
-            UpdatePlanTool(),
-            RequestPlanTool(),
-            ListFilesTool(path_policy),
-            SearchTextTool(path_policy, editing_runtime),
-            ReadFileTool(path_policy, editing_runtime),
-            WriteFileTool(path_policy, editing_runtime),
-            DeletePathTool(path_policy, editing_runtime),
-            EditFileTool(editing_runtime),
-            RunCommandTool(path_policy, command_policy),
-            RunVerificationTool(verification_runtime),
-            GitStatusTool(path_policy),
-            GitDiffTool(path_policy),
-        ],
+        tools,
         workspace=path_policy.workspace,
         approval_engine=approval_engine,
         verification_runtime=verification_runtime,
         plan_runtime=plan_runtime,
+        subagent_manager=subagent_manager,
     )

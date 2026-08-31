@@ -40,3 +40,5 @@ Skill 创作采用确定性工具链：`reporivet skill init ID` 在 `reporivet-
 CLI 默认省略工具请求 ID、步骤号、安全低风险审批和常规自动放行；重要审批单独显示一行，耗时命令保留运行提示，实际执行的工具各用一行显示最终成功、失败、退出码和耗时。状态行不显示文件内容、完整命令参数或原始输出，完整结构化事件仍写入会话的 `events.jsonl`。模型最终回答默认使用简洁纯文本；只有用户明确要求 Markdown，或内容确实需要相应结构时才使用 Markdown。
 
 安全边界：审批位于 Tool Registry 与本地执行器之间。所有工具声明能力，路径和命令先规范化并评估风险；工作区外写入、软链接逃逸、提权、设备与凭据访问由硬规则拒绝，任何审批模式均不能绕过。批准后会立即重新解析路径和指纹再执行。命令不经过 shell；普通 subprocess 不是完整操作系统沙箱，请仅在可信项目中运行。
+
+测试分为确定性测试和真实 Provider 集成测试。普通 `uv run pytest` 使用 Fake 验证本地状态机、安全策略和错误恢复，不产生模型费用；涉及流式协议、原生 Tool Calling、reasoning 状态回传、独立规划/审批模型及完整只读 Subagent 的场景标记为 `live_api`。本地明确接受费用后运行 `uv run pytest -m live_api --run-live-api`，默认读取已忽略的 `reporivet.toml`，也可通过 `--live-api-config PATH` 或 `REPORIVET_LIVE_*` 环境变量提供专用低成本模型。CI 配置 Secret `REPORIVET_LIVE_API_KEY` 以及 Variables `REPORIVET_LIVE_BASE_URL`、`REPORIVET_LIVE_MODEL`、`REPORIVET_LIVE_CONTEXT_WINDOW` 后会自动运行真实接口测试；Fork PR 不会获得 Secret，因此只运行确定性测试。真实测试固定调用次数并使用配置中最低的受支持推理档位，但仍可能产生费用。

@@ -48,6 +48,7 @@ class WaitKind(StrEnum):
     MODEL_RESPONSE = "model_response"
     APPROVAL = "approval"
     TOOL_COMPLETION = "tool_completion"
+    SUBAGENT_RESULTS = "subagent_results"
     RETRY_BACKOFF = "retry_backoff"
 
 

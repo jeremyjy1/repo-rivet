@@ -224,6 +224,24 @@ class ReasoningProtocolFallbackCompletions:
         return iter([stream_chunk(content="protocol recovered", finish_reason="stop")])
 
 
+class ThinkingToolChoiceError(RuntimeError):
+    def __init__(self) -> None:
+        super().__init__("Thinking mode does not support this tool_choice")
+        self.status_code = 400
+        self.code = "invalid_request_error"
+
+
+class ThinkingToolChoiceFallbackCompletions:
+    def __init__(self) -> None:
+        self.requests: list[dict[str, object]] = []
+
+    def create(self, **kwargs: object) -> Iterator[SimpleNamespace]:
+        self.requests.append(kwargs)
+        if len(self.requests) == 1:
+            raise ThinkingToolChoiceError()
+        return iter([stream_chunk(content="forced tool recovered", finish_reason="stop")])
+
+
 def test_complete_calls_chat_completions_with_configured_model() -> None:
     completions = FakeCompletions()
     client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
@@ -271,6 +289,34 @@ def test_complete_can_require_the_only_recovery_tool() -> None:
         "type": "function",
         "function": {"name": "register_verification"},
     }
+
+
+def test_required_tool_retries_without_thinking_when_provider_rejects_combination() -> None:
+    completions = ThinkingToolChoiceFallbackCompletions()
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    events = RecordingSink()
+    config = ApiConfig(
+        api_key=SecretStr("test-key"),
+        base_url="https://example.com/v1",
+        model="test-model",
+        context_window_tokens=32768,
+        reasoning_effort="low",
+    )
+    adapter = OpenAICompatibleClient(config, client=client, event_logger=events)
+
+    result = adapter.complete(
+        messages=[{"role": "user", "content": "register checks"}],
+        tools=[{"type": "function", "function": {"name": "register_verification"}}],
+        options=ModelRequestOptions(required_tool="register_verification"),
+    )
+
+    assert result.content == "forced tool recovered"
+    assert result.provider_thinking_disabled is True
+    assert len(completions.requests) == 2
+    assert completions.requests[0]["reasoning_effort"] == "low"
+    assert "reasoning_effort" not in completions.requests[1]
+    assert completions.requests[1]["extra_body"] == {"thinking": {"type": "disabled"}}
+    assert any(name == "model_thinking_tool_choice_recovery" for name, _data in events.events)
 
 
 def test_complete_maps_adaptive_effort_to_provider_capabilities() -> None:

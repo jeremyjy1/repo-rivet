@@ -174,7 +174,7 @@ def reduce(state: AgentRuntimeState, event: DomainEvent) -> AgentRuntimeState:
         value.status = RunStatus.WAITING
         value.phase = WorkflowPhase.EXECUTING_ACTION
         value.wait = WaitState(
-            kind=WaitKind.TOOL_COMPLETION,
+            kind=WaitKind(event.payload.get("wait_kind", WaitKind.TOOL_COMPLETION)),
             correlation_id=action.action_id,
             resume_phase=WorkflowPhase.APPLYING_OBSERVATION,
         )

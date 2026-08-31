@@ -34,6 +34,11 @@ _EVENT_NAMES = {
     "plan_approved": "plan.approved",
     "context_auto_compaction": "context.auto.compaction",
     "context_manual_compaction": "context.manual.compaction",
+    "delegation_requested": "delegation.requested",
+    "subagent_started": "subagent.started",
+    "subagent_report_accepted": "subagent.report.accepted",
+    "subagent_marked_stale": "subagent.marked.stale",
+    "subagent_blocked": "subagent.blocked",
 }
 
 
