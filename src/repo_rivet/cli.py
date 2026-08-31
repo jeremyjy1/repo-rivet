@@ -1099,6 +1099,7 @@ def _build_runtime(
             event_logger=runtime_events,
             initial_workspace_revision=memory.workspace_revision,
             subagent_manager=subagent_manager,
+            semantic_index_path=store.session_dir / "index" / "semantic.sqlite",
         )
         skill_runtime = SkillRuntime(_create_skill_registry(session_manager))
         previous_skill = memory.active_skill

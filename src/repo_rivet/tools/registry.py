@@ -11,6 +11,8 @@ from repo_rivet.editing.tools import EditFileTool
 from repo_rivet.planning.runtime import PlanRuntime
 from repo_rivet.safety.command_policy import CommandPolicy
 from repo_rivet.safety.path_policy import WorkspacePathPolicy
+from repo_rivet.semantic.engine import SemanticEngine
+from repo_rivet.semantic.tools import SemanticQueryTool
 from repo_rivet.subagents.tools import DelegateTaskTool, DelegationRunner
 from repo_rivet.tools.base import BaseTool, DecisionPolicy, ToolCall, ToolResult
 from repo_rivet.tools.filesystem import (
@@ -225,6 +227,7 @@ def create_default_registry(
     event_logger: Any | None = None,
     initial_workspace_revision: int = 0,
     subagent_manager: DelegationRunner | None = None,
+    semantic_index_path: Path | None = None,
 ) -> ToolRegistry:
     """Create the local workspace tools and the side-effect-free decision meta tool."""
     path_policy = WorkspacePathPolicy(workspace)
@@ -237,6 +240,11 @@ def create_default_registry(
         event_logger=event_logger,
         initial_workspace_revision=initial_workspace_revision,
     )
+    semantic_engine = SemanticEngine(
+        path_policy,
+        editing_runtime,
+        index_path=semantic_index_path,
+    )
     tools: list[BaseTool[Any]] = [
         RecordDecisionTool(),
         RegisterVerificationTool(),
@@ -246,6 +254,7 @@ def create_default_registry(
         ListFilesTool(path_policy),
         SearchTextTool(path_policy, editing_runtime),
         ReadFileTool(path_policy, editing_runtime),
+        SemanticQueryTool(semantic_engine),
         WriteFileTool(path_policy, editing_runtime),
         DeletePathTool(path_policy, editing_runtime),
         EditFileTool(editing_runtime),

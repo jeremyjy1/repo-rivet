@@ -18,6 +18,7 @@ def test_default_registry_exposes_workspace_and_decision_tools(tmp_path: Path) -
         "list_files",
         "search_text",
         "read_file",
+        "semantic_query",
         "write_file",
         "delete_path",
         "edit_file",

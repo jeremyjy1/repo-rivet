@@ -44,6 +44,12 @@ class ActionRegistry:
             runtime.actions.get(recovery.failed_action_id or "") if recovery is not None else None
         )
         if failed_action is not None and key == failed_action.semantic_key:
+            if recovery is not None and recovery.retry_semantic_key == key:
+                return ProposalClassification(
+                    DuplicateDisposition.EXECUTE_NEW,
+                    key,
+                    failed_action,
+                )
             return ProposalClassification(
                 DuplicateDisposition.BLOCK,
                 key,

@@ -310,6 +310,12 @@ def test_overlapping_and_unseen_edits_are_rejected_without_writing(tmp_path: Pat
     )
 
     assert unseen.error_code == "unseen_range"
+    assert unseen.metadata == {
+        "path": "module.py",
+        "snapshot_id": snapshot_id,
+        "required_start_line": 2,
+        "required_end_line": 2,
+    }
     assert overlapping.error_code == "overlapping_operations"
     assert path.read_text(encoding="utf-8") == original
 

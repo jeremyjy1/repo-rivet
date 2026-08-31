@@ -27,6 +27,7 @@ PLANNING_TOOL_NAMES = frozenset(
         "list_files",
         "read_file",
         "search_text",
+        "semantic_query",
         "git_status",
         "git_diff",
         "submit_plan",

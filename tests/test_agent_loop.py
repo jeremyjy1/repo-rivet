@@ -1104,6 +1104,34 @@ def test_length_limited_reasoning_is_replayed_then_removed_from_memory() -> None
     assert all(not message.ephemeral for message in memory.messages)
 
 
+def test_completed_provider_reasoning_is_retained_only_for_live_follow_up() -> None:
+    model = FakeModelClient(
+        [
+            ModelResponse(
+                content="First task completed.",
+                reasoning_content="opaque provider continuation",
+            ),
+            ModelResponse(content="Follow-up completed."),
+        ]
+    )
+    memory = MemoryState(session_id="live-provider-prefix")
+    agent = controller(model, FakeToolRegistry([]))
+
+    first = agent.run("inspect", memory=memory)
+    second = agent.run("continue", memory=memory)
+
+    assert first.status == "success"
+    assert second.status == "success"
+    assert any(
+        message.get("reasoning_content") == "opaque provider continuation"
+        for message in model.requests[1]["messages"]
+    )
+    assert all(
+        "reasoning_content" not in message
+        for message in memory.model_dump(mode="json")["messages"]
+    )
+
+
 def test_repeated_reasoning_length_exhaustion_disables_thinking_and_restarts_from_facts() -> None:
     model = FakeModelClient(
         [
@@ -1342,7 +1370,7 @@ def test_stale_edit_snapshot_is_refreshed_without_consuming_repetition_budget() 
     )
 
     terminal = agent._record_action_result(edit, stale, state=state, memory=memory)
-    recovery_terminal = agent._recover_stale_edit_snapshot(
+    recovery_terminal = agent._recover_edit_precondition(
         edit,
         stale,
         state=state,
@@ -1364,10 +1392,108 @@ def test_stale_edit_snapshot_is_refreshed_without_consuming_repetition_budget() 
         message
         for message in reversed(state.messages)
         if message.get("role") == "system"
-        and "stale_snapshot_recovered" in str(message.get("content"))
+        and "edit_context_recovered" in str(message.get("content"))
     )
     assert fresh_snapshot in recovery["content"]
-    assert "do not repeat the stale request verbatim" in recovery["content"]
+    assert "Record a fresh matching decision" in recovery["content"]
+
+
+def test_unseen_edit_range_is_read_automatically_and_preserves_decision() -> None:
+    snapshot_id = "a" * 64
+    edit = call(
+        "edit-unseen",
+        "edit_file",
+        {
+            "path": "main.cpp",
+            "snapshot_id": snapshot_id,
+            "operations": [
+                {
+                    "op": "replace",
+                    "start_line": 145,
+                    "end_line": 191,
+                    "new_lines": ["replacement"],
+                }
+            ],
+        },
+    )
+    retry = call("edit-retry", "edit_file", edit.arguments)
+    unseen = ToolResult(
+        ok=False,
+        output="",
+        error="Target lines 145-191 were not shown; read that range first",
+        error_code="unseen_range",
+        retryable=True,
+        metadata={
+            "execution_attempted": False,
+            "path": "main.cpp",
+            "snapshot_id": snapshot_id,
+            "required_start_line": 145,
+            "required_end_line": 191,
+        },
+    )
+    refreshed = ToolResult(
+        ok=True,
+        output="[main.cpp#AAAAAAAA lines=125-381 total=381]\n145│ current line",
+        metadata={
+            "path": "main.cpp",
+            "snapshot_id": snapshot_id,
+            "snapshot_tag": "AAAAAAAA",
+            "start_line": 125,
+            "end_line": 381,
+            "fully_visible_end_line": 381,
+        },
+    )
+    edited = ToolResult(
+        ok=True,
+        output="Edited main.cpp.",
+        metadata={
+            "path": "main.cpp",
+            "new_snapshot_id": "b" * 64,
+            "workspace_revision": 1,
+        },
+    )
+    model = FakeModelClient(
+        [
+            ModelResponse(
+                tool_calls=[
+                    verification_plan(),
+                    decision("decision-edit", "edit_file"),
+                    edit,
+                ]
+            ),
+            ModelResponse(tool_calls=[retry]),
+            ModelResponse(content="The edit is complete; run the registered verification."),
+            ModelResponse(content="Edit completed and verification passed."),
+        ]
+    )
+    tools = FakeToolRegistry(
+        [
+            unseen,
+            refreshed,
+            edited,
+            passed_verification_result(revision=1),
+        ]
+    )
+    events = RecordingSink()
+
+    result = controller(model, tools, event_logger=events).run("update main.cpp")
+
+    assert result.status == "success"
+    assert [item.name for item in tools.calls[:3]] == [
+        "edit_file",
+        "read_file",
+        "edit_file",
+    ]
+    assert tools.calls[1].arguments == {
+        "path": "main.cpp",
+        "start_line": 125,
+        "end_line": 424,
+    }
+    assert not any(
+        name == "action_blocked" and data.get("error_code") == "decision_validation_failed"
+        for name, data in events.events
+    )
+    assert any(name == "edit_context_recovery_finished" for name, _ in events.events)
 
 
 def test_agent_renews_step_checkpoint_once_for_observed_progress() -> None:
@@ -1457,7 +1583,7 @@ def test_agent_replaces_truncated_whole_file_edit_with_bounded_recovery() -> Non
     assert invalid_event["argument_chars"] == 27_952
 
 
-def test_malformed_edit_enters_controller_enforced_read_then_bounded_recovery() -> None:
+def test_malformed_edit_recovery_keeps_schema_stable_and_enforces_bounded_read() -> None:
     class RecoverySchemaRegistry(FakeToolRegistry):
         def schemas(self) -> list[dict[str, object]]:
             return [
@@ -1507,20 +1633,9 @@ def test_malformed_edit_enters_controller_enforced_read_then_bounded_recovery() 
     result = agent.run("edit app.py")
 
     assert result.status == "success"
-    assert [item["function"]["name"] for item in model.requests[1]["tools"]] == ["read_file"]
+    assert model.requests[1]["tools"] == model.requests[0]["tools"]
+    assert model.requests[2]["tools"] == model.requests[0]["tools"]
     assert model.requests[1]["options"].reasoning_effort == "high"
-    recovery_schema = next(
-        item["function"]
-        for item in model.requests[2]["tools"]
-        if item["function"]["name"] == "edit_file"
-    )
-    parameters = recovery_schema["parameters"]
-    assert parameters["properties"]["operations"]["maxItems"] == 1
-    assert {
-        definition["properties"]["new_lines"]["maxItems"]
-        for definition in parameters["$defs"].values()
-        if "new_lines" in definition["properties"]
-    } == {40}
     invalid = next(data for name, data in events.events if name == "model_response_invalid")
     assert invalid["requires_read"] is True
     assert invalid["recovery_attempt"] == 1

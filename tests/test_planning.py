@@ -603,7 +603,9 @@ def test_controller_normalizes_exact_verify_command_to_registered_check(tmp_path
     assert not any(name == "action_blocked" for name, _ in events.events)
 
 
-def test_execute_plan_exposes_only_current_step_side_effect_capability(tmp_path: Path) -> None:
+def test_execute_plan_keeps_stable_capability_envelope_for_controller_validation(
+    tmp_path: Path,
+) -> None:
     memory = inspected_memory(tmp_path)
     registry = create_default_registry(tmp_path)
     registry.plan_runtime.bind(memory)
@@ -620,9 +622,9 @@ def test_execute_plan_exposes_only_current_step_side_effect_capability(tmp_path:
     assert "edit_file" in names
     assert "read_file" in names
     assert "update_plan" in names
-    assert "run_command" not in names
-    assert "run_verification" not in names
-    assert "write_file" not in names
+    assert "run_command" in names
+    assert "run_verification" in names
+    assert "write_file" in names
 
 
 def test_scope_revision_can_reread_invalidated_target_before_plan_update(tmp_path: Path) -> None:
@@ -725,13 +727,16 @@ def test_scope_revision_can_reread_invalidated_target_before_plan_update(tmp_pat
     assert "Makefile" in memory.plan_artifact.affected_files
     assert memory.plan_scope_revision_required is False
     assert "app.py" not in memory.invalidated_files
-    second_request_tools = {schema["function"]["name"] for schema in model.requests[1]["tools"]}
-    assert second_request_tools == {
+    assert model.requests[1]["tools"] == model.requests[0]["tools"]
+    assert model.requests[2]["tools"] == model.requests[0]["tools"]
+    assert model.requests[3]["tools"] == model.requests[0]["tools"]
+    allowed_recovery_tools = {
         "git_diff",
         "git_status",
         "list_files",
         "read_file",
         "search_text",
+        "semantic_query",
         "update_plan",
     }
     recovery = next(
@@ -741,7 +746,7 @@ def test_scope_revision_can_reread_invalidated_target_before_plan_update(tmp_pat
         and isinstance(message.get("content"), str)
         and '"plan_scope_revision_required":true' in message["content"]
     )
-    assert set(recovery["allowed_next_actions"]) == second_request_tools
+    assert set(recovery["allowed_next_actions"]) == allowed_recovery_tools
     retry_feedback = next(
         json.loads(message["content"])
         for message in model.requests[2]["messages"]

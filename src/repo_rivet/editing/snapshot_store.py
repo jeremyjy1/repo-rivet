@@ -70,7 +70,7 @@ class VisibilityStore:
         snapshot_id: str,
         start_line: int,
         end_line: int,
-        source: Literal["read_file", "search_text", "edit_file"],
+        source: Literal["read_file", "search_text", "edit_file", "semantic_query"],
     ) -> None:
         key = self._key(path, snapshot_id)
         values = [
@@ -105,6 +105,12 @@ class VisibilityStore:
                 "unseen_range",
                 f"Target lines {start_line}-{end_line} were not shown for snapshot "
                 f"{snapshot_id[:8].upper()}; read that range first",
+                metadata={
+                    "path": path,
+                    "snapshot_id": snapshot_id,
+                    "required_start_line": start_line,
+                    "required_end_line": end_line,
+                },
             )
 
     def has_snapshot_view(self, *, path: str, snapshot_id: str) -> bool:

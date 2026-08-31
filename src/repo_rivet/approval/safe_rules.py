@@ -2,7 +2,7 @@
 
 from repo_rivet.approval.models import ApprovalRequest, Capability
 
-_SAFE_TOOLS = frozenset({"list_files", "search_text", "git_diff", "git_status"})
+_SAFE_TOOLS = frozenset({"list_files", "search_text", "semantic_query", "git_diff", "git_status"})
 
 
 def is_obviously_safe(request: ApprovalRequest) -> bool:

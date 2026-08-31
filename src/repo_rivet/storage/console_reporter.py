@@ -47,6 +47,7 @@ _TOOL_PROGRESS_LABELS = {
     "run_command": "running command",
     "run_verification": "running verification",
     "search_text": "searching workspace text",
+    "semantic_query": "inspecting code semantics",
     "write_file": "creating file",
 }
 _MODEL_ACTIVITY_LABELS = {
@@ -142,6 +143,23 @@ class ConsoleEventReporter:
                 "RECOVER",
                 f"{tool} · {reason} · choose a distinct evidence-based action",
                 style="bold yellow",
+            )
+        elif event_type == "edit_context_recovery_started":
+            path = self._safe(data.get("path", "file"), limit=160)
+            start = self._safe(data.get("start_line", "?"), limit=10)
+            end = self._safe(data.get("end_line", "?"), limit=10)
+            self._print_trace_label(
+                "RECOVER",
+                f"{path}:{start}-{end} · reading required edit context automatically",
+                style="bold yellow",
+            )
+        elif event_type == "edit_context_recovery_finished":
+            path = self._safe(data.get("path", "file"), limit=160)
+            status = "ready" if data.get("ok") else "failed"
+            self._print_trace_label(
+                "RECOVER",
+                f"{path} · edit context {status}",
+                style="bold cyan" if data.get("ok") else "bold red",
             )
         elif event_type == "observation":
             self._observation(data)

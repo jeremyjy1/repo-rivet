@@ -21,6 +21,8 @@ from repo_rivet.memory.store import MemoryStore
 from repo_rivet.planning.policy import AutoPlanMode, AutoPlanPolicy
 from repo_rivet.reasoning.manager import ReasoningManager
 from repo_rivet.reasoning.models import ReasoningConfig
+from repo_rivet.semantic.engine import SemanticEngine
+from repo_rivet.semantic.tools import SemanticQueryTool
 from repo_rivet.storage.atomic_write import atomic_write_json
 from repo_rivet.storage.event_sink import CompositeEventSink
 from repo_rivet.subagents.models import (
@@ -352,11 +354,22 @@ class SubagentManager:
             allowed_paths=request.scope_paths,
             excluded_paths=request.excluded_paths,
         )
-        editing = EditingRuntime(policy, snapshot_dir=child_directory / "snapshots")
+        editing = EditingRuntime(
+            policy,
+            snapshot_dir=child_directory / "snapshots",
+            initial_workspace_revision=request.base_workspace_revision,
+        )
+        semantic_engine = SemanticEngine(
+            policy,
+            editing,
+            index_path=child_directory / "index" / "semantic.sqlite",
+            scan_roots=request.scope_paths,
+        )
         available: dict[str, BaseTool[Any]] = {
             "list_files": ListFilesTool(policy),
             "read_file": ReadFileTool(policy, editing),
             "search_text": SearchTextTool(policy, editing),
+            "semantic_query": SemanticQueryTool(semantic_engine),
             "git_diff": GitDiffTool(policy),
             "read_tool_output": ReadToolOutputTool(
                 self.parent_store,

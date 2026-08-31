@@ -1,6 +1,5 @@
 """Explicit single-agent model/tool/verification loop."""
 
-import copy
 import hashlib
 import json
 import time
@@ -17,6 +16,7 @@ from repo_rivet.actions.models import (
     ActionResultSnapshot,
     ActionStatus,
     DuplicateDisposition,
+    RecoveryState,
     RetryClass,
 )
 from repo_rivet.actions.registry import ActionRegistry, ProposalClassification
@@ -108,7 +108,15 @@ _MAX_VERIFICATION_PLAN_RECOVERY_ATTEMPTS = 3
 _MAX_VERIFICATION_PLAN_REVISION_ATTEMPTS = 3
 _MAX_PLAN_SCOPE_REVISION_ATTEMPTS = 3
 _PLAN_SCOPE_RECOVERY_TOOLS = frozenset(
-    {"git_diff", "git_status", "list_files", "read_file", "search_text", "update_plan"}
+    {
+        "git_diff",
+        "git_status",
+        "list_files",
+        "read_file",
+        "search_text",
+        "semantic_query",
+        "update_plan",
+    }
 )
 _RECOVERY_MAX_WRITE_CHARS = 2_000
 
@@ -533,22 +541,11 @@ class AgentController:
                 model_call_id: str | None = None
                 decision_epoch_id: str | None = None
                 try:
-                    tool_schemas = self._tool_schemas(state.workflow_mode, state=state)
-                    if state.verification_plan_revision_required or (
-                        state.verification_plan_recovery_attempts > 0
-                        and state.verification_plan is None
-                    ):
-                        tool_schemas = [
-                            schema
-                            for schema in tool_schemas
-                            if schema.get("function", {}).get("name") == "register_verification"
-                        ]
-                    elif state.plan_scope_revision_required:
-                        tool_schemas = [
-                            schema
-                            for schema in tool_schemas
-                            if schema.get("function", {}).get("name") in _PLAN_SCOPE_RECOVERY_TOOLS
-                        ]
+                    # Provider prompt caches include tool definitions. Keep the capability
+                    # envelope stable for the whole workflow and enforce transient recovery,
+                    # plan-step, and approval constraints in the Controller instead of
+                    # rebuilding a different schema list on every turn.
+                    tool_schemas = self._tool_schemas(state.workflow_mode)
                     model_call_id, decision_epoch_id = self._begin_model_call(
                         state=state,
                         memory=memory,
@@ -556,12 +553,7 @@ class AgentController:
                     response = self._complete_with_context_recovery(
                         state=state,
                         memory=memory,
-                        tool_schemas=(
-                            []
-                            if state.runtime is not None
-                            and state.runtime.phase == WorkflowPhase.FINALIZING
-                            else tool_schemas
-                        ),
+                        tool_schemas=tool_schemas,
                     )
                 except ModelStreamInterrupted:
                     self._end_model_call(
@@ -1968,6 +1960,26 @@ class AgentController:
                 state=state,
                 memory=memory,
             )
+            if call.name == "edit_file" and result.error_code in {
+                "stale_snapshot",
+                "unseen_range",
+            }:
+                recovery_result = self._recover_edit_precondition(
+                    call,
+                    result,
+                    rejected_action=action,
+                    state=state,
+                    memory=memory,
+                    preserved_decision=(
+                        decision_for_validation
+                        if result.error_code == "unseen_range"
+                        and (result.metadata or {}).get("execution_attempted") is False
+                        else None
+                    ),
+                )
+                if recovery_result is not None:
+                    return recovery_result
+                continue
             terminal_result = self._post_action_result(
                 result,
                 state=state,
@@ -1982,15 +1994,6 @@ class AgentController:
                     status="success",
                     summary=result.output,
                 )
-            if call.name == "edit_file" and result.error_code == "stale_snapshot":
-                recovery_result = self._recover_stale_edit_snapshot(
-                    call,
-                    result,
-                    state=state,
-                    memory=memory,
-                )
-                if recovery_result is not None:
-                    return recovery_result
             if verification_result is not None:
                 passed_verification_check = (
                     passed_verification_check
@@ -2520,6 +2523,7 @@ class AgentController:
         classification: ProposalClassification | None,
         state: SessionState,
         memory: MemoryState,
+        clear_recovery: bool = True,
     ) -> ActionRecord:
         runtime = state.runtime
         if runtime is None:
@@ -2534,7 +2538,7 @@ class AgentController:
             raise RuntimeError(
                 f"Cannot execute a proposal classified as {proposal.disposition.value}"
             )
-        if runtime.recovery is not None:
+        if clear_recovery and runtime.recovery is not None:
             self._dispatch_runtime_event(
                 state,
                 DomainEventKind.RECOVERY_CLEARED,
@@ -2636,6 +2640,7 @@ class AgentController:
         state: SessionState,
         memory: MemoryState,
         delivered_to_model: bool = True,
+        clear_recovery_on_success: bool = True,
     ) -> None:
         runtime = state.runtime
         if runtime is None:
@@ -2671,7 +2676,11 @@ class AgentController:
                 correlation_id=action_id,
             )
         if action_succeeded:
-            if state.runtime is not None and state.runtime.recovery is not None:
+            if (
+                clear_recovery_on_success
+                and state.runtime is not None
+                and state.runtime.recovery is not None
+            ):
                 self._dispatch_runtime_event(
                     state,
                     DomainEventKind.RECOVERY_CLEARED,
@@ -2697,12 +2706,16 @@ class AgentController:
                 correlation_id=action_id,
                 payload={"recovery": recovery.model_dump(mode="json")},
             )
-            self._log(
-                "action_recovery_started",
-                action_id=action_id,
-                tool=call.name,
-                reason_code=recovery.reason_code,
-            )
+            if not (
+                call.name == "edit_file"
+                and recovery.reason_code in {"stale_snapshot", "unseen_range"}
+            ):
+                self._log(
+                    "action_recovery_started",
+                    action_id=action_id,
+                    tool=call.name,
+                    reason_code=recovery.reason_code,
+                )
         self._save_memory(memory, state, status=self._active_memory_status(state))
 
     @staticmethod
@@ -3064,31 +3077,40 @@ class AgentController:
             return self._finish(state, memory, status="stopped", reason=reason)
         return None
 
-    def _recover_stale_edit_snapshot(
+    def _recover_edit_precondition(
         self,
-        stale_call: ToolCall,
-        stale_result: ToolResult,
+        rejected_call: ToolCall,
+        rejected_result: ToolResult,
         *,
+        rejected_action: ActionRecord | None = None,
         state: SessionState,
         memory: MemoryState,
+        preserved_decision: ReasoningEvent | None = None,
     ) -> AgentResult | None:
-        """Refresh a stale edit target without letting the rejected request loop."""
-        path = stale_call.arguments.get("path")
+        """Read the exact context needed to recover a rejected edit precondition."""
+        path = rejected_call.arguments.get("path")
         if not isinstance(path, str) or not path:
             return None
-        read_arguments = self._stale_edit_read_arguments(stale_call, stale_result)
+        reason_code = rejected_result.error_code or "edit_precondition_failed"
+        recovery_window = self._edit_recovery_read_arguments(rejected_call, rejected_result)
+        read_arguments = {
+            "path": recovery_window["path"],
+            "start_line": recovery_window["start_line"],
+            "end_line": recovery_window["end_line"],
+        }
         recovery_call = ToolCall(
-            id=f"controller-stale-read-{uuid4().hex[:12]}",
+            id=f"controller-edit-read-{uuid4().hex[:12]}",
             name="read_file",
             arguments=read_arguments,
         )
         self._log(
-            "stale_snapshot_recovery_started",
+            "edit_context_recovery_started",
             step=state.step_count,
             path=path,
             start_line=read_arguments["start_line"],
             end_line=read_arguments["end_line"],
-            source_tool_call_id=stale_call.id,
+            reason_code=reason_code,
+            source_tool_call_id=rejected_call.id,
         )
         self._log(
             "action",
@@ -3097,7 +3119,7 @@ class AgentController:
             tool=recovery_call.name,
             argument_summary=self._action_summary(recovery_call),
             requested_by="controller",
-            reason="refresh stale edit snapshot",
+            reason=f"recover edit precondition: {reason_code}",
         )
         classification = (
             self.action_registry.classify(
@@ -3114,6 +3136,7 @@ class AgentController:
             classification=classification,
             state=state,
             memory=memory,
+            clear_recovery=False,
         )
         recovery_result = self._execute_action_effect(
             recovery_call,
@@ -3136,6 +3159,7 @@ class AgentController:
             state=state,
             memory=memory,
             delivered_to_model=True,
+            clear_recovery_on_success=False,
         )
         terminal_result = self._post_action_result(
             recovery_result,
@@ -3145,25 +3169,59 @@ class AgentController:
         metadata = recovery_result.metadata or {}
         if recovery_result.ok:
             state.consecutive_failures = 0
+            required_start = recovery_window["required_start_line"]
+            required_end = recovery_window["required_end_line"]
+            visible_start = metadata.get("start_line")
+            visible_end = metadata.get("fully_visible_end_line")
+            returned_snapshot = metadata.get("snapshot_id")
+            requested_snapshot = rejected_call.arguments.get("snapshot_id")
+            exact_request_is_ready = (
+                reason_code == "unseen_range"
+                and returned_snapshot == requested_snapshot
+                and isinstance(visible_start, int)
+                and isinstance(visible_end, int)
+                and visible_start <= required_start
+                and visible_end >= required_end
+            )
+            if exact_request_is_ready and preserved_decision is not None:
+                state.pending_decision = preserved_decision
+            if exact_request_is_ready and rejected_action is not None:
+                self._dispatch_runtime_event(
+                    state,
+                    DomainEventKind.RECOVERY_ENTERED,
+                    correlation_id=rejected_action.action_id,
+                    payload={
+                        "recovery": RecoveryState(
+                            reason_code="edit_precondition_satisfied",
+                            failed_action_id=rejected_action.action_id,
+                            retry_semantic_key=rejected_action.semantic_key,
+                        ).model_dump(mode="json")
+                    },
+                )
             feedback = {
-                "event": "stale_snapshot_recovered",
+                "event": "edit_context_recovered",
+                "reason_code": reason_code,
                 "path": path,
                 "fresh_snapshot_id": metadata.get("snapshot_id"),
                 "fresh_snapshot_tag": metadata.get("snapshot_tag"),
-                "visible_start_line": metadata.get("start_line"),
-                "visible_end_line": metadata.get("fully_visible_end_line"),
+                "visible_start_line": visible_start,
+                "visible_end_line": visible_end,
                 "fresh_file_content": recovery_result.output,
                 "instruction": (
-                    "The rejected edit did not execute. Discard its old snapshot and line "
-                    "assumptions. Recompute a small coherent edit from this fresh content, "
-                    "using fresh_snapshot_id. Record a fresh matching decision with the new "
-                    "edit; do not repeat the stale request verbatim. Read another range first "
-                    "if any intended target line is not visible above."
+                    "The rejected edit did not execute, and its exact target range is now "
+                    "visible on the same snapshot. Reissue that exact edit once without "
+                    "another record_decision; the original matching decision remains one-shot."
+                    if exact_request_is_ready and preserved_decision is not None
+                    else "The rejected edit did not execute. Recompute one small coherent edit "
+                    "from this visible content using fresh_snapshot_id. Record a fresh matching "
+                    "decision with the new edit. Read another range first if every intended "
+                    "target line is not fully visible above."
                 ),
             }
         else:
             feedback = {
-                "event": "stale_snapshot_recovery_failed",
+                "event": "edit_context_recovery_failed",
+                "reason_code": reason_code,
                 "path": path,
                 "error": recovery_result.error,
                 "instruction": (
@@ -3173,9 +3231,10 @@ class AgentController:
             }
         self._append_system_feedback(state, memory, feedback)
         self._log(
-            "stale_snapshot_recovery_finished",
+            "edit_context_recovery_finished",
             step=state.step_count,
             path=path,
+            reason_code=reason_code,
             ok=recovery_result.ok,
             start_line=metadata.get("start_line"),
             end_line=metadata.get("fully_visible_end_line"),
@@ -3184,11 +3243,11 @@ class AgentController:
         return terminal_result
 
     @staticmethod
-    def _stale_edit_read_arguments(
+    def _edit_recovery_read_arguments(
         call: ToolCall,
         result: ToolResult,
     ) -> dict[str, Any]:
-        """Choose one bounded range around the earliest stale edit operation."""
+        """Choose one bounded range containing the rejected edit's required lines."""
         metadata = result.metadata or {}
         total_lines_value = metadata.get("current_total_lines")
         total_lines = total_lines_value if isinstance(total_lines_value, int) else None
@@ -3204,17 +3263,41 @@ class AgentController:
                 target_lines.append(1)
             elif operation.get("op") == "insert_end" and total_lines is not None:
                 target_lines.append(max(1, total_lines))
-        anchor = min(target_lines, default=1)
+        required_start_value = metadata.get("required_start_line")
+        required_end_value = metadata.get("required_end_line")
+        required_start = (
+            required_start_value
+            if isinstance(required_start_value, int) and required_start_value >= 1
+            else min(target_lines, default=1)
+        )
+        required_end = (
+            required_end_value
+            if isinstance(required_end_value, int) and required_end_value >= required_start
+            else max(target_lines, default=required_start)
+        )
         if total_lines is not None:
-            anchor = min(anchor, max(1, total_lines))
-        start_line = max(1, anchor - 20)
-        end_line = start_line + MAX_READ_LINES - 1
+            required_start = min(required_start, max(1, total_lines))
+            required_end = min(max(required_start, required_end), max(1, total_lines))
+        required_span = required_end - required_start + 1
+        if required_span >= MAX_READ_LINES:
+            start_line = required_start
+            end_line = required_start + MAX_READ_LINES - 1
+        else:
+            context_lines = MAX_READ_LINES - required_span
+            before = min(20, required_start - 1, context_lines // 2)
+            start_line = required_start - before
+            end_line = start_line + MAX_READ_LINES - 1
+            if end_line < required_end:
+                end_line = required_end
+                start_line = max(1, end_line - MAX_READ_LINES + 1)
         if total_lines is not None:
             end_line = min(end_line, max(1, total_lines))
         return {
             "path": call.arguments.get("path"),
             "start_line": start_line,
             "end_line": end_line,
+            "required_start_line": required_start,
+            "required_end_line": required_end,
         }
 
     def _check_termination(
@@ -3894,9 +3977,13 @@ class AgentController:
     def _tool_schemas(
         self,
         workflow_mode: WorkflowMode,
-        *,
-        state: SessionState | None = None,
     ) -> list[dict[str, Any]]:
+        """Return a stable provider capability envelope for one workflow.
+
+        Availability in the provider request is not authorization. Plan/runtime validators,
+        approval policy, and recovery state remain authoritative when a call is received.
+        Keeping this list stable preserves the expensive provider-cache prefix.
+        """
         schemas = self.tool_registry.schemas()
         if workflow_mode == WorkflowMode.PLANNING:
             schemas = [
@@ -3906,41 +3993,15 @@ class AgentController:
                 in PLANNING_TOOL_NAMES | PLANNING_AUXILIARY_TOOL_NAMES
             ]
         elif workflow_mode == WorkflowMode.EXECUTE:
-            has_plan = (
-                self.plan_runtime.memory is not None
-                and self.plan_runtime.memory.plan_artifact is not None
-            )
             schemas = [
                 schema
                 for schema in schemas
                 if schema.get("function", {}).get("name") != "submit_plan"
-                and (schema.get("function", {}).get("name") != "update_plan" or has_plan)
                 and (
                     schema.get("function", {}).get("name") != "request_plan"
-                    or (
-                        self.auto_plan_policy.model_may_request
-                        and self.plan_runtime.memory is not None
-                        and self._can_start_new_plan(self.plan_runtime.memory)
-                    )
+                    or self.auto_plan_policy.model_may_request
                 )
             ]
-            artifact = (
-                self.plan_runtime.memory.plan_artifact
-                if self.plan_runtime.memory is not None
-                else None
-            )
-            if artifact is not None and artifact.status == PlanStatus.EXECUTING:
-                allowed_side_effects = self._plan_step_side_effect_tools(artifact.current_step)
-                schemas = [
-                    schema
-                    for schema in schemas
-                    if not self.tool_registry.is_state_changing(
-                        str(schema.get("function", {}).get("name", ""))
-                    )
-                    or schema.get("function", {}).get("name") in allowed_side_effects
-                ]
-        if state is not None and state.structured_tool_recovery is not None:
-            schemas = self._structured_tool_recovery_schemas(schemas, state)
         if self.reasoning_manager.config.enabled:
             return schemas
         return [
@@ -3948,48 +4009,6 @@ class AgentController:
             for schema in schemas
             if schema.get("function", {}).get("name") != "record_decision"
         ]
-
-    @staticmethod
-    def _structured_tool_recovery_schemas(
-        schemas: list[dict[str, Any]],
-        state: SessionState,
-    ) -> list[dict[str, Any]]:
-        if state.structured_tool_recovery_requires_read:
-            return [
-                schema
-                for schema in schemas
-                if schema.get("function", {}).get("name") == "read_file"
-            ]
-
-        constrained = copy.deepcopy(schemas)
-        for schema in constrained:
-            function = schema.get("function", {})
-            if function.get("name") != state.structured_tool_recovery:
-                continue
-            parameters = function.get("parameters", {})
-            properties = parameters.get("properties", {})
-            if state.structured_tool_recovery == "edit_file":
-                function["description"] = (
-                    "RECOVERY MODE: issue exactly one snapshot-bound line operation with at "
-                    f"most {RECOVERY_MAX_NEW_LINES} new_lines entries. Split larger changes "
-                    "across later calls and use the fresh snapshot returned after each edit."
-                )
-                operations = properties.get("operations", {})
-                operations["maxItems"] = RECOVERY_MAX_EDIT_OPERATIONS
-                for definition in parameters.get("$defs", {}).values():
-                    new_lines = definition.get("properties", {}).get("new_lines")
-                    if isinstance(new_lines, dict):
-                        new_lines["maxItems"] = RECOVERY_MAX_NEW_LINES
-            elif state.structured_tool_recovery == "write_file":
-                function["description"] = (
-                    "RECOVERY MODE: create only a minimal valid file. Keep content under "
-                    f"{_RECOVERY_MAX_WRITE_CHARS} characters, then expand it with read_file "
-                    "and snapshot-bound edit_file calls."
-                )
-                content = properties.get("content")
-                if isinstance(content, dict):
-                    content["maxLength"] = _RECOVERY_MAX_WRITE_CHARS
-        return constrained
 
     @staticmethod
     def _structured_tool_recovery_error(
@@ -4695,7 +4714,10 @@ class AgentController:
         )
         memory_status = "completed" if status == "success" else status
         memory.last_agent_outcome = status
-        memory.discard_provider_state()
+        # Hidden provider continuation is excluded from persistence by Message's schema.
+        # Preserve it in the live MemoryState so a follow-up in the same process can replay
+        # the exact provider prefix; only incomplete continuation prompts are discarded.
+        memory.discard_ephemeral_messages()
         self._save_memory(memory, state, status=memory_status)
         self._log(
             "session_end",

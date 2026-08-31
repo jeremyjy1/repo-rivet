@@ -114,3 +114,4 @@ class RecoveryState(BaseModel):
 
     reason_code: str
     failed_action_id: str | None = None
+    retry_semantic_key: str | None = None

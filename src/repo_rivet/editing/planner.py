@@ -86,6 +86,12 @@ def plan_edit(
                 raise EditError(
                     "unseen_range",
                     "The file snapshot has not been shown; read it before inserting",
+                    metadata={
+                        "path": snapshot.relative_path,
+                        "snapshot_id": snapshot.snapshot_id,
+                        "required_start_line": 1,
+                        "required_end_line": max(1, snapshot.total_lines),
+                    },
                 )
             if snapshot.total_lines:
                 anchor = 1 if isinstance(operation, InsertStart) else snapshot.total_lines

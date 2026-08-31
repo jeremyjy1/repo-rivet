@@ -54,7 +54,7 @@ class VisibleRange(BaseModel):
     snapshot_id: str
     start_line: int = Field(ge=1)
     end_line: int = Field(ge=1)
-    source: Literal["read_file", "search_text", "edit_file"]
+    source: Literal["read_file", "search_text", "edit_file", "semantic_query"]
 
 
 class _NewLinesOperation(BaseModel):

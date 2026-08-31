@@ -155,6 +155,7 @@ class ApprovalFactAnalyzer:
         if request.tool_name in {
             "list_files",
             "search_text",
+            "semantic_query",
             "read_file",
             "git_diff",
             "git_status",

@@ -13,6 +13,7 @@ _PROFILE_TOOLS: dict[SubagentProfile, frozenset[str]] = {
             "list_files",
             "read_file",
             "search_text",
+            "semantic_query",
             "git_diff",
             "submit_subagent_report",
         }
@@ -21,6 +22,7 @@ _PROFILE_TOOLS: dict[SubagentProfile, frozenset[str]] = {
         {
             "read_file",
             "search_text",
+            "semantic_query",
             "read_tool_output",
             "submit_subagent_report",
         }
@@ -28,6 +30,7 @@ _PROFILE_TOOLS: dict[SubagentProfile, frozenset[str]] = {
     SubagentProfile.REVIEWER: frozenset(
         {
             "read_file",
+            "semantic_query",
             "git_diff",
             "read_verification_result",
             "submit_subagent_report",

@@ -54,7 +54,7 @@ class EditingRuntime:
         *,
         start_line: int,
         end_line: int,
-        source: Literal["read_file", "search_text", "edit_file"],
+        source: Literal["read_file", "search_text", "edit_file", "semantic_query"],
         parent_snapshot_id: str | None = None,
     ) -> tuple[TextDocument, FileSnapshot]:
         resolved = self.path_policy.resolve(path)
@@ -76,7 +76,7 @@ class EditingRuntime:
         *,
         start_line: int,
         end_line: int,
-        source: Literal["read_file", "search_text", "edit_file"],
+        source: Literal["read_file", "search_text", "edit_file", "semantic_query"],
         parent_snapshot_id: str | None = None,
         visible: bool = True,
     ) -> FileSnapshot:

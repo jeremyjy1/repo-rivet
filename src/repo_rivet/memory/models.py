@@ -476,12 +476,6 @@ class MemoryState(BaseModel):
     def discard_ephemeral_messages(self) -> None:
         self.messages[:] = [message for message in self.messages if not message.ephemeral]
 
-    def discard_provider_state(self) -> None:
-        """Drop hidden continuation data when the current agent run terminates."""
-        self.discard_ephemeral_messages()
-        for message in self.messages:
-            message.reasoning_content = None
-
     def append_tool_message(self, message: dict[str, Any], *, step: int) -> None:
         self.messages.append(Message.from_chat_message(message, step=step))
 
@@ -531,6 +525,14 @@ class MemoryState(BaseModel):
                 if isinstance(snapshot_id, str):
                     self.current_snapshots.pop(path, None)
                     self.current_snapshots[path] = snapshot_id
+
+        elif call.name == "semantic_query" and result.ok:
+            snapshot_ids = metadata.get("snapshot_ids")
+            if isinstance(snapshot_ids, dict):
+                for semantic_path, snapshot_id in snapshot_ids.items():
+                    if isinstance(semantic_path, str) and isinstance(snapshot_id, str):
+                        self.current_snapshots.pop(semantic_path, None)
+                        self.current_snapshots[semantic_path] = snapshot_id
 
         elif (
             call.name in {"write_file", "edit_file", "delete_path"}

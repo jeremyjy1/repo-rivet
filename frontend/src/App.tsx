@@ -82,6 +82,7 @@ const toolLabels: Record<string, string> = {
   run_command: "Run command",
   run_verification: "Run verification",
   search_text: "Search code",
+  semantic_query: "Inspect code semantics",
   submit_plan: "Submit plan",
   update_plan: "Update plan",
   write_file: "Write file",
@@ -92,6 +93,7 @@ const sessionRefreshEvents = new Set([
   "approval.awaiting.human",
   "approval.resolved",
   "action.recovery.started",
+  "edit.context.recovery.finished",
   "external.files.changed",
   "plan.approved",
   "plan.cancelled",
@@ -128,6 +130,8 @@ const visibleTimelineEvents = new Set([
   "context.auto.compaction",
   "context.manual.compaction",
   "duplicate.successful.command.suppressed",
+  "edit.context.recovery.finished",
+  "edit.context.recovery.started",
   "external.files.changed",
   "interrupted.history.repaired",
   "model.error",
@@ -150,7 +154,6 @@ const visibleTimelineEvents = new Set([
   "skill.activated",
   "skill.deactivated",
   "skill.load.failed",
-  "stale.snapshot.recovery.finished",
   "subagent.blocked",
   "subagent.marked.stale",
   "subagent.report.accepted",
@@ -1076,6 +1079,16 @@ function describeToolRequest(tool: string, argumentsValue: unknown): string {
     const query = textValue(args.query) || textValue(args.pattern);
     return `${query ? `“${clipped(query, 160)}”` : "Text search"} in ${path || "."}`;
   }
+  if (tool === "semantic_query") {
+    const action = humanize(textValue(args.action) || "semantic query");
+    const target = textValue(args.symbol) || textValue(args.query);
+    const line = numberValue(args.line);
+    const column = numberValue(args.column);
+    const position = line !== null
+      ? ` · ${path || "workspace"}:${line}${column !== null ? `:${column}` : ""}`
+      : path ? ` · ${path}` : "";
+    return `${action}${target ? ` · ${target}` : ""}${position}`;
+  }
   if (tool === "list_files") {
     const depth = numberValue(args.max_depth);
     return `${path || "."}${depth !== null ? ` · depth ${depth}` : ""}`;
@@ -1229,6 +1242,20 @@ function presentEvent(event: AgentEvent, pendingApprovalId: string | null): Even
         summary: `${toolLabel(textValue(payload.tool))} needs a different next action`,
         detail: humanize(textValue(payload.reason_code)),
       };
+    case "edit.context.recovery.started":
+      return {
+        title: "Refreshing edit context",
+        summary: `${textValue(payload.path) || "Workspace file"} · lines ${textValue(payload.start_line)}–${textValue(payload.end_line)}`,
+        detail: "The rejected edit changed nothing; RepoRivet is reading the required range automatically",
+      };
+    case "edit.context.recovery.finished":
+      return {
+        title: payload.ok === true ? "Edit context ready" : "Edit context refresh failed",
+        summary: textValue(payload.path) || "Workspace file",
+        detail: payload.ok === true
+          ? `Lines ${textValue(payload.start_line)}–${textValue(payload.end_line)} are available for a safe retry`
+          : "The agent must choose a different read-only recovery action",
+      };
     case "auto.plan.started":
       return { title: "Automatic planning", summary: "Entered read-only Plan Mode", detail: clipped(textValue(payload.reason)) };
     case "auto.plan.review.started":
@@ -1322,20 +1349,6 @@ function presentEvent(event: AgentEvent, pendingApprovalId: string | null): Even
         title: "Reasoning tier mapped",
         summary: `${textValue(payload.requested_effort)} requested · ${textValue(payload.applied_effort)} applied`,
         detail: clipped(textValue(payload.reason)),
-      };
-    case "stale.snapshot.recovery.started":
-      return {
-        title: "Refreshing stale edit target",
-        summary: `${textValue(payload.path) || "Workspace file"} · lines ${textValue(payload.start_line)}–${textValue(payload.end_line)}`,
-        detail: "The rejected edit did not change the file; reading its current contents automatically",
-      };
-    case "stale.snapshot.recovery.finished":
-      return {
-        title: payload.ok === true ? "Fresh snapshot ready" : "Snapshot refresh failed",
-        summary: textValue(payload.path) || "Workspace file",
-        detail: payload.ok === true
-          ? `Current lines ${textValue(payload.start_line)}–${textValue(payload.end_line)} are ready for a regenerated edit`
-          : "The agent must read the file before editing again",
       };
     case "plan.scope.revision.required":
       return {

@@ -118,7 +118,13 @@ class ActionIdentity:
                     "environment_revision": revisions.environment,
                 }
             )
-        elif tool in {"search_text", "list_files", "git_status", "git_diff"}:
+        elif tool in {
+            "search_text",
+            "semantic_query",
+            "list_files",
+            "git_status",
+            "git_diff",
+        }:
             identity.update(
                 {
                     "arguments": arguments,

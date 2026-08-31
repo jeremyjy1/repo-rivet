@@ -20,6 +20,7 @@ _PATH_KEYS: dict[str, tuple[str, ...]] = {
     "list_files": ("path",),
     "search_text": ("path",),
     "read_file": ("path",),
+    "semantic_query": ("path",),
     "write_file": ("path",),
     "edit_file": ("path",),
     "delete_path": ("path",),

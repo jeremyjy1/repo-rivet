@@ -142,6 +142,11 @@ class ReasoningManager:
     @staticmethod
     def _affected_paths(call: ToolCall, metadata: dict[str, Any]) -> list[str]:
         paths: list[str] = []
+        metadata_paths = metadata.get("paths")
+        if isinstance(metadata_paths, list):
+            for value in metadata_paths:
+                if isinstance(value, str) and value and value not in paths:
+                    paths.append(value)
         for value in (metadata.get("path"), call.arguments.get("path"), call.arguments.get("cwd")):
             if isinstance(value, str) and value and value not in paths:
                 paths.append(value)
@@ -180,6 +185,14 @@ class ReasoningManager:
             start = metadata.get("start_line", "?")
             end = metadata.get("fully_visible_end_line", metadata.get("end_line", "?"))
             return f"Read {path}:{start}-{end}."
+        if call.name == "semantic_query":
+            action = str(metadata.get("action", "query")).replace("_", " ")
+            count = metadata.get("result_count", "unknown")
+            status = metadata.get("status", "unknown")
+            confidence = metadata.get("confidence", "unknown")
+            return (
+                f"Semantic {action} returned {count} result(s): {status}, {confidence} confidence."
+            )
         if call.name == "write_file":
             path = metadata.get("path") or call.arguments.get("path", "file")
             line_count = metadata.get("line_count")
