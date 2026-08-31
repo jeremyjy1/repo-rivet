@@ -96,7 +96,7 @@ def controller(
     *,
     memory: MemoryState | None = None,
     reasoning_manager: ReasoningManager | None = None,
-):  # type: ignore[no-untyped-def]
+) -> tuple[AgentController, MemoryState]:
     state = memory or MemoryState(session_id="reasoning-test")
     agent = AgentController(
         model_client=FakeModelClient(responses),

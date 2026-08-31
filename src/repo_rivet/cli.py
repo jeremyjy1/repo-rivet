@@ -616,29 +616,33 @@ def _skill_command(arguments: argparse.Namespace, console: Console) -> int:
             console.print(f"Skill draft created and validated: {_terminal_text(str(target))}")
             return 0
         if arguments.skill_command == "validate":
-            report = validate_skill(arguments.path)
+            validation_report = validate_skill(arguments.path)
             console.print(
-                f"Skill valid: {report.skill_id}@{report.version or 'unversioned'}\n"
-                f"Path: {_terminal_text(str(report.path))}\n"
-                f"Estimated body tokens: {report.estimated_prompt_tokens}\n"
-                f"Resources: {len(report.resource_files)} references, "
-                f"{len(report.script_files)} scripts, {len(report.asset_files)} assets"
+                f"Skill valid: {validation_report.skill_id}@"
+                f"{validation_report.version or 'unversioned'}\n"
+                f"Path: {_terminal_text(str(validation_report.path))}\n"
+                f"Estimated body tokens: {validation_report.estimated_prompt_tokens}\n"
+                f"Resources: {len(validation_report.resource_files)} references, "
+                f"{len(validation_report.script_files)} scripts, "
+                f"{len(validation_report.asset_files)} assets"
             )
             return 0
         if arguments.skill_command == "convert":
-            report = convert_skill(
+            conversion_report = convert_skill(
                 arguments.source,
                 output_root=arguments.output,
                 skill_id=arguments.skill_id,
                 description=arguments.description,
             )
             details = [
-                f"Skill converted: {_terminal_text(str(report.target))}",
-                f"Detected format: {report.source_format}",
+                f"Skill converted: {_terminal_text(str(conversion_report.target))}",
+                f"Detected format: {conversion_report.source_format}",
             ]
-            if report.dropped_fields:
-                details.append("Dropped fields: " + ", ".join(report.dropped_fields))
-            details.extend(f"Warning: {_terminal_text(item)}" for item in report.warnings)
+            if conversion_report.dropped_fields:
+                details.append("Dropped fields: " + ", ".join(conversion_report.dropped_fields))
+            details.extend(
+                f"Warning: {_terminal_text(item)}" for item in conversion_report.warnings
+            )
             console.print("\n".join(details))
             return 0
         if arguments.skill_command == "install":
@@ -827,6 +831,7 @@ def _session_resume(
     manager: FileSessionStore,
     prompt_reader: PromptReader | None,
 ) -> int:
+    metadata: SessionMetadata | None
     if arguments.session_id:
         metadata = manager.read_metadata(arguments.session_id)
         workspace = arguments.workspace or Path(metadata.workspace)
@@ -839,6 +844,8 @@ def _session_resume(
                 "workspace-scoped. Run `reporivet session list`, then resume by ID, or pass "
                 "`--workspace <path>`."
             )
+    if metadata is None:
+        raise SessionError("No session was selected")
     manager.ensure_resumable(metadata)
     runtime_arguments = argparse.Namespace(
         command="chat",
@@ -1286,6 +1293,7 @@ def _print_runtime(console: Console, workspace: Path, runtime: Runtime) -> None:
         for item in runtime.skill_runtime.system
     )
     active_skill = runtime.skill_runtime.active
+    approval_engine = runtime.registry.approval_engine
     global_skill_label = (
         f"{active_skill.qualified_id}@{active_skill.version or 'unversioned'}"
         if active_skill is not None
@@ -1299,7 +1307,8 @@ def _print_runtime(console: Console, workspace: Path, runtime: Runtime) -> None:
             f"Active prompt limit: {runtime.config.token.active_prompt_limit} tokens\n"
             f"Reserved output headroom: {runtime.config.token.reserved_output_tokens} tokens\n"
             f"Token estimator: {runtime.controller.context_manager.token_manager.name}\n"
-            f"Approval mode: {runtime.registry.approval_engine.mode.value}\n"
+            f"Approval mode: "
+            f"{approval_engine.mode.value if approval_engine is not None else 'disabled'}\n"
             f"Decision trace: {runtime.controller.reasoning_manager.config.display.value}\n"
             f"Auto plan: {runtime.controller.auto_plan_policy.mode.value}\n"
             "Adaptive plan classifier: "

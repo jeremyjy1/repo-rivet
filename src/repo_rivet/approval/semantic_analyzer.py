@@ -111,8 +111,9 @@ class ApprovalFactAnalyzer:
             Path("/usr/local/bin"),
             Path("/opt/homebrew/bin"),
         ]
+        configured_paths = [Path(path) for path in configured]
         self.trusted_executable_directories = {
-            Path(path).expanduser().resolve(strict=False) for path in [*defaults, *configured]
+            path.expanduser().resolve(strict=False) for path in [*defaults, *configured_paths]
         }
 
     def bind(self, memory: MemoryState) -> None:
@@ -582,7 +583,7 @@ def _command_paths(
         return _reporivet_skill_paths(args, cwd)
     if operation in {OperationClass.STATIC_CHECK, OperationClass.TEST, OperationClass.FORMAT}:
         ignored_words = {"check", "run", "test", "pytest"}
-        inputs = []
+        check_inputs: list[str] = []
         for argument in args:
             if argument.startswith("-") or argument.lower() in ignored_words:
                 continue
@@ -593,22 +594,22 @@ def _command_paths(
                 or candidate.exists()
                 or Path(argument).suffix
             ):
-                inputs.append(str(candidate))
+                check_inputs.append(str(candidate))
         if program in _PACKAGE_MANAGERS:
-            inputs.append(str((cwd / "package.json").resolve(strict=False)))
-        return sorted(set(inputs)), []
+            check_inputs.append(str((cwd / "package.json").resolve(strict=False)))
+        return sorted(set(check_inputs)), []
     if operation == OperationClass.GENERATE:
-        inputs = [
+        generated_inputs = [
             str((cwd / argument).resolve(strict=False))
             for argument in args
             if not argument.startswith("-") and Path(argument).suffix.lower() == ".proto"
         ]
-        outputs = [
+        generated_outputs = [
             str((cwd / argument.split("=", 1)[1]).resolve(strict=False))
             for argument in args
             if argument.startswith("--") and "_out=" in argument and argument.split("=", 1)[1]
         ]
-        return sorted(set(inputs)), sorted(set(outputs))
+        return sorted(set(generated_inputs)), sorted(set(generated_outputs))
     if operation != OperationClass.BUILD:
         return [], []
     inputs: list[str] = []

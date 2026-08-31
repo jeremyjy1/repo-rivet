@@ -46,10 +46,12 @@ class VerificationRuntime:
 
     def register_plan(self, arguments: dict[str, object]) -> VerificationPlan:
         try:
-            checks = [
-                VerificationCheck.model_validate(item)
-                for item in arguments.get("checks", [])  # type: ignore[arg-type]
-            ]
+            checks_value = arguments.get("checks", [])
+            checks = (
+                [VerificationCheck.model_validate(item) for item in checks_value]
+                if isinstance(checks_value, list)
+                else []
+            )
             requirements_value = arguments.get("requirements", [])
             requirements = (
                 [str(item) for item in requirements_value]

@@ -293,7 +293,7 @@ class OpenAICompatibleClient:
         stream: Any,
         *,
         attempt: int,
-        reasoning_effort: str | None,
+        reasoning_effort: ReasoningEffort | None,
     ) -> tuple[ModelResponse, Any]:
         started_at = time.monotonic()
         last_progress_at = started_at
@@ -346,7 +346,7 @@ class OpenAICompatibleClient:
             )
             current_ceiling = self.reasoning_effort_ceiling
             bounded_effort = map_to_supported_effort(
-                _cap_reasoning_effort(reasoning_effort, current_ceiling),
+                _cap_reasoning_effort(reasoning_effort or current_ceiling, current_ceiling),
                 self._reasoning_supported_efforts,
             )
             if bounded_effort != reasoning_effort and not content_chars and not tool_argument_chars:

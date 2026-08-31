@@ -5,6 +5,7 @@ import json
 import re
 import shutil
 import stat
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar
@@ -80,7 +81,7 @@ class PreparedDeletion:
     protected_entries: tuple[str, ...]
 
 
-class WorkspaceTool(BaseTool[ToolArguments]):
+class WorkspaceTool[ArgumentsT: ToolArguments](BaseTool[ArgumentsT]):
     """Base class for tools sharing one workspace path policy."""
 
     arguments_type: ClassVar[type[ToolArguments]] = ToolArguments
@@ -89,7 +90,7 @@ class WorkspaceTool(BaseTool[ToolArguments]):
         self.path_policy = path_policy
 
 
-class ListFilesTool(WorkspaceTool):
+class ListFilesTool(WorkspaceTool[ListFilesArguments]):
     name = "list_files"
     description = "List files and directories inside the workspace to a limited depth."
     arguments_type = ListFilesArguments
@@ -140,7 +141,7 @@ class ListFilesTool(WorkspaceTool):
         return False
 
 
-class SearchTextTool(WorkspaceTool):
+class SearchTextTool(WorkspaceTool[SearchTextArguments]):
     name = "search_text"
     description = "Search text files in the workspace using a literal string or regular expression."
     arguments_type = SearchTextArguments
@@ -225,7 +226,7 @@ class SearchTextTool(WorkspaceTool):
             },
         )
 
-    def _iter_files(self, root: Path):  # type: ignore[no-untyped-def]
+    def _iter_files(self, root: Path) -> Iterator[tuple[str, Path]]:
         candidates = [root] if root.is_file() else sorted(root.rglob("*"))
         for candidate in candidates:
             try:
@@ -244,7 +245,7 @@ class SearchTextTool(WorkspaceTool):
                 yield relative.as_posix(), resolved
 
 
-class ReadFileTool(WorkspaceTool):
+class ReadFileTool(WorkspaceTool[ReadFileArguments]):
     name = "read_file"
     description = "Read up to 300 numbered lines from a UTF-8 text file in the workspace."
     arguments_type = ReadFileArguments
@@ -328,7 +329,7 @@ class ReadFileTool(WorkspaceTool):
         )
 
 
-class WriteFileTool(WorkspaceTool):
+class WriteFileTool(WorkspaceTool[WriteFileArguments]):
     name = "write_file"
     description = "Create a new UTF-8 text file. Existing files must be changed with edit_file."
     arguments_type = WriteFileArguments
@@ -386,7 +387,7 @@ class WriteFileTool(WorkspaceTool):
         )
 
 
-class DeletePathTool(WorkspaceTool):
+class DeletePathTool(WorkspaceTool[DeletePathArguments]):
     name = "delete_path"
     description = (
         "Delete one workspace file, symlink, or directory. Set recursive=true explicitly for "

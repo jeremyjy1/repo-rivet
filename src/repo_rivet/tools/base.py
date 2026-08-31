@@ -63,12 +63,12 @@ class ToolArguments(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class BaseTool[ArgumentsT: ToolArguments](ABC):
+class BaseTool[ArgumentsT: BaseModel](ABC):
     """Validate model arguments before invoking a local operation."""
 
     name: ClassVar[str]
     description: ClassVar[str]
-    arguments_type: ClassVar[type[ToolArguments]]
+    arguments_type: ClassVar[type[BaseModel]]
     capabilities: ClassVar[frozenset[Capability]] = frozenset()
     decision_policy: ClassVar[DecisionPolicy] = DecisionPolicy.MUTATION
 

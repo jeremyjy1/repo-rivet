@@ -302,6 +302,8 @@ class ContextManager:
         """Return the immutable provider-cache prefix for the current cache epoch."""
         if memory.context_checkpoint is None:
             raise ValueError("Memory has no cache-epoch checkpoint")
+        if memory.fixed is None:
+            raise ValueError("Memory has no fixed prompt state")
         return [
             {"role": "system", "content": memory.fixed.system_prompt},
             *(policy_messages or []),
@@ -350,23 +352,30 @@ class ContextManager:
     @staticmethod
     def _format_recent_trace(memory: MemoryState) -> str:
         events: list[tuple[int, str]] = []
-        for event in memory.reasoning_events[-4:]:
+        for reasoning_event in memory.reasoning_events[-4:]:
             next_action = (
-                f" next={event.next_action.tool_name}" if event.next_action is not None else ""
+                f" next={reasoning_event.next_action.tool_name}"
+                if reasoning_event.next_action is not None
+                else ""
             )
-            evidence = f" evidence={event.evidence_refs}" if event.evidence_refs else ""
+            evidence = (
+                f" evidence={reasoning_event.evidence_refs}"
+                if reasoning_event.evidence_refs
+                else ""
+            )
             events.append(
                 (
-                    event.step,
-                    f"- {event.event_id} {event.phase.value}: "
-                    f"{event.summary}{evidence}{next_action}",
+                    reasoning_event.step,
+                    f"- {reasoning_event.event_id} {reasoning_event.phase.value}: "
+                    f"{reasoning_event.summary}{evidence}{next_action}",
                 )
             )
-        for event in memory.observation_events[-4:]:
+        for observation_event in memory.observation_events[-4:]:
             events.append(
                 (
-                    event.step,
-                    f"- {event.event_id} observation: {event.result_summary} ok={event.ok}",
+                    observation_event.step,
+                    f"- {observation_event.event_id} observation: "
+                    f"{observation_event.result_summary} ok={observation_event.ok}",
                 )
             )
         events.sort(key=lambda item: item[0])

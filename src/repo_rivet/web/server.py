@@ -5,6 +5,7 @@ from __future__ import annotations
 import socket
 import threading
 import webbrowser
+from argparse import Namespace
 from pathlib import Path
 from typing import cast
 
@@ -20,7 +21,7 @@ from repo_rivet.web.app import create_app
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 
-def run_gui(arguments, console: Console) -> int:  # type: ignore[no-untyped-def]
+def run_gui(arguments: Namespace, console: Console) -> int:
     host = str(arguments.host)
     if host not in _LOOPBACK_HOSTS and not arguments.unsafe_network:
         console.print(

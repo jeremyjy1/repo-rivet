@@ -115,14 +115,14 @@ def reduce(state: AgentRuntimeState, event: DomainEvent) -> AgentRuntimeState:
     elif kind == DomainEventKind.MODEL_CALL_STARTED:
         if value.model_call is not None and value.model_call.status == ModelCallStatus.PENDING:
             raise TransitionError("A model call is already pending")
-        record = ModelCallRecord.model_validate(event.payload["model_call"])
-        value.model_call = record
+        model_record = ModelCallRecord.model_validate(event.payload["model_call"])
+        value.model_call = model_record
         value.decision_epoch = DecisionEpoch.model_validate(event.payload["decision_epoch"])
         value.status = RunStatus.WAITING
         value.wait = WaitState(
             kind=WaitKind.MODEL_RESPONSE,
-            correlation_id=record.model_call_id,
-            resume_phase=record.phase,
+            correlation_id=model_record.model_call_id,
+            resume_phase=model_record.phase,
         )
     elif kind in {DomainEventKind.MODEL_CALL_FINISHED, DomainEventKind.MODEL_CALL_FAILED}:
         if value.model_call is None or value.model_call.status != ModelCallStatus.PENDING:
@@ -137,12 +137,14 @@ def reduce(state: AgentRuntimeState, event: DomainEvent) -> AgentRuntimeState:
         value.status = RunStatus.ACTIVE
         value.wait = None
     elif kind == DomainEventKind.ACTION_PROPOSED:
-        record = ActionRecord.model_validate(event.payload["action"])
-        active = [item.action_id for item in value.actions.values() if not item.terminal]
-        if active:
-            raise TransitionError(f"Cannot propose {record.action_id}; active action: {active[0]}")
-        value.actions[record.action_id] = record
-        value.current_action_id = record.action_id
+        action_record = ActionRecord.model_validate(event.payload["action"])
+        active_action_ids = [item.action_id for item in value.actions.values() if not item.terminal]
+        if active_action_ids:
+            raise TransitionError(
+                f"Cannot propose {action_record.action_id}; active action: {active_action_ids[0]}"
+            )
+        value.actions[action_record.action_id] = action_record
+        value.current_action_id = action_record.action_id
         value.status = RunStatus.ACTIVE
         value.phase = WorkflowPhase.PREPARING_ACTION
     elif kind == DomainEventKind.ACTION_PREPARED:

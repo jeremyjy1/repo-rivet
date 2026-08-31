@@ -7,7 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol
 
-from rich.console import Console, Group
+from rich.console import Console, ConsoleRenderable, Group, RichCast
 from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.table import Table
@@ -44,6 +44,7 @@ _DISPLAY_LABELS = {
     "start_line": "Start line",
     "timeout_seconds": "Timeout",
 }
+_Renderable = ConsoleRenderable | RichCast | str
 
 
 class HumanApprover(Protocol):
@@ -133,7 +134,7 @@ class TerminalHumanApprover:
         if not reasons:
             reasons.append("• No deterministic reason was provided.")
 
-        sections: list[object] = [summary]
+        sections: list[_Renderable] = [summary]
         if request.tool_name == "edit_file":
             sections.extend(TerminalHumanApprover._edit_sections(request))
         else:
@@ -176,7 +177,7 @@ class TerminalHumanApprover:
         return Panel(Group(*sections), title=title, border_style="yellow")
 
     @staticmethod
-    def _edit_sections(request: ApprovalRequest) -> list[object]:
+    def _edit_sections(request: ApprovalRequest) -> list[_Renderable]:
         arguments = request.normalized_arguments
         details = Table.grid(padding=(0, 2))
         details.add_column(style="bold")
@@ -206,7 +207,7 @@ class TerminalHumanApprover:
         ]
 
     @staticmethod
-    def _request_sections(request: ApprovalRequest) -> list[object]:
+    def _request_sections(request: ApprovalRequest) -> list[_Renderable]:
         rows = _request_rows(request)
         if not rows:
             return []

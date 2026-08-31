@@ -423,11 +423,14 @@ class RuntimeManager:
             termination_policy=termination,
         )
         with run.input_event_lock:
-            run.event_logger = runtime.controller.event_logger
+            event_logger = runtime.controller.event_logger
+            if event_logger is None:
+                raise RuntimeError("Web runtime requires an event logger")
+            run.event_logger = event_logger
             pending_input_events = list(run.pending_input_events)
             run.pending_input_events.clear()
             for instruction, delivery in pending_input_events:
-                run.event_logger.log(
+                event_logger.log(
                     "user_input",
                     task=instruction,
                     delivery=delivery,

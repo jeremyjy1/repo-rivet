@@ -70,6 +70,8 @@ class PlanRuntime:
         ):
             raise ValueError("A plan already exists; use update_plan to revise it")
         is_update = update_reason is not None and previous is not None
+        previous_plan_id = previous.plan_id if previous is not None else None
+        previous_revision = previous.artifact_revision if previous is not None else 0
         affected_files, snapshots = self._bind_files(draft)
         artifact = PlanArtifact(
             **draft.model_dump(exclude={"steps"}),
@@ -77,8 +79,10 @@ class PlanRuntime:
                 draft,
                 previous=previous if is_update else None,
             ),
-            plan_id=previous.plan_id if is_update else f"plan-{uuid4().hex[:12]}",
-            artifact_revision=(previous.artifact_revision + 1 if is_update else 1),
+            plan_id=previous_plan_id
+            if is_update and previous_plan_id
+            else f"plan-{uuid4().hex[:12]}",
+            artifact_revision=(previous_revision + 1 if is_update else 1),
             status=PlanStatus.READY,
             affected_files=affected_files,
             workspace_revision=memory.workspace_revision,
@@ -467,6 +471,7 @@ class PlanRuntime:
             previous_step = cls._matching_previous_step(step, previous)
             if (
                 previous_step is not None
+                and previous is not None
                 and step.operation == PlanOperation.VERIFY
                 and not cls._verification_specs_match(step, draft, previous)
             ):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -144,7 +145,10 @@ def create_app(
     app.state.reporivet = context
 
     @app.middleware("http")
-    async def secure_local_requests(request: Request, call_next):  # type: ignore[no-untyped-def]
+    async def secure_local_requests(
+        request: Request,
+        call_next: Callable[[Request], Awaitable[Response]],
+    ) -> Response:
         host = request.headers.get("host", "")
         if host != context.auth.expected_host:
             return JSONResponse(status_code=400, content={"detail": "Invalid Host header"})
@@ -259,6 +263,7 @@ def create_app(
             approval_mode=None,
             skill=None,
             no_skills=False,
+            auto_plan=None,
         )
 
     @app.post("/api/v1/sessions/{session_id}/plan/inspect", dependencies=[Depends(require_write)])
@@ -270,6 +275,7 @@ def create_app(
             approval_mode=None,
             skill=None,
             no_skills=False,
+            auto_plan=None,
         )
 
     @app.post("/api/v1/sessions/{session_id}/plan/cancel", dependencies=[Depends(require_write)])

@@ -1,5 +1,6 @@
 """Serializable plan artifacts and execution progress."""
 
+from collections.abc import Sequence
 from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -90,7 +91,7 @@ class PlanDraft(BaseModel):
     constraints: list[str] = Field(default_factory=list, max_length=50)
     assumptions: list[str] = Field(default_factory=list, max_length=50)
     evidence_refs: list[str] = Field(min_length=1, max_length=100)
-    steps: list[PlanStepSpec] = Field(min_length=1, max_length=100)
+    steps: Sequence[PlanStepSpec] = Field(min_length=1, max_length=100)
     verification: list[PlanVerification] = Field(min_length=1, max_length=100)
     risks: list[str] = Field(default_factory=list, max_length=50)
 

@@ -57,8 +57,8 @@ def execution(
 
 def test_build_passes_from_registered_criteria_and_artifact(
     tmp_path: Path,
-    monkeypatch,
-) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     value = runtime(tmp_path)
     register(
         value,
@@ -103,8 +103,8 @@ def test_registered_command_match_requires_exact_argv_and_working_directory(
 
 def test_build_fails_when_exit_is_zero_but_artifact_is_missing(
     tmp_path: Path,
-    monkeypatch,
-) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     value = runtime(tmp_path)
     register(
         value,
@@ -124,8 +124,8 @@ def test_build_fails_when_exit_is_zero_but_artifact_is_missing(
 
 def test_build_fails_when_compiler_exits_nonzero(
     tmp_path: Path,
-    monkeypatch,
-) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     value = runtime(tmp_path)
     register(value, kind="build")
     monkeypatch.setattr(
@@ -141,8 +141,8 @@ def test_build_fails_when_compiler_exits_nonzero(
 
 def test_smoke_check_can_pass_from_declared_exit_criteria(
     tmp_path: Path,
-    monkeypatch,
-) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     value = runtime(tmp_path)
     register(value, kind="smoke")
     monkeypatch.setattr(
@@ -169,8 +169,8 @@ def test_registration_rejects_behavior_or_custom_check_without_oracle(
 
 def test_behavior_output_oracle_passes_and_fails_deterministically(
     tmp_path: Path,
-    monkeypatch,
-) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     value = runtime(tmp_path)
     register(
         value,

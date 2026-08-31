@@ -9,9 +9,9 @@ def response_with(
     *,
     content: str | None = None,
     reasoning_content: str | None = None,
-    tool_calls=None,
-    finish_reason="stop",
-):
+    tool_calls: list[SimpleNamespace] | None = None,
+    finish_reason: str = "stop",
+) -> SimpleNamespace:
     message = SimpleNamespace(
         content=content,
         reasoning_content=reasoning_content,
@@ -21,7 +21,12 @@ def response_with(
     return SimpleNamespace(choices=[choice])
 
 
-def function_call(*, arguments: str, name: str = "read_file", call_id: str = "call-1"):
+def function_call(
+    *,
+    arguments: str,
+    name: str = "read_file",
+    call_id: str = "call-1",
+) -> SimpleNamespace:
     function = SimpleNamespace(name=name, arguments=arguments)
     return SimpleNamespace(id=call_id, type="function", function=function)
 

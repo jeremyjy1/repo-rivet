@@ -1222,7 +1222,7 @@ def test_openai_plan_classifier_uses_isolated_workspace_metadata() -> None:
         def __init__(self) -> None:
             self.request: dict[str, object] = {}
 
-        def create(self, **kwargs):  # type: ignore[no-untyped-def]
+        def create(self, **kwargs: object) -> SimpleNamespace:
             self.request = kwargs
             message = SimpleNamespace(
                 content=('{"decision":"plan","reason":"Greenfield architecture","confidence":0.94}')

@@ -1,3 +1,4 @@
+from collections.abc import Iterator
 from types import SimpleNamespace
 
 import pytest
@@ -19,9 +20,9 @@ from repo_rivet.llm.protocol import InvalidConversationHistory
 
 class FakeCompletions:
     def __init__(self) -> None:
-        self.kwargs = None
+        self.kwargs: dict[str, object] | None = None
 
-    def create(self, **kwargs):  # type: ignore[no-untyped-def]
+    def create(self, **kwargs: object) -> Iterator[SimpleNamespace]:
         self.kwargs = kwargs
         usage = SimpleNamespace(prompt_tokens=123, completion_tokens=7)
         return iter(
@@ -33,7 +34,7 @@ class FakeCompletions:
 
 
 class FragmentedToolCompletions:
-    def create(self, **kwargs):  # type: ignore[no-untyped-def]
+    def create(self, **kwargs: object) -> Iterator[SimpleNamespace]:
         del kwargs
         first_call = SimpleNamespace(
             index=0,
@@ -60,7 +61,7 @@ class StallingThenCompletes:
     def __init__(self) -> None:
         self.requests: list[dict[str, object]] = []
 
-    def create(self, **kwargs):  # type: ignore[no-untyped-def]
+    def create(self, **kwargs: object) -> Iterator[SimpleNamespace]:
         self.requests.append(kwargs)
         if len(self.requests) == 1:
             return iter([stream_chunk(reasoning="still analyzing")])
@@ -72,12 +73,12 @@ class ReconfiguredThenCompletes:
         self.requests: list[dict[str, object]] = []
         self.on_first_chunk = lambda: None
 
-    def create(self, **kwargs):  # type: ignore[no-untyped-def]
+    def create(self, **kwargs: object) -> Iterator[SimpleNamespace]:
         self.requests.append(kwargs)
         if len(self.requests) > 1:
             return iter([stream_chunk(content="done", finish_reason="stop")])
 
-        def first_stream():  # type: ignore[no-untyped-def]
+        def first_stream() -> Iterator[SimpleNamespace]:
             self.on_first_chunk()
             yield stream_chunk(reasoning="started at the old ceiling")
 
@@ -115,7 +116,7 @@ class FailingCompletions:
         self.error = error
         self.calls = 0
 
-    def create(self, **kwargs):  # type: ignore[no-untyped-def]
+    def create(self, **kwargs: object) -> Iterator[SimpleNamespace]:
         del kwargs
         self.calls += 1
         raise self.error
@@ -145,7 +146,7 @@ class StreamOptionsFallbackCompletions:
     def __init__(self) -> None:
         self.requests: list[dict[str, object]] = []
 
-    def create(self, **kwargs):  # type: ignore[no-untyped-def]
+    def create(self, **kwargs: object) -> Iterator[SimpleNamespace]:
         self.requests.append(kwargs)
         if "stream_options" in kwargs:
             raise UnsupportedStreamOptionsError()
@@ -160,7 +161,7 @@ class InterruptedStreamCompletions:
     def __init__(self) -> None:
         self.calls = 0
 
-    def create(self, **kwargs):  # type: ignore[no-untyped-def]
+    def create(self, **kwargs: object) -> Iterator[SimpleNamespace]:
         del kwargs
         self.calls += 1
         if self.calls == 1:
@@ -168,7 +169,7 @@ class InterruptedStreamCompletions:
         return iter([stream_chunk(content="recovered", finish_reason="stop")])
 
     @staticmethod
-    def _interrupted():  # type: ignore[no-untyped-def]
+    def _interrupted() -> Iterator[SimpleNamespace]:
         yield stream_chunk(content="partial")
         raise APITimeoutError("stream stalled")
 
@@ -178,12 +179,12 @@ class RedirectedStreamCompletions:
         self.redirected = redirected
         self.calls = 0
 
-    def create(self, **kwargs):  # type: ignore[no-untyped-def]
+    def create(self, **kwargs: object) -> Iterator[SimpleNamespace]:
         del kwargs
         self.calls += 1
         return self._stream()
 
-    def _stream(self):  # type: ignore[no-untyped-def]
+    def _stream(self) -> Iterator[SimpleNamespace]:
         yield stream_chunk(content="discarded partial response")
         self.redirected["value"] = True
         yield stream_chunk(content="must not be consumed", finish_reason="stop")
@@ -193,7 +194,7 @@ class ContinuousReasoningCompletions:
     def __init__(self) -> None:
         self.requests: list[dict[str, object]] = []
 
-    def create(self, **kwargs):  # type: ignore[no-untyped-def]
+    def create(self, **kwargs: object) -> Iterator[SimpleNamespace]:
         self.requests.append(kwargs)
         return iter(
             [
@@ -216,7 +217,7 @@ class ReasoningProtocolFallbackCompletions:
     def __init__(self) -> None:
         self.requests: list[dict[str, object]] = []
 
-    def create(self, **kwargs):  # type: ignore[no-untyped-def]
+    def create(self, **kwargs: object) -> Iterator[SimpleNamespace]:
         self.requests.append(kwargs)
         if len(self.requests) == 1:
             raise ReasoningProtocolError()
@@ -323,7 +324,9 @@ def test_complete_reassembles_streamed_reasoning_and_tool_arguments() -> None:
     assert progress[-1]["tool_argument_chars"] > 0
 
 
-def test_reasoning_only_stream_downgrades_effort_and_restarts(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+def test_reasoning_only_stream_downgrades_effort_and_restarts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     completions = StallingThenCompletes()
     client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
     events = RecordingSink()

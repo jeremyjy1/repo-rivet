@@ -1,6 +1,7 @@
 """Exact-request approval and denial grants scoped to one persisted session."""
 
 from datetime import UTC, datetime
+from typing import Literal
 
 from repo_rivet.approval.models import ApprovalAction, ApprovalGrant, ApprovalRequest
 from repo_rivet.memory.models import MemoryState
@@ -43,10 +44,13 @@ class ApprovalGrantStore:
             return
         if action not in {ApprovalAction.ALLOW, ApprovalAction.DENY}:
             return
+        stored_action: Literal["allow", "deny"] = (
+            "allow" if action == ApprovalAction.ALLOW else "deny"
+        )
         grant = ApprovalGrant(
             request_fingerprint=request.fingerprint,
             session_id=request.session_id,
-            action=action.value,
+            action=stored_action,
             guidance=guidance,
         )
         self.memory.approval_session_grants[request.fingerprint] = grant.model_dump(mode="json")

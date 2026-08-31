@@ -14,6 +14,7 @@ from pydantic import (
     model_validator,
 )
 from pydantic.functional_validators import field_validator
+from pydantic_core import ErrorDetails
 
 from repo_rivet.approval.models import ApprovalMode, NonInteractivePolicy
 from repo_rivet.llm.base import REASONING_EFFORTS, ReasoningEffort
@@ -243,7 +244,7 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> AppConfig:
         raise ConfigurationError(f"Invalid configuration in {config_path}: {details}") from None
 
 
-def _format_validation_error(error: dict[str, Any]) -> str:
+def _format_validation_error(error: ErrorDetails) -> str:
     """Format a Pydantic error while deliberately omitting its input value."""
     location = ".".join(str(part) for part in error["loc"])
     return f"{location}: {error['msg']}"

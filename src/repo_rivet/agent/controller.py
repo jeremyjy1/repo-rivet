@@ -8,7 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, cast
 from uuid import uuid4
 
 from repo_rivet.actions.identity import ActionIdentity
@@ -76,6 +76,7 @@ from repo_rivet.reasoning.manager import ReasoningManager
 from repo_rivet.reasoning.models import ReasoningEvent, ReasoningPhase
 from repo_rivet.reasoning.policy import (
     AdaptiveReasoningPolicy,
+    ReasoningCallPhase,
     ReasoningContext,
     ReasoningPolicyMode,
     ReasoningPolicySettings,
@@ -237,6 +238,7 @@ class AgentController:
             auto_plan_reason=auto_plan_reason,
         )
         auto_plan_source = "controller"
+        failure: str | None = None
         if (
             auto_plan_reason is None
             and auto_plan_eligible
@@ -356,9 +358,12 @@ class AgentController:
         )
         self.verification_runtime.bind(memory)
         self.plan_runtime.bind(memory)
-        if self._runtime_needs_reconciliation(state.runtime):
+        runtime_state = state.runtime
+        if runtime_state is None:
+            raise RuntimeError("Agent runtime was not initialized")
+        if self._runtime_needs_reconciliation(runtime_state):
             active = next(
-                (item for item in state.runtime.actions.values() if not item.terminal),
+                (item for item in runtime_state.actions.values() if not item.terminal),
                 None,
             )
             recovery = (
@@ -377,9 +382,12 @@ class AgentController:
                     "recovery": recovery.model_dump(mode="json") if recovery is not None else None
                 },
             )
+            reconciled_runtime = state.runtime
+            if reconciled_runtime is None:
+                raise RuntimeError("Agent runtime disappeared during reconciliation")
             active = (
-                state.runtime.actions.get(state.runtime.current_action_id)
-                if state.runtime.current_action_id is not None
+                reconciled_runtime.actions.get(reconciled_runtime.current_action_id)
+                if reconciled_runtime.current_action_id is not None
                 else None
             )
             if active is not None and active.status == ActionStatus.OBSERVED:
@@ -570,8 +578,9 @@ class AgentController:
                     )
                     cancelled_pending_decision = False
                     if bounded_edit_recovery:
-                        recovery_tool = (
-                            "edit_file" if error.tool_name == "edit_file" else "write_file"
+                        recovery_tool = cast(
+                            Literal["edit_file", "write_file"],
+                            error.tool_name,
                         )
                         if state.structured_tool_recovery != recovery_tool:
                             state.structured_tool_recovery_failures = 0
@@ -1340,9 +1349,9 @@ class AgentController:
             for call in calls:
                 try:
                     self.plan_runtime.ensure_tool_allowed(call.name)
-                except PlanModeViolation as error:
-                    forbidden_calls.append((call, error))
-            for call, error in forbidden_calls:
+                except PlanModeViolation as plan_mode_exception:
+                    forbidden_calls.append((call, plan_mode_exception))
+            for call, plan_violation in forbidden_calls:
                 self._log(
                     "tool_call",
                     step=state.step_count,
@@ -1355,7 +1364,7 @@ class AgentController:
                     ToolResult(
                         ok=False,
                         output="",
-                        error=str(error),
+                        error=str(plan_violation),
                         error_code="plan_mode_violation",
                         retryable=True,
                     ),
@@ -1379,7 +1388,7 @@ class AgentController:
             state.verification_plan_recovery_attempts >= 1 and state.verification_plan is None
         )
         if awaiting_plan_recovery and not registration_calls:
-            error = (
+            recovery_error_message = (
                 "Verification-plan recovery requires register_verification before any other "
                 "action. The pending action is held by the Controller; do not repeat it."
             )
@@ -1394,7 +1403,7 @@ class AgentController:
                 result = ToolResult(
                     ok=False,
                     output="",
-                    error=error,
+                    error=recovery_error_message,
                     error_code="verification_plan_missing",
                     retryable=True,
                 )
@@ -1402,11 +1411,11 @@ class AgentController:
                     self._record_meta_result(call, result, state=state, memory=memory)
                 else:
                     self._record_blocked_action(call, result, state=state, memory=memory)
-            state.record_protocol_failure(error)
+            state.record_protocol_failure(recovery_error_message)
             self._log(
                 "model_response_invalid",
                 step=state.step_count,
-                error=error,
+                error=recovery_error_message,
                 recovery="required_tool",
                 required_tool="register_verification",
             )
@@ -1435,7 +1444,7 @@ class AgentController:
                 for call in missing_plan_verification_calls
                 if str(call.arguments.get("check_id", "")).strip()
             ]
-            error = (
+            missing_plan_error = (
                 "No verification plan is registered. The requested check cannot run until "
                 "register_verification defines its command and deterministic success criteria."
             )
@@ -1450,7 +1459,7 @@ class AgentController:
                 result = ToolResult(
                     ok=False,
                     output="",
-                    error=error,
+                    error=missing_plan_error,
                     error_code="verification_plan_missing",
                     retryable=True,
                 )
@@ -1498,8 +1507,8 @@ class AgentController:
                         memory=memory,
                         step=state.step_count,
                     )
-                except ValueError as error:
-                    reasoning_error = str(error)
+                except ValueError as reasoning_exception:
+                    reasoning_error = str(reasoning_exception)
 
         if len(registration_calls) > 1:
             registration_error = "Only one verification plan may be registered per model turn."
@@ -1546,8 +1555,8 @@ class AgentController:
                     state.runtime.revisions.verification_plan = (
                         memory.runtime.revisions.verification_plan
                     )
-            except ValueError as error:
-                registration_error = str(error)
+            except ValueError as registration_exception:
+                registration_error = str(registration_exception)
 
         if len(plan_calls) > 1:
             plan_error = "Only one plan submission or update is allowed per model turn."
@@ -1581,8 +1590,8 @@ class AgentController:
                     memory.plan_scope_revision_attempts = 0
                     if state.runtime is not None and memory.runtime is not None:
                         state.runtime.revisions.plan = memory.runtime.revisions.plan
-                except ValueError as error:
-                    plan_error = str(error)
+                except ValueError as plan_exception:
+                    plan_error = str(plan_exception)
 
         decision_for_validation = reasoning_event
         if reasoning_event is None and mutating_calls:
@@ -1675,8 +1684,8 @@ class AgentController:
                     mutating_calls=mutating_calls,
                     require_decision=requires_decision,
                 )
-            except DecisionValidationError as error:
-                validation_error = str(error)
+            except DecisionValidationError as decision_exception:
+                validation_error = str(decision_exception)
         if (
             validation_error is None
             and state.verification_plan is None
@@ -1764,6 +1773,9 @@ class AgentController:
 
             if call.name == "register_verification":
                 if registered_plan_id is not None and call == registration_calls[0]:
+                    registered_plan = state.verification_plan
+                    if registered_plan is None:
+                        raise RuntimeError("Registered verification plan is unavailable")
                     result = ToolResult(
                         ok=True,
                         output=f"Registered verification plan {registered_plan_id}.",
@@ -1772,7 +1784,7 @@ class AgentController:
                     self._log(
                         "verification_plan_registered",
                         plan_id=registered_plan_id,
-                        check_ids=[check.check_id for check in (state.verification_plan.checks)],
+                        check_ids=[check.check_id for check in registered_plan.checks],
                     )
                 else:
                     result = ToolResult(
@@ -1787,33 +1799,36 @@ class AgentController:
 
             if call.name in {"submit_plan", "update_plan"}:
                 if plan_artifact_id is not None and call == plan_calls[0]:
-                    artifact = memory.plan_artifact
+                    ready_artifact = memory.plan_artifact
+                    ready_artifact_revision = (
+                        ready_artifact.artifact_revision if ready_artifact is not None else 1
+                    )
                     result = ToolResult(
                         ok=True,
                         output=(
                             f"Plan {plan_artifact_id} revision "
-                            f"{artifact.artifact_revision if artifact is not None else 1} "
+                            f"{ready_artifact_revision} "
                             "is ready for user review."
                         ),
                         metadata={
                             "plan_id": plan_artifact_id,
-                            "artifact_revision": (
-                                artifact.artifact_revision if artifact is not None else 1
-                            ),
+                            "artifact_revision": ready_artifact_revision,
                         },
                     )
                     self._log(
                         "plan_ready",
                         plan_id=plan_artifact_id,
-                        artifact_revision=(
-                            artifact.artifact_revision if artifact is not None else 1
-                        ),
+                        artifact_revision=ready_artifact_revision,
                         workspace_revision=(
-                            artifact.workspace_revision if artifact is not None else None
+                            ready_artifact.workspace_revision
+                            if ready_artifact is not None
+                            else None
                         ),
                         update_reason=memory.plan_update_reason,
                         artifact=(
-                            artifact.model_dump(mode="json") if artifact is not None else None
+                            ready_artifact.model_dump(mode="json")
+                            if ready_artifact is not None
+                            else None
                         ),
                     )
                 else:
@@ -2046,9 +2061,11 @@ class AgentController:
             if successful_action:
                 self._save_memory(memory, state, status=self._active_memory_status(state))
         if plan_step_validation_error:
-            step = memory.plan_artifact.current_step if memory.plan_artifact is not None else None
-            allowed_side_effects = self._plan_step_side_effect_tools(step)
-            required_action = self._plan_step_action_contract(step)
+            violation_step = (
+                memory.plan_artifact.current_step if memory.plan_artifact is not None else None
+            )
+            allowed_side_effects = self._plan_step_side_effect_tools(violation_step)
+            required_action = self._plan_step_action_contract(violation_step)
             completed_step = self._completed_plan_step_for_call(
                 memory.plan_artifact,
                 plan_step_violation_call,
@@ -2086,7 +2103,9 @@ class AgentController:
                     "plan_scope_revision_required",
                     step=state.step_count,
                     reason=scope_reason,
-                    current_step_id=step.step_id if step is not None else None,
+                    current_step_id=(
+                        violation_step.step_id if violation_step is not None else None
+                    ),
                     rejected_tool=(
                         plan_step_violation_call.name
                         if plan_step_violation_call is not None
@@ -2128,13 +2147,13 @@ class AgentController:
                     "error": "plan_step_violation",
                     "current_step": (
                         {
-                            "step_id": step.step_id,
-                            "title": step.title,
-                            "operation": step.operation.value,
-                            "target_files": step.target_files,
-                            "verification_ids": step.verification_ids,
+                            "step_id": violation_step.step_id,
+                            "title": violation_step.title,
+                            "operation": violation_step.operation.value,
+                            "target_files": violation_step.target_files,
+                            "verification_ids": violation_step.verification_ids,
                         }
-                        if step is not None
+                        if violation_step is not None
                         else None
                     ),
                     "allowed_side_effect_tools": sorted(allowed_side_effects),
@@ -2166,7 +2185,9 @@ class AgentController:
             )
             self._save_memory(memory, state, status=self._active_memory_status(state))
         elif multiple_mutating_actions:
-            step = memory.plan_artifact.current_step if memory.plan_artifact is not None else None
+            cardinality_step = (
+                memory.plan_artifact.current_step if memory.plan_artifact is not None else None
+            )
             self._append_system_feedback(
                 state,
                 memory,
@@ -2182,16 +2203,16 @@ class AgentController:
                     ],
                     "current_step": (
                         {
-                            "step_id": step.step_id,
-                            "title": step.title,
-                            "operation": step.operation.value,
-                            "target_files": step.target_files,
-                            "verification_ids": step.verification_ids,
+                            "step_id": cardinality_step.step_id,
+                            "title": cardinality_step.title,
+                            "operation": cardinality_step.operation.value,
+                            "target_files": cardinality_step.target_files,
+                            "verification_ids": cardinality_step.verification_ids,
                         }
-                        if step is not None
+                        if cardinality_step is not None
                         else None
                     ),
-                    "required_next_action": self._plan_step_action_contract(step),
+                    "required_next_action": self._plan_step_action_contract(cardinality_step),
                     "instruction": (
                         "None of the state-changing calls in the rejected response executed. "
                         "Retry with exactly one state-changing tool call matching "
@@ -4370,7 +4391,7 @@ class AgentController:
         memory = self.plan_runtime.memory
         artifact = memory.plan_artifact if memory is not None else None
         active_plan = artifact is not None and artifact.status == PlanStatus.EXECUTING
-        current_step = artifact.current_step if active_plan else None
+        current_step = artifact.current_step if active_plan and artifact is not None else None
         failed_checks = sum(
             result.workspace_revision == state.workspace_revision
             and result.status in {VerificationStatus.FAILED, VerificationStatus.ERROR}
@@ -4383,6 +4404,7 @@ class AgentController:
             or state.structured_tool_recovery is not None
             or failed_checks > 0
         )
+        phase: ReasoningCallPhase
         if state.runtime is not None and state.runtime.phase == WorkflowPhase.FINALIZING:
             phase = "finalizing"
         elif state.workflow_mode == WorkflowMode.PLANNING:

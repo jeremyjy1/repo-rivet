@@ -23,8 +23,10 @@ build-backend = "uv_build"
 [dependency-groups]
 dev = [
     "httpx>=0.28",
+    "mypy>=1.18",
     "pytest",
     "ruff",
+    "types-pyyaml>=6.0.12",
 ]
 
 [tool.pytest.ini_options]
@@ -37,7 +39,16 @@ src = ["src", "tests"]
 target-version = "py312"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "SIM"]
+select = ["E", "F", "I", "UP", "B", "SIM", "ANN"]
+ignore = ["ANN401"]
 
 [tool.ruff.format]
 quote-style = "double"
+
+[tool.mypy]
+python_version = "3.12"
+files = ["src"]
+plugins = ["pydantic.mypy"]
+check_untyped_defs = true
+disallow_untyped_defs = true
+show_error_codes = true
