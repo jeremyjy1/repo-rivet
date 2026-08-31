@@ -68,6 +68,9 @@ change may include register_verification, record_decision, and the matching acti
 provider emits a
 decision alone, it authorizes only the matching state-changing tool in the immediately following
 model response and is consumed once. At most one state-changing tool may be requested per turn.
+A response may instead contain a bounded batch of up to 8 independent workspace inspection tool
+calls such as reads, searches, semantic queries, or Git inspection. Do not mix any other primary
+action with that batch.
 If an observation differs from expectations, record a reflection before the next side effect.
 If an approval denial includes User direction, treat it as explicit task guidance: reflect,
 change the proposed approach, and request fresh approval when a different action is needed.

@@ -107,6 +107,20 @@ from repo_rivet.verification.runtime import VerificationRuntime
 _MAX_VERIFICATION_PLAN_RECOVERY_ATTEMPTS = 3
 _MAX_VERIFICATION_PLAN_REVISION_ATTEMPTS = 3
 _MAX_PLAN_SCOPE_REVISION_ATTEMPTS = 3
+_MAX_READ_ONLY_ACTIONS_PER_TURN = 8
+_MAX_PLAN_TEXT_RECOVERY_ATTEMPTS = 2
+_BATCHABLE_READ_ONLY_TOOLS = frozenset(
+    {
+        "git_diff",
+        "git_status",
+        "list_files",
+        "read_file",
+        "read_tool_output",
+        "read_verification_result",
+        "search_text",
+        "semantic_query",
+    }
+)
 _PLAN_SCOPE_RECOVERY_TOOLS = frozenset(
     {
         "git_diff",
@@ -370,6 +384,10 @@ class AgentController:
             plan_scope_revision_required=memory.plan_scope_revision_required,
             plan_scope_revision_reason=memory.plan_scope_revision_reason,
             plan_scope_revision_attempts=memory.plan_scope_revision_attempts,
+            plan_text_recovery_attempts=memory.plan_text_recovery_attempts,
+            last_plan_text_signature=memory.last_plan_text_signature,
+            required_plan_tool=memory.required_plan_tool,
+            required_protocol_tool=memory.required_protocol_tool,
             candidate_final_assessment=memory.candidate_final_assessment,
             provider_reasoning_detected=memory.provider_requires_reasoning_content,
             sanitize_unreplayable_provider_history=(
@@ -607,6 +625,8 @@ class AgentController:
                             and pending_action.tool_name == error.tool_name
                         ):
                             state.pending_decision = None
+                            if state.required_protocol_tool == error.tool_name:
+                                state.required_protocol_tool = None
                             memory.verification_plan_recovery_decision = None
                             cancelled_pending_decision = True
                         memory.working.pending_actions.clear()
@@ -916,25 +936,59 @@ class AgentController:
                         return terminal_result
                     continue
 
+                if state.required_protocol_tool is not None:
+                    required_tool = state.required_protocol_tool
+                    state.record_model_error(
+                        f"protocol recovery requires {required_tool}",
+                        recovery_instruction=(
+                            f"Call {required_tool} exactly as required; do not return prose."
+                        ),
+                    )
+                    memory.messages.append(
+                        Message.from_chat_message(
+                            state.messages[-1],
+                            step=state.tool_call_count,
+                        )
+                    )
+                    self._log(
+                        "model_response_invalid",
+                        step=state.step_count,
+                        error=f"required tool {required_tool} was not called",
+                        recovery="required_tool",
+                        required_tool=required_tool,
+                    )
+                    self._save_memory(
+                        memory,
+                        state,
+                        status=self._active_memory_status(state),
+                    )
+                    continue
+
                 if state.pending_decision is not None:
                     state.pending_decision = None
                     memory.working.pending_actions.clear()
                     memory.verification_plan_recovery_decision = None
                 if response.content and response.content.strip():
                     if state.workflow_mode == WorkflowMode.PLANNING:
-                        self._append_system_feedback(
-                            state,
-                            memory,
-                            {
-                                "error": "plan_artifact_required",
-                                "instruction": (
-                                    "Planning is not complete until submit_plan or update_plan "
-                                    "produces a locally validated Plan Artifact. Continue "
-                                    "inspection or submit the structured plan now."
-                                ),
-                            },
+                        terminal_result = self._recover_plan_text_response(
+                            response.content,
+                            state=state,
+                            memory=memory,
                         )
-                        self._save_memory(memory, state, status=self._active_memory_status(state))
+                        if terminal_result is not None:
+                            return terminal_result
+                        continue
+                    if (
+                        state.verification_plan_revision_required
+                        or state.plan_scope_revision_required
+                    ):
+                        terminal_result = self._handle_final_response(
+                            response.content.strip(),
+                            state=state,
+                            memory=memory,
+                        )
+                        if terminal_result is not None:
+                            return terminal_result
                         continue
                     if (
                         memory.plan_artifact is not None
@@ -1034,6 +1088,7 @@ class AgentController:
             state.runtime.revisions.knowledge += 1
         state.task = normalized[-1]
         state.pending_decision = None
+        state.required_protocol_tool = None
         state.verification_plan_recovery_attempts = 0
         memory.verification_plan_recovery_attempts = 0
         memory.verification_plan_recovery_decision = None
@@ -1044,6 +1099,7 @@ class AgentController:
         state.structured_tool_recovery = None
         state.structured_tool_recovery_failures = 0
         state.structured_tool_recovery_requires_read = False
+        self._reset_plan_text_recovery(state)
         state.renew_step_checkpoint(self.termination_policy.config.max_steps)
         state.started_at = time.monotonic()
         if state.workflow_mode == WorkflowMode.PLANNING:
@@ -1129,10 +1185,12 @@ class AgentController:
         state.workflow_mode = WorkflowMode.PLANNING
         self._change_runtime_phase(state, WorkflowPhase.PLANNING)
         state.pending_decision = None
+        state.required_protocol_tool = None
         state.verification_plan_recovery_attempts = 0
         memory.verification_plan_recovery_attempts = 0
         memory.working.pending_actions.clear()
         memory.verification_plan_recovery_decision = None
+        self._reset_plan_text_recovery(state)
 
     def _append_planning_feedback(
         self,
@@ -1179,6 +1237,103 @@ class AgentController:
                 ),
             },
         )
+
+    @staticmethod
+    def _planning_submission_tool(
+        memory: MemoryState,
+    ) -> Literal["submit_plan", "update_plan"]:
+        existing_plan = memory.plan_artifact
+        if existing_plan is not None and existing_plan.status not in {
+            PlanStatus.CANCELLED,
+            PlanStatus.COMPLETED,
+        }:
+            return "update_plan"
+        return "submit_plan"
+
+    @staticmethod
+    def _reset_plan_text_recovery(state: SessionState) -> None:
+        state.plan_text_recovery_attempts = 0
+        state.last_plan_text_signature = None
+        state.required_plan_tool = None
+
+    @staticmethod
+    def _discard_latest_repeated_plan_text(
+        content: str,
+        *,
+        state: SessionState,
+        memory: MemoryState,
+    ) -> None:
+        if (
+            state.messages
+            and state.messages[-1].get("role") == "assistant"
+            and state.messages[-1].get("content") == content
+        ):
+            state.messages.pop()
+        if (
+            memory.messages
+            and memory.messages[-1].role == "assistant"
+            and memory.messages[-1].content == content
+        ):
+            memory.messages.pop()
+
+    def _recover_plan_text_response(
+        self,
+        content: str,
+        *,
+        state: SessionState,
+        memory: MemoryState,
+    ) -> AgentResult | None:
+        """Bound tool-free Plan Mode responses instead of replaying them indefinitely."""
+        normalized = " ".join(content.split())
+        signature = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+        repeated = signature == state.last_plan_text_signature
+        if repeated:
+            self._discard_latest_repeated_plan_text(content, state=state, memory=memory)
+
+        state.plan_text_recovery_attempts += 1
+        state.last_plan_text_signature = signature
+        state.required_plan_tool = self._planning_submission_tool(memory)
+        error = (
+            "Plan Mode requires a validated Plan Artifact; a tool-free response cannot "
+            "complete planning."
+        )
+        state.record_protocol_failure(error)
+        self._log(
+            "plan_text_response_rejected",
+            step=state.step_count,
+            attempt=state.plan_text_recovery_attempts,
+            repeated=repeated,
+            required_tool=state.required_plan_tool,
+            content_length=len(content),
+        )
+        if state.plan_text_recovery_attempts >= _MAX_PLAN_TEXT_RECOVERY_ATTEMPTS:
+            return self._finish(
+                state,
+                memory,
+                status="stopped",
+                reason=(
+                    "Plan Mode received tool-free responses instead of a structured "
+                    f"{state.required_plan_tool} call after "
+                    f"{_MAX_PLAN_TEXT_RECOVERY_ATTEMPTS} attempts"
+                ),
+            )
+
+        self._append_system_feedback(
+            state,
+            memory,
+            {
+                "error": "plan_artifact_required",
+                "attempt": state.plan_text_recovery_attempts,
+                "required_tool": state.required_plan_tool,
+                "instruction": (
+                    "The prose response did not complete planning. The next response must "
+                    f"call {state.required_plan_tool} with the complete structured plan; "
+                    "do not repeat the prose report."
+                ),
+            },
+        )
+        self._save_memory(memory, state, status=self._active_memory_status(state))
+        return None
 
     def _handle_request_plan(
         self,
@@ -1306,6 +1461,11 @@ class AgentController:
         plan_scope_recovery_turn = bool(calls) and all(
             call.name in _PLAN_SCOPE_RECOVERY_TOOLS for call in calls
         )
+        plan_scope_inspection_turn = (
+            state.plan_scope_revision_required
+            and plan_scope_recovery_turn
+            and all(call.name != "update_plan" for call in calls)
+        )
         if state.plan_scope_revision_required and not plan_scope_recovery_turn:
             reason = state.plan_scope_revision_reason or "the action exceeds the approved plan"
             error = (
@@ -1338,7 +1498,14 @@ class AgentController:
                     self._record_meta_result(call, result, state=state, memory=memory)
                 else:
                     self._record_blocked_action(call, result, state=state, memory=memory)
-            return self._retry_plan_scope_revision(state=state, memory=memory)
+            # An unrelated action is not a failed plan revision. Do not burn the bounded
+            # update_plan validation budget; constrain the next provider response instead.
+            self._require_plan_scope_update_after_protocol_violation(
+                error,
+                state=state,
+                memory=memory,
+            )
+            return None
 
         calls = [self._normalize_registered_plan_action(call, state=state) for call in calls]
 
@@ -1505,6 +1672,10 @@ class AgentController:
         passed_verification_check = False
         inconclusive_verification: VerificationResult | None = None
         successful_action = False
+        read_only_batch = len(action_calls) > 1 and all(
+            call.name in _BATCHABLE_READ_ONLY_TOOLS for call in action_calls
+        )
+        deferred_read_only_result: ToolResult | None = None
 
         if len(reasoning_calls) > 1:
             reasoning_error = "Only one record_decision call is allowed per model turn."
@@ -1604,6 +1775,11 @@ class AgentController:
                 except ValueError as plan_exception:
                     plan_error = str(plan_exception)
 
+        if state.required_protocol_tool == "update_plan" and len(plan_calls) == 1:
+            # The forced meta action reached local validation. A rejected replacement may
+            # need fresh read-only evidence before another update attempt.
+            state.required_protocol_tool = None
+
         decision_for_validation = reasoning_event
         if reasoning_event is None and mutating_calls:
             decision_for_validation = pending_decision
@@ -1633,11 +1809,29 @@ class AgentController:
                 "At most one state-changing tool may run in a model turn; split the "
                 "operations and execute only the current plan step."
             )
-        if validation_error is None and len(action_calls) > 1:
+        if validation_error is None and len(action_calls) > 1 and mutating_calls:
             multiple_primary_actions = True
             validation_error = (
-                "A model turn may contain at most one primary action. Return one tool action; "
-                "record_decision and register_verification may accompany it as metadata."
+                "A state-changing tool cannot be mixed with other primary actions in one "
+                "model turn. Return the single state-changing action; record_decision and "
+                "register_verification may accompany it as metadata."
+            )
+        if (
+            validation_error is None
+            and len(action_calls) > 1
+            and any(call.name not in _BATCHABLE_READ_ONLY_TOOLS for call in action_calls)
+        ):
+            multiple_primary_actions = True
+            validation_error = (
+                "Only independent workspace inspection tools may be batched in one model "
+                "turn; return this primary action by itself."
+            )
+        if validation_error is None and len(action_calls) > _MAX_READ_ONLY_ACTIONS_PER_TURN:
+            multiple_primary_actions = True
+            validation_error = (
+                "A read-only model turn may contain at most "
+                f"{_MAX_READ_ONLY_ACTIONS_PER_TURN} primary actions; split this inspection "
+                "into smaller batches."
             )
         if validation_error is None and state.structured_tool_recovery is not None:
             for call in action_calls:
@@ -1721,6 +1915,14 @@ class AgentController:
             state.pending_decision = decision_for_validation
             memory.verification_plan_recovery_decision = decision_for_validation
 
+        if multiple_mutating_actions or (multiple_primary_actions and mutating_calls):
+            self._arm_action_protocol_recovery(
+                mutating_calls,
+                reasoning_event=reasoning_event,
+                state=state,
+                memory=memory,
+            )
+
         if reasoning_event is not None:
             event_type = (
                 "assessment"
@@ -1740,8 +1942,18 @@ class AgentController:
                 memory.candidate_final_assessment = assessment
             self._save_memory(memory, state, status=self._active_memory_status(state))
 
+        if (
+            state.required_protocol_tool == "record_decision"
+            and reasoning_event is not None
+            and reasoning_event.phase == ReasoningPhase.DECISION
+            and reasoning_event.next_action is not None
+        ):
+            # A reflection may be required first after an execution failure, but recovery is
+            # complete only after a concrete decision selects one next action.
+            state.required_protocol_tool = None
+
         reasoning_call_id = reasoning_calls[0].id if len(reasoning_calls) == 1 else None
-        for call in calls:
+        for call_index, call in enumerate(calls):
             self._log(
                 "tool_call",
                 step=state.step_count,
@@ -1854,17 +2066,23 @@ class AgentController:
                 continue
 
             if validation_error is not None:
+                cardinality_rejection = multiple_primary_actions or multiple_mutating_actions
                 result = ToolResult(
                     ok=False,
                     output="",
-                    error=validation_error,
+                    error=(
+                        f"The model turn was rejected as one batch ({len(action_calls)} "
+                        "actions); no action was executed."
+                        if cardinality_rejection
+                        else validation_error
+                    ),
                     error_code=(
                         "plan_step_violation"
                         if plan_step_validation_error
                         else "structured_tool_recovery_violation"
                         if structured_tool_recovery_violation
                         else "action_cardinality_violation"
-                        if multiple_primary_actions
+                        if cardinality_rejection
                         else "verification_retry_without_change"
                         if unchanged_verification_retry is not None
                         else "verification_plan_missing"
@@ -1872,14 +2090,33 @@ class AgentController:
                         else "decision_validation_failed"
                     ),
                     retryable=True,
+                    metadata=(
+                        {"rejected_action_count": len(action_calls)}
+                        if cardinality_rejection
+                        else None
+                    ),
                 )
                 self._record_blocked_action(call, result, state=state, memory=memory)
                 continue
 
-            if proposal_classification is not None:
+            if state.required_protocol_tool == call.name:
+                # The constrained action reached normal validation and consumes its one-shot
+                # provider constraint. Ordinary tool errors select their own recovery path.
+                state.required_protocol_tool = None
+
+            runtime = state.runtime
+            if runtime is None:
+                raise RuntimeError("The runtime must exist before classifying an action")
+            call_classification = proposal_classification or self.action_registry.classify(
+                call,
+                runtime=runtime,
+                context=memory,
+                plan_step_id=self._current_plan_step_id(memory),
+            )
+            if call_classification is not None:
                 handled, terminal_result = self._handle_action_disposition(
                     call,
-                    proposal_classification,
+                    call_classification,
                     state=state,
                     memory=memory,
                 )
@@ -1932,7 +2169,7 @@ class AgentController:
                     self._log_plan_step("plan_step_started", memory, plan_step)
             action = self._propose_action(
                 call,
-                classification=proposal_classification,
+                classification=call_classification,
                 state=state,
                 memory=memory,
             )
@@ -1980,13 +2217,23 @@ class AgentController:
                 if recovery_result is not None:
                     return recovery_result
                 continue
-            terminal_result = self._post_action_result(
-                result,
-                state=state,
-                memory=memory,
-            )
-            if terminal_result is not None:
-                return terminal_result
+            if read_only_batch:
+                deferred_read_only_result = result
+                if result.metadata and result.metadata.get("approval_abort"):
+                    self._record_cancelled_batch_calls(
+                        calls[call_index + 1 :],
+                        state=state,
+                        memory=memory,
+                    )
+                    return self._post_action_result(result, state=state, memory=memory)
+            else:
+                terminal_result = self._post_action_result(
+                    result,
+                    state=state,
+                    memory=memory,
+                )
+                if terminal_result is not None:
+                    return terminal_result
             if call.name in self.terminal_tool_names and result.ok:
                 return self._finish(
                     state,
@@ -2002,6 +2249,15 @@ class AgentController:
                 )
                 if verification_result.status == VerificationStatus.INCONCLUSIVE:
                     inconclusive_verification = verification_result
+
+        if deferred_read_only_result is not None:
+            terminal_result = self._post_action_result(
+                deferred_read_only_result,
+                state=state,
+                memory=memory,
+            )
+            if terminal_result is not None:
+                return terminal_result
 
         if verification_plan_missing_for_file_change:
             return self._request_verification_plan_recovery(
@@ -2046,6 +2302,7 @@ class AgentController:
                 and reasoning_event.next_action is not None
             ):
                 state.pending_decision = reasoning_event
+                state.required_protocol_tool = reasoning_event.next_action.tool_name
                 if state.verification_plan is None and self.tool_registry.modifies_workspace_files(
                     reasoning_event.next_action.tool_name
                 ):
@@ -2088,7 +2345,23 @@ class AgentController:
         elif action_calls:
             state.reasoning_only_turns = 0
             if successful_action:
+                self._reset_plan_text_recovery(state)
                 self._save_memory(memory, state, status=self._active_memory_status(state))
+        if plan_scope_inspection_turn and successful_action and validation_error is None:
+            state.required_protocol_tool = "update_plan"
+            self._append_system_feedback(
+                state,
+                memory,
+                {
+                    "event": "plan_scope_inspection_complete",
+                    "required_next_action": "update_plan",
+                    "instruction": (
+                        "The bounded read-only inspection turn is complete. The next response "
+                        "must call update_plan only with the complete replacement plan."
+                    ),
+                },
+            )
+            self._save_memory(memory, state, status=self._active_memory_status(state))
         if plan_step_validation_error:
             violation_step = (
                 memory.plan_artifact.current_step if memory.plan_artifact is not None else None
@@ -2242,11 +2515,35 @@ class AgentController:
                         else None
                     ),
                     "required_next_action": self._plan_step_action_contract(cardinality_step),
+                    "forced_recovery_tool": state.required_protocol_tool,
                     "instruction": (
                         "None of the state-changing calls in the rejected response executed. "
-                        "Retry with exactly one state-changing tool call matching "
-                        "required_next_action. Do not batch later plan steps into the same "
-                        "model response."
+                        + (
+                            "Record one decision for the single next action now; the Controller "
+                            "will constrain the following response to that action."
+                            if state.required_protocol_tool == "record_decision"
+                            else "Retry exactly the Controller-constrained action."
+                        )
+                        + " Do not batch later plan steps into the same model response."
+                    ),
+                },
+            )
+            self._save_memory(memory, state, status=self._active_memory_status(state))
+        elif multiple_primary_actions:
+            self._append_system_feedback(
+                state,
+                memory,
+                {
+                    "error": "action_cardinality_violation",
+                    "rejected_tools": [call.name for call in action_calls],
+                    "read_only_batch_limit": _MAX_READ_ONLY_ACTIONS_PER_TURN,
+                    "batchable_inspection_tools": sorted(_BATCHABLE_READ_ONLY_TOOLS),
+                    "forced_recovery_tool": state.required_protocol_tool,
+                    "instruction": (
+                        "None of the rejected calls executed. Return either one "
+                        "primary action or a batch of at most "
+                        f"{_MAX_READ_ONLY_ACTIONS_PER_TURN} independent workspace inspection "
+                        "actions. Never mix another primary action into an inspection batch."
                     ),
                 },
             )
@@ -2295,6 +2592,7 @@ class AgentController:
                 trigger="the supplied verification plan was invalid",
             )
         if plan_artifact_id is not None:
+            self._reset_plan_text_recovery(state)
             state.workflow_mode = WorkflowMode.EXECUTE
             self._change_runtime_phase(state, WorkflowPhase.PLAN_REVIEW)
             return self._finish(
@@ -2340,6 +2638,7 @@ class AgentController:
             )
             if ready_to_finish:
                 state.pending_decision = None
+                state.required_protocol_tool = None
                 memory.working.pending_actions.clear()
                 memory.verification_plan_recovery_decision = None
             self._save_memory(memory, state, status=self._active_memory_status(state))
@@ -2414,6 +2713,7 @@ class AgentController:
         memory.append_tool_message(message, step=state.tool_call_count)
         self._log(
             "tool_result",
+            step=state.step_count,
             tool_call_id=call.id,
             name=call.name,
             ok=result.ok,
@@ -2445,6 +2745,7 @@ class AgentController:
         )
         self._log(
             "tool_result",
+            step=state.step_count,
             tool_call_id=call.id,
             name=call.name,
             ok=False,
@@ -2455,6 +2756,36 @@ class AgentController:
             executed=False,
         )
         self._save_memory(memory, state, status=self._active_memory_status(state))
+
+    def _record_cancelled_batch_calls(
+        self,
+        calls: list[ToolCall],
+        *,
+        state: SessionState,
+        memory: MemoryState,
+    ) -> None:
+        """Pair calls that were not dispatched after an earlier batch action aborted the run."""
+        for call in calls:
+            self._log(
+                "tool_call",
+                step=state.step_count,
+                tool_call_id=call.id,
+                name=call.name,
+                arguments=call.arguments,
+            )
+            self._record_blocked_action(
+                call,
+                ToolResult(
+                    ok=False,
+                    output="",
+                    error="An earlier action stopped this read-only batch.",
+                    error_code="batch_cancelled",
+                    retryable=True,
+                    metadata={"execution_attempted": False},
+                ),
+                state=state,
+                memory=memory,
+            )
 
     @staticmethod
     def _current_plan_step_id(memory: MemoryState) -> str | None:
@@ -3400,11 +3731,13 @@ class AgentController:
                 summary=summary,
             )
         if state.plan_scope_revision_required:
-            return self._retry_plan_scope_revision(
+            self._require_plan_scope_update_after_protocol_violation(
+                "Plan scope revision requires update_plan; a text response cannot revise the "
+                "approved Plan Artifact.",
                 state=state,
                 memory=memory,
-                summary=summary,
             )
+            return None
 
         assessment_summary = _bounded_assessment_summary(summary)
         existing_assessment = state.candidate_final_assessment
@@ -3532,6 +3865,7 @@ class AgentController:
         """Request a bounded plan-only correction without stopping on the first mistake."""
         if state.verification_plan_recovery_attempts >= (_MAX_VERIFICATION_PLAN_RECOVERY_ATTEMPTS):
             state.pending_decision = None
+            state.required_protocol_tool = None
             memory.verification_plan_recovery_decision = None
             fallback_summary = (
                 state.candidate_final_assessment.summary
@@ -3885,6 +4219,7 @@ class AgentController:
         memory.verification_plan_revision_reason = state.verification_plan_revision_reason
         memory.verification_plan_revision_guidance = state.verification_plan_revision_guidance
         state.pending_decision = None
+        state.required_protocol_tool = None
         memory.working.pending_actions.clear()
         memory.verification_plan_recovery_decision = None
         self._change_runtime_phase(state, WorkflowPhase.RECOVERING)
@@ -3942,6 +4277,29 @@ class AgentController:
                 ),
                 summary=summary,
             )
+        self._append_plan_scope_revision_feedback(state, memory)
+        self._save_memory(memory, state, status=self._active_memory_status(state))
+        return None
+
+    def _require_plan_scope_update_after_protocol_violation(
+        self,
+        error: str,
+        *,
+        state: SessionState,
+        memory: MemoryState,
+    ) -> None:
+        """Constrain recovery without charging an update_plan validation attempt."""
+        state.record_protocol_failure(error)
+        state.required_protocol_tool = "update_plan"
+        self._append_plan_scope_revision_feedback(state, memory)
+        self._save_memory(memory, state, status=self._active_memory_status(state))
+
+    def _append_plan_scope_revision_feedback(
+        self,
+        state: SessionState,
+        memory: MemoryState,
+    ) -> None:
+        """Describe the active scope-revision boundary without changing retry counters."""
         artifact = memory.plan_artifact
         self._append_system_feedback(
             state,
@@ -3971,8 +4329,6 @@ class AgentController:
                 ),
             },
         )
-        self._save_memory(memory, state, status=self._active_memory_status(state))
-        return None
 
     def _tool_schemas(
         self,
@@ -4102,6 +4458,57 @@ class AgentController:
             "arguments": arguments,
             "one_state_changing_call_only": True,
         }
+
+    def _arm_action_protocol_recovery(
+        self,
+        calls: list[ToolCall],
+        *,
+        reasoning_event: ReasoningEvent | None,
+        state: SessionState,
+        memory: MemoryState,
+    ) -> None:
+        """Turn a rejected mutating batch into one constrained recovery sequence."""
+        matching_calls = (
+            [
+                call
+                for call in calls
+                if reasoning_event is not None
+                and reasoning_event.next_action is not None
+                and call.name == reasoning_event.next_action.tool_name
+            ]
+            if reasoning_event is not None
+            else []
+        )
+        if (
+            reasoning_event is not None
+            and reasoning_event.phase == ReasoningPhase.DECISION
+            and reasoning_event.next_action is not None
+            and len(matching_calls) == 1
+        ):
+            # The rejected response contained exactly one action matching its valid audit
+            # record. Preserve that authority instead of charging another reasoning turn.
+            state.pending_decision = reasoning_event
+            state.required_protocol_tool = matching_calls[0].name
+            return
+
+        if any(self._requires_decision(call) for call in calls):
+            state.pending_decision = None
+            memory.verification_plan_recovery_decision = None
+            state.required_protocol_tool = "record_decision"
+            return
+
+        current_step = (
+            memory.plan_artifact.current_step
+            if memory.plan_artifact is not None
+            and memory.plan_artifact.status == PlanStatus.EXECUTING
+            else None
+        )
+        contract = self._plan_step_action_contract(current_step)
+        required_tool = contract.get("tool") if contract is not None else None
+        if isinstance(required_tool, str):
+            state.required_protocol_tool = required_tool
+        elif len(calls) == 1:
+            state.required_protocol_tool = calls[0].name
 
     def _completed_plan_step_for_call(
         self,
@@ -4284,7 +4691,18 @@ class AgentController:
             protocol_checkpoints = 0
             options = self._model_request_options(state)
             required_tool = self._required_model_tool(state)
-            if required_tool is not None:
+            finalizing = (
+                state.runtime is not None and state.runtime.phase == WorkflowPhase.FINALIZING
+            )
+            if finalizing:
+                # Keep the stable schema prefix for provider caching, but prevent the model
+                # from selecting another tool after deterministic verification has completed.
+                options = replace(
+                    options or ModelRequestOptions(),
+                    tool_choice="none",
+                    required_tool=None,
+                )
+            elif required_tool is not None:
                 options = replace(
                     options or ModelRequestOptions(),
                     required_tool=required_tool,
@@ -4442,7 +4860,7 @@ class AgentController:
             state.verification_plan_recovery_attempts > 0 and state.verification_plan is None
         ):
             return "register_verification"
-        return None
+        return state.required_plan_tool or state.required_protocol_tool
 
     def _reasoning_context(self, state: SessionState) -> ReasoningContext:
         memory = self.plan_runtime.memory
@@ -4748,6 +5166,10 @@ class AgentController:
         memory.plan_scope_revision_required = state.plan_scope_revision_required
         memory.plan_scope_revision_reason = state.plan_scope_revision_reason
         memory.plan_scope_revision_attempts = state.plan_scope_revision_attempts
+        memory.plan_text_recovery_attempts = state.plan_text_recovery_attempts
+        memory.last_plan_text_signature = state.last_plan_text_signature
+        memory.required_plan_tool = state.required_plan_tool
+        memory.required_protocol_tool = state.required_protocol_tool
         memory.candidate_final_assessment = state.candidate_final_assessment
         memory.workflow_mode = state.workflow_mode
         memory.runtime = state.runtime.model_copy(deep=True) if state.runtime is not None else None

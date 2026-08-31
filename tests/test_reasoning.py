@@ -290,7 +290,128 @@ def test_read_decision_cannot_cover_mutation_in_same_turn() -> None:
         for message in memory.messages
         if message.tool_call_id in {"read-1", "write-1"}
     ]
-    assert all("at most one primary action" in payload.lower() for payload in tool_payloads)
+    assert all("rejected as one batch" in payload.lower() for payload in tool_payloads)
+
+
+def test_bounded_read_only_batch_executes_each_action_in_order() -> None:
+    listed = ToolCall(id="list-1", name="list_files", arguments={"path": "."})
+    first = ToolCall(id="read-1", name="read_file", arguments={"path": "a.py"})
+    second = ToolCall(id="read-2", name="read_file", arguments={"path": "b.py"})
+    tools = FakeToolRegistry(
+        [
+            ToolResult(ok=True, output="a.py\nb.py", metadata={"path": "."}),
+            ToolResult(ok=True, output="a = 1", metadata={"path": "a.py"}),
+            ToolResult(ok=True, output="b = 2", metadata={"path": "b.py"}),
+        ]
+    )
+    agent, memory = controller(
+        [
+            ModelResponse(tool_calls=[listed, first, second]),
+            ModelResponse(content="Inspection complete."),
+        ],
+        tools,
+    )
+
+    result = agent.run("inspect both files", memory=memory)
+
+    assert result.status == "success"
+    assert tools.calls == [listed, first, second]
+    assert [event.tool_call_id for event in memory.observation_events] == [
+        "list-1",
+        "read-1",
+        "read-2",
+    ]
+    assert not any(
+        "action_cardinality_violation" in (message.content or "") for message in memory.messages
+    )
+
+
+def test_mutating_batch_recovery_forces_one_decision_then_its_action() -> None:
+    first = ToolCall(
+        id="command-1",
+        name="run_command",
+        arguments={"program": "g++", "args": ["--version"]},
+    )
+    second = ToolCall(
+        id="command-2",
+        name="run_command",
+        arguments={"program": "g++", "args": ["main.cpp"]},
+    )
+    recovered = ToolCall(
+        id="command-recovered",
+        name="run_command",
+        arguments={"program": "g++", "args": ["--version"]},
+    )
+    tools = FakeToolRegistry([ToolResult(ok=True, output="g++ 15")])
+    recovery_decision = decision("decision-recovery", "run_command")
+    model = FakeModelClient(
+        [
+            ModelResponse(tool_calls=[first, second]),
+            ModelResponse(tool_calls=[recovery_decision]),
+            ModelResponse(tool_calls=[recovered]),
+            ModelResponse(content="Compiler availability was confirmed."),
+        ]
+    )
+    agent = AgentController(
+        model_client=model,
+        tool_registry=cast(ToolRegistry, tools),
+    )
+    memory = MemoryState(session_id="cardinality-recovery")
+
+    result = agent.run("check the compiler", memory=memory)
+
+    assert result.status == "success"
+    assert tools.calls == [recovered]
+    assert model.requests[1]["options"].required_tool == "record_decision"
+    assert model.requests[2]["options"].required_tool == "run_command"
+    assert memory.required_protocol_tool is None
+
+
+def test_read_only_batch_over_limit_is_rejected_as_one_invalid_turn() -> None:
+    reads = [
+        ToolCall(id=f"read-{index}", name="read_file", arguments={"path": f"{index}.py"})
+        for index in range(9)
+    ]
+    tools = FakeToolRegistry([])
+    agent, memory = controller(
+        [
+            ModelResponse(tool_calls=reads),
+            ModelResponse(content="Stopped after the rejected batch."),
+        ],
+        tools,
+    )
+
+    result = agent.run("inspect too many files at once", memory=memory)
+
+    assert result.status == "success"
+    assert tools.calls == []
+    assert len([item for item in memory.messages if item.tool_call_id]) == 9
+    assert all(
+        "rejected as one batch" in (item.content or "")
+        for item in memory.messages
+        if item.tool_call_id
+    )
+
+
+def test_read_only_batch_pairs_every_result_before_failure_limit_stops_run() -> None:
+    reads = [
+        ToolCall(id=f"read-{index}", name="read_file", arguments={"path": f"{index}.py"})
+        for index in range(8)
+    ]
+    tools = FakeToolRegistry(
+        [ToolResult(ok=False, output="", error=f"missing {index}.py") for index in range(8)]
+    )
+    agent, memory = controller([ModelResponse(tool_calls=reads)], tools)
+
+    result = agent.run("inspect missing files", memory=memory)
+
+    assert result.status == "stopped"
+    assert result.reason == "maximum consecutive tool failures reached (5)"
+    assert tools.calls == reads
+    assert {item.tool_call_id for item in memory.messages if item.role == "tool"} == {
+        item.id for item in reads
+    }
+    validate_tool_call_protocol([item.as_chat_message() for item in memory.messages])
 
 
 def test_matching_decision_executes_action_and_creates_executor_observation() -> None:

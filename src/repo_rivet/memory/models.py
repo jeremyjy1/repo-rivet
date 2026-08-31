@@ -262,6 +262,10 @@ class MemoryState(BaseModel):
     plan_scope_revision_required: bool = False
     plan_scope_revision_reason: str | None = Field(default=None, max_length=1_000)
     plan_scope_revision_attempts: int = Field(default=0, ge=0)
+    plan_text_recovery_attempts: int = Field(default=0, ge=0)
+    last_plan_text_signature: str | None = Field(default=None, max_length=64)
+    required_plan_tool: Literal["submit_plan", "update_plan"] | None = None
+    required_protocol_tool: str | None = Field(default=None, max_length=100)
     candidate_final_assessment: FinalAssessment | None = None
     last_model_error: ModelErrorRecord | None = None
     provider_requires_reasoning_content: bool = False
@@ -307,6 +311,10 @@ class MemoryState(BaseModel):
         if task_changed:
             self.verification_plan_recovery_attempts = 0
             self.verification_plan_recovery_decision = None
+            self.plan_text_recovery_attempts = 0
+            self.last_plan_text_signature = None
+            self.required_plan_tool = None
+            self.required_protocol_tool = None
         self.denied_request_fingerprints.clear()
         self.approval_denial_guidance.clear()
         if self.fixed is None:
@@ -344,6 +352,10 @@ class MemoryState(BaseModel):
         self.plan_scope_revision_required = False
         self.plan_scope_revision_reason = None
         self.plan_scope_revision_attempts = 0
+        self.plan_text_recovery_attempts = 0
+        self.last_plan_text_signature = None
+        self.required_plan_tool = None
+        self.required_protocol_tool = None
         self.candidate_final_assessment = None
         self.last_model_error = None
         self.working.recent_modified_files.clear()

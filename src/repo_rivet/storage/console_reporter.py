@@ -91,6 +91,7 @@ class ConsoleEventReporter:
         self._secrets = tuple(secret for secret in secrets if secret)
         self.reasoning_mode = reasoning_mode
         self._active_status: Status | None = None
+        self._last_blocked_signature: tuple[object, object, object, object] | None = None
 
     def log(self, event_type: str, **data: Any) -> None:
         if event_type in _STATUS_STOP_EVENTS:
@@ -161,6 +162,14 @@ class ConsoleEventReporter:
                 f"{path} · edit context {status}",
                 style="bold cyan" if data.get("ok") else "bold red",
             )
+        elif event_type == "plan_text_response_rejected":
+            attempt = self._safe(data.get("attempt", "?"), limit=10)
+            required_tool = self._safe(data.get("required_tool", "submit_plan"), limit=40)
+            self._print_trace_label(
+                "RECOVER",
+                f"Plan prose was not submitted · attempt {attempt} · requiring {required_tool}",
+                style="bold yellow",
+            )
         elif event_type == "observation":
             self._observation(data)
         elif event_type == "verification_result":
@@ -220,6 +229,17 @@ class ConsoleEventReporter:
     def _action_blocked(self, data: dict[str, Any]) -> None:
         if self.reasoning_mode == ReasoningDisplayMode.OFF:
             return
+        if data.get("error_code") == "finalization_tool_disabled":
+            return
+        signature = (
+            data.get("step"),
+            data.get("tool"),
+            data.get("error_code"),
+            data.get("reason"),
+        )
+        if signature == self._last_blocked_signature:
+            return
+        self._last_blocked_signature = signature
         tool = self._safe(data.get("tool", "unknown tool"))
         reason = self._safe(data.get("reason", "decision protocol rejected the call"), limit=300)
         self._print_trace_label("BLOCKED", self._join(tool, reason), style="bold yellow")

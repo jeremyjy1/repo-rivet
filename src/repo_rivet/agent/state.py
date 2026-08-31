@@ -63,6 +63,10 @@ class SessionState:
     recent_errors: list[str] = field(default_factory=list)
     started_at: float = field(default_factory=time.monotonic)
     reasoning_only_turns: int = 0
+    plan_text_recovery_attempts: int = 0
+    last_plan_text_signature: str | None = None
+    required_plan_tool: Literal["submit_plan", "update_plan"] | None = None
+    required_protocol_tool: str | None = None
     pending_decision: ReasoningEvent | None = None
     reasoning_max_calls: int = 0
     reasoning_xhigh_calls: int = 0

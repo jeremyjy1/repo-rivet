@@ -130,8 +130,10 @@ class OpenAICompatibleClient:
             provider_options["extra_body"] = {
                 "thinking": {"type": "enabled" if thinking_enabled else "disabled"}
             }
-        tool_choice: str | dict[str, Any] = "auto"
+        tool_choice: str | dict[str, Any] = request_options.tool_choice or "auto"
         if request_options.required_tool is not None:
+            if tool_choice == "none":
+                raise ValueError("required_tool cannot be combined with tool_choice='none'")
             available_tools = {str(tool.get("function", {}).get("name", "")) for tool in tools}
             if request_options.required_tool not in available_tools:
                 raise ValueError(

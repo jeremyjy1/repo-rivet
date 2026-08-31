@@ -730,6 +730,7 @@ def test_scope_revision_can_reread_invalidated_target_before_plan_update(tmp_pat
     assert model.requests[1]["tools"] == model.requests[0]["tools"]
     assert model.requests[2]["tools"] == model.requests[0]["tools"]
     assert model.requests[3]["tools"] == model.requests[0]["tools"]
+    assert model.requests[3]["options"].required_tool == "update_plan"
     allowed_recovery_tools = {
         "git_diff",
         "git_status",
@@ -760,6 +761,81 @@ def test_scope_revision_can_reread_invalidated_target_before_plan_update(tmp_pat
         for step in retry_feedback["current_plan"]["steps"]
     )
     assert makefile.read_text(encoding="utf-8") == "build:\n\ttrue\n"
+
+
+def test_wrong_actions_do_not_consume_plan_scope_revision_attempts(tmp_path: Path) -> None:
+    memory = inspected_memory(tmp_path)
+    registry = create_default_registry(tmp_path)
+    registry.plan_runtime.bind(memory)
+    registry.plan_runtime.submit({"plan": plan_payload()})
+    registry.plan_runtime.approve()
+    memory.plan_scope_revision_required = True
+    memory.plan_scope_revision_reason = "the approved scope must be revised"
+    rejected_writes = [
+        ToolCall(
+            id=f"wrong-write-{index}",
+            name="write_file",
+            arguments={"path": f"unexpected-{index}.py", "content": "pass\n"},
+        )
+        for index in range(3)
+    ]
+    update = ToolCall(
+        id="scope-update",
+        name="update_plan",
+        arguments={
+            "reason": "Keep the complete validated plan while renewing user review.",
+            "plan": plan_payload(),
+        },
+    )
+    model = FakeModelClient(
+        [
+            *(ModelResponse(tool_calls=[call]) for call in rejected_writes),
+            ModelResponse(tool_calls=[update]),
+        ]
+    )
+
+    result = AgentController(model_client=model, tool_registry=registry).run(
+        "Execute the approved plan",
+        memory=memory,
+    )
+
+    assert result.status == "plan_ready"
+    assert memory.plan_scope_revision_attempts == 0
+    assert not any((tmp_path / f"unexpected-{index}.py").exists() for index in range(3))
+    assert all(request["options"].required_tool == "update_plan" for request in model.requests[1:])
+
+
+def test_text_does_not_consume_plan_scope_revision_attempts(tmp_path: Path) -> None:
+    memory = inspected_memory(tmp_path)
+    registry = create_default_registry(tmp_path)
+    registry.plan_runtime.bind(memory)
+    registry.plan_runtime.submit({"plan": plan_payload()})
+    registry.plan_runtime.approve()
+    memory.plan_scope_revision_required = True
+    memory.plan_scope_revision_reason = "the approved scope must be revised"
+    update = ToolCall(
+        id="scope-update-after-text",
+        name="update_plan",
+        arguments={
+            "reason": "Return the complete plan for renewed user review.",
+            "plan": plan_payload(),
+        },
+    )
+    model = FakeModelClient(
+        [
+            ModelResponse(content="I will continue with the existing implementation."),
+            ModelResponse(tool_calls=[update]),
+        ]
+    )
+
+    result = AgentController(model_client=model, tool_registry=registry).run(
+        "Execute the approved plan",
+        memory=memory,
+    )
+
+    assert result.status == "plan_ready"
+    assert memory.plan_scope_revision_attempts == 0
+    assert model.requests[1]["options"].required_tool == "update_plan"
 
 
 def test_plan_step_transition_corrects_replay_of_completed_create(tmp_path: Path) -> None:
@@ -1474,3 +1550,69 @@ def test_auto_plan_off_hides_model_transition_tool(tmp_path: Path) -> None:
     assert result.status == "success"
     visible_tools = {schema["function"]["name"] for schema in model.requests[0]["tools"]}
     assert "request_plan" not in visible_tools
+
+
+def test_plan_mode_tool_free_response_is_forced_to_submit_then_stopped(
+    tmp_path: Path,
+) -> None:
+    memory = inspected_memory(tmp_path)
+    memory.workflow_mode = WorkflowMode.PLANNING
+    repeated_report = "I inspected the files and here is the proposed implementation."
+    model = FakeModelClient(
+        [
+            ModelResponse(content=repeated_report),
+            ModelResponse(content=repeated_report),
+        ]
+    )
+    agent = AgentController(
+        model_client=model,
+        tool_registry=create_default_registry(tmp_path),
+    )
+
+    result = agent.run("Prepare a plan for app.py", memory=memory)
+
+    assert result.status == "stopped"
+    assert "instead of a structured submit_plan call after 2 attempts" in (result.reason or "")
+    assert len(model.requests) == 2
+    assert model.requests[0]["options"] is None or (
+        model.requests[0]["options"].required_tool is None
+    )
+    assert model.requests[1]["options"].required_tool == "submit_plan"
+    assert (
+        sum(
+            item.role == "assistant" and item.content == repeated_report for item in memory.messages
+        )
+        == 1
+    )
+    assert memory.plan_text_recovery_attempts == 2
+    assert memory.required_plan_tool == "submit_plan"
+
+
+def test_plan_mode_tool_free_response_recovers_with_forced_plan_submission(
+    tmp_path: Path,
+) -> None:
+    memory = inspected_memory(tmp_path)
+    memory.workflow_mode = WorkflowMode.PLANNING
+    submit = ToolCall(
+        id="submit-after-prose",
+        name="submit_plan",
+        arguments={"plan": plan_payload()},
+    )
+    model = FakeModelClient(
+        [
+            ModelResponse(content="The inspection is complete."),
+            ModelResponse(tool_calls=[submit]),
+        ]
+    )
+    agent = AgentController(
+        model_client=model,
+        tool_registry=create_default_registry(tmp_path),
+    )
+
+    result = agent.run("Prepare a plan for app.py", memory=memory)
+
+    assert result.status == "plan_ready"
+    assert model.requests[1]["options"].required_tool == "submit_plan"
+    assert memory.plan_text_recovery_attempts == 0
+    assert memory.last_plan_text_signature is None
+    assert memory.required_plan_tool is None

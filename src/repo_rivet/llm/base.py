@@ -30,6 +30,7 @@ class ModelRequestOptions:
 
     reasoning_effort: ReasoningEffort | None = None
     thinking_enabled: bool | None = None
+    tool_choice: Literal["auto", "none"] | None = None
     required_tool: str | None = None
 
 

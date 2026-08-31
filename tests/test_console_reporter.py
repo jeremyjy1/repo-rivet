@@ -645,6 +645,45 @@ def test_console_reporter_labels_unexecuted_action_as_blocked() -> None:
     ]
 
 
+def test_console_reporter_suppresses_duplicate_blocked_actions_from_one_turn() -> None:
+    buffer = StringIO()
+    reporter = ConsoleEventReporter(
+        Console(file=buffer, force_terminal=False, color_system=None, width=240),
+        reasoning_mode=ReasoningDisplayMode.SUMMARY,
+    )
+    payload = {
+        "step": 3,
+        "tool": "run_command",
+        "reason": "The model turn contained multiple state-changing actions.",
+        "error_code": "action_cardinality_violation",
+    }
+
+    reporter.log("action_blocked", **payload)
+    reporter.log("action_blocked", **payload)
+
+    assert buffer.getvalue().splitlines() == [
+        "[BLOCKED] run_command · The model turn contained multiple state-changing actions."
+    ]
+
+
+def test_console_reporter_hides_finalization_tool_fallback() -> None:
+    buffer = StringIO()
+    reporter = ConsoleEventReporter(
+        Console(file=buffer, force_terminal=False, color_system=None, width=240),
+        reasoning_mode=ReasoningDisplayMode.SUMMARY,
+    )
+
+    reporter.log(
+        "action_blocked",
+        step=4,
+        tool="run_verification",
+        reason="Tools are disabled during finalization.",
+        error_code="finalization_tool_disabled",
+    )
+
+    assert buffer.getvalue() == ""
+
+
 def test_console_reporter_trace_is_structured_bounded_and_secret_safe() -> None:
     buffer = StringIO()
     reporter = ConsoleEventReporter(

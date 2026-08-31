@@ -291,6 +291,28 @@ def test_complete_can_require_the_only_recovery_tool() -> None:
     }
 
 
+def test_complete_can_disable_tool_calls_without_removing_schemas() -> None:
+    completions = FakeCompletions()
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    config = ApiConfig(
+        api_key=SecretStr("test-key"),
+        base_url="https://example.com/v1",
+        model="test-model",
+        context_window_tokens=32768,
+    )
+    adapter = OpenAICompatibleClient(config, client=client)
+    tools = [{"type": "function", "function": {"name": "run_verification"}}]
+
+    adapter.complete(
+        messages=[{"role": "user", "content": "summarize verified work"}],
+        tools=tools,
+        options=ModelRequestOptions(tool_choice="none"),
+    )
+
+    assert completions.kwargs["tools"] == tools
+    assert completions.kwargs["tool_choice"] == "none"
+
+
 def test_required_tool_retries_without_thinking_when_provider_rejects_combination() -> None:
     completions = ThinkingToolChoiceFallbackCompletions()
     client = SimpleNamespace(chat=SimpleNamespace(completions=completions))

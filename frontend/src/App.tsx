@@ -97,6 +97,7 @@ const sessionRefreshEvents = new Set([
   "external.files.changed",
   "plan.approved",
   "plan.cancelled",
+  "plan.text.response.rejected",
   "plan.submitted",
   "plan.updated",
   "plan.step.finished",
@@ -146,6 +147,7 @@ const visibleTimelineEvents = new Set([
   "plan.cancelled",
   "plan.ready",
   "plan.scope.revision.required",
+  "plan.text.response.rejected",
   "plan.submitted",
   "plan.updated",
   "reasoning",
@@ -189,6 +191,12 @@ function toolLabel(tool: string): string {
 
 function eventStep(event: AgentEvent): number | null {
   return numberValue(event.payload.step) ?? numberValue(event.payload.model_step);
+}
+
+function eventToolName(event: AgentEvent): string {
+  return textValue(event.payload.name)
+    || textValue(event.payload.tool)
+    || textValue(event.payload.tool_name);
 }
 
 function shouldShowApprovalResolution(event: AgentEvent): boolean {
@@ -240,7 +248,11 @@ function compactTimelineEvents(
     if (event.type === "tool.finished") {
       const toolCallId = textValue(event.payload.tool_call_id);
       const failedOrSkipped = event.payload.ok === false || event.payload.executed === false;
-      if (observedToolCalls.has(toolCallId) || !failedOrSkipped) continue;
+      if (
+        observedToolCalls.has(toolCallId)
+        || !failedOrSkipped
+        || textValue(event.payload.error_code) === "finalization_tool_disabled"
+      ) continue;
     }
     if (event.type === "approval.resolved" && !shouldShowApprovalResolution(event)) continue;
     if (
@@ -254,8 +266,24 @@ function compactTimelineEvents(
       && (event.type === "reasoning" || event.type === "assessment")
       && previous.type === event.type
       && eventStep(previous) === eventStep(event);
+    const aggregateRejectedAction = previous
+      && event.type === "tool.finished"
+      && previous.type === "tool.finished"
+      && event.payload.executed === false
+      && previous.payload.executed === false
+      && eventToolName(previous) === eventToolName(event)
+      && textValue(previous.payload.error_code) === textValue(event.payload.error_code)
+      && textValue(previous.payload.error) === textValue(event.payload.error);
     if (replaceRepeatedThought) compacted[compacted.length - 1] = event;
-    else compacted.push(event);
+    else if (aggregateRejectedAction) {
+      compacted[compacted.length - 1] = {
+        ...previous,
+        payload: {
+          ...previous.payload,
+          repeated_count: (numberValue(previous.payload.repeated_count) || 1) + 1,
+        },
+      };
+    } else compacted.push(event);
   }
   return compacted;
 }
@@ -1162,8 +1190,9 @@ function presentEvent(event: AgentEvent, pendingApprovalId: string | null): Even
     case "tool.finished": {
       const ok = payload.ok !== false;
       const executed = payload.executed !== false;
+      const repeatedCount = numberValue(payload.repeated_count) || 1;
       return {
-        title: `${!executed ? "Not executed" : ok ? "Completed" : "Failed"} · ${toolLabel(tool)}`,
+        title: `${!executed ? "Not executed" : ok ? "Completed" : "Failed"} · ${toolLabel(tool)}${repeatedCount > 1 ? ` ×${repeatedCount}` : ""}`,
         summary: textValue(payload.error) || (ok ? "Tool completed successfully" : "Tool operation failed"),
         detail: [textValue(payload.error_code), !executed ? "Workspace unchanged" : ""]
           .filter(Boolean)
@@ -1258,6 +1287,14 @@ function presentEvent(event: AgentEvent, pendingApprovalId: string | null): Even
       };
     case "auto.plan.started":
       return { title: "Automatic planning", summary: "Entered read-only Plan Mode", detail: clipped(textValue(payload.reason)) };
+    case "plan.text.response.rejected":
+      return {
+        title: "Submitting structured plan",
+        summary: `Plain text cannot finish Plan Mode · requiring ${humanize(textValue(payload.required_tool))}`,
+        detail: payload.repeated === true
+          ? "A repeated prose response was discarded instead of being added to the context again"
+          : "RepoRivet will make one bounded recovery attempt",
+      };
     case "auto.plan.review.started":
       return {
         title: "Adaptive Plan evaluation",

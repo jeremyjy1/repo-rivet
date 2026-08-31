@@ -707,11 +707,18 @@ def test_finalization_disables_tools_and_does_not_repeat_passed_check() -> None:
             ModelResponse(tool_calls=[repeated_check]),
         ]
     )
-    tools = FakeToolRegistry(
-        [
-            ToolResult(ok=True, output="written"),
-            passed_verification_result(),
-        ]
+
+    class NonEmptySchemaRegistry(FakeToolRegistry):
+        def schemas(self) -> list[dict[str, object]]:
+            return [
+                {
+                    "type": "function",
+                    "function": {"name": "run_verification", "parameters": {}},
+                }
+            ]
+
+    tools = NonEmptySchemaRegistry(
+        [ToolResult(ok=True, output="written"), passed_verification_result()]
     )
 
     result = controller(model, tools).run("implement and verify")
@@ -719,7 +726,8 @@ def test_finalization_disables_tools_and_does_not_repeat_passed_check() -> None:
     assert result.status == "success"
     assert result.verification_status.value == "passed"
     assert [item.name for item in tools.calls] == ["write_file", "run_verification"]
-    assert model.requests[2]["tools"] == []
+    assert model.requests[2]["tools"] == tools.schemas()
+    assert model.requests[2]["options"].tool_choice == "none"
 
 
 def test_finalization_discards_dsml_tool_markup_from_result_and_history() -> None:
