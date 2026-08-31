@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from repo_rivet.memory.budget_manager import (
     RequestTokenEstimate,
@@ -94,6 +94,7 @@ class ContextManager:
         self._dynamic_token_manager: TokenBudgetManager | None = None
         self.compactor = compactor or ConversationCompactor()
         self.last_estimate = RequestTokenEstimate(raw=0, effective=0, correction_factor=1.0)
+        self.last_pressure: Literal["normal", "compact", "aggressive", "overflow"] = "normal"
 
     @property
     def token_manager(self) -> TokenBudgetManager:
@@ -128,6 +129,7 @@ class ContextManager:
         ]
         full_estimate = manager.estimate_request(full_messages, tools)
         pressure = manager.pressure_level(full_estimate.effective)
+        self.last_pressure = pressure
         self.compactor.compact_if_needed(memory, pressure=pressure)
 
         # Compaction intentionally starts a new cache epoch. Its checkpoint captures the

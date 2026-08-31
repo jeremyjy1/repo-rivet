@@ -168,6 +168,8 @@ button:focus-visible, textarea:focus-visible, select:focus-visible { outline: 2p
 .composer-control.active { color: var(--accent); }
 .composer-control.warning { color: var(--amber); }
 .composer-control.muted { color: #596474; }
+.composer-control.compact-control { margin-left: 2px; color: #7d8da5; }
+.composer-control.compact-control:hover { color: var(--blue); }
 .composer-control:hover, .composer-control[aria-expanded="true"] { color: var(--accent); background: #181d25; border-color: #303846; }
 .composer-control:disabled { opacity: .42; cursor: not-allowed; }
 .control-chevron { position: absolute; right: 2px; bottom: 2px; opacity: .65; }

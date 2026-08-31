@@ -84,6 +84,11 @@ class RuntimeSettingsRequest(BaseModel):
     reasoning_effort: ReasoningEffort | None = None
 
 
+class CompactSessionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    aggressive: bool = False
+
+
 @dataclass(slots=True)
 class WebContext:
     auth: LocalAuth
@@ -202,6 +207,16 @@ def create_app(
     @app.delete("/api/v1/sessions/{session_id}", dependencies=[Depends(require_write)])
     def session_delete(session_id: str) -> dict[str, object]:
         return context.commands.delete_session(session_id)
+
+    @app.post("/api/v1/sessions/{session_id}/compact", dependencies=[Depends(require_write)])
+    def session_compact(
+        session_id: str,
+        payload: CompactSessionRequest,
+    ) -> dict[str, object]:
+        return context.commands.compact_session(
+            session_id,
+            aggressive=payload.aggressive,
+        )
 
     @app.post("/api/v1/sessions/{session_id}/use", dependencies=[Depends(require_write)])
     def session_use(session_id: str) -> dict[str, object]:

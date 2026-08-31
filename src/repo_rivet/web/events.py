@@ -32,6 +32,8 @@ _EVENT_NAMES = {
     "plan_submitted": "plan.submitted",
     "plan_updated": "plan.updated",
     "plan_approved": "plan.approved",
+    "context_auto_compaction": "context.auto.compaction",
+    "context_manual_compaction": "context.manual.compaction",
 }
 
 

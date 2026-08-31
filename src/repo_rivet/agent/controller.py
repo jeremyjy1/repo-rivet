@@ -4204,6 +4204,8 @@ class AgentController:
                     removed_messages=removed,
                     remaining_messages=len(memory.messages),
                 )
+            compaction_count = memory.compaction_count
+            message_count = len(memory.messages)
             try:
                 messages = self.context_manager.build(
                     memory=memory,
@@ -4223,6 +4225,15 @@ class AgentController:
                     reason=last_reason,
                 )
                 continue
+            finally:
+                if memory.compaction_count > compaction_count:
+                    self._log(
+                        "context_auto_compaction",
+                        pressure=self.context_manager.last_pressure,
+                        removed_messages=max(0, message_count - len(memory.messages)),
+                        remaining_messages=len(memory.messages),
+                        compaction_count=memory.compaction_count,
+                    )
 
             protocol_checkpoints = 0
             options = self._model_request_options(state)

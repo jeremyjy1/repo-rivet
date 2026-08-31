@@ -9,6 +9,7 @@ from repo_rivet.approval.models import ApprovalMode
 from repo_rivet.config import load_config
 from repo_rivet.editing.document import TextDocument
 from repo_rivet.llm.base import ReasoningEffort
+from repo_rivet.memory.compactor import ConversationCompactor
 from repo_rivet.planning.models import PlanStatus, WorkflowMode
 from repo_rivet.planning.policy import AutoPlanMode
 from repo_rivet.planning.runtime import PlanRuntime
@@ -252,6 +253,44 @@ class AgentCommandService:
             "deleted": True,
             "session_id": resolved_id,
             "permanent": True,
+        }
+
+    def compact_session(self, session_id: str, *, aggressive: bool = False) -> dict[str, object]:
+        resolved_id = self.sessions.resolve_id(session_id)
+        run = self.manager.get(resolved_id)
+        if run is not None and run.status in {
+            "queued",
+            "running",
+            "awaiting_approval",
+            "stopping",
+        }:
+            raise ValueError("Stop the active run before compacting this conversation")
+
+        loaded = self.sessions.load(resolved_id)
+        removed = ConversationCompactor().compact(
+            loaded.memory,
+            aggressive=aggressive,
+        )
+        loaded.store.save_state(
+            loaded.memory,
+            status=loaded.memory.status,
+            agent_step=loaded.metadata.step,
+        )
+        loaded.store.log(
+            "context_manual_compaction",
+            aggressive=aggressive,
+            changed=removed > 0,
+            removed_messages=removed,
+            remaining_messages=len(loaded.memory.messages),
+            compaction_count=loaded.memory.compaction_count,
+        )
+        self.manager.broker.notify(resolved_id)
+        return {
+            "changed": removed > 0,
+            "aggressive": aggressive,
+            "removed_messages": removed,
+            "remaining_messages": len(loaded.memory.messages),
+            "compaction_count": loaded.memory.compaction_count,
         }
 
     async def submit(

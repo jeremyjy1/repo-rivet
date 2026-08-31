@@ -23,6 +23,7 @@ import {
   ListTodo,
   LoaderCircle,
   MessageSquareText,
+  Minimize2,
   Moon,
   Play,
   Plus,
@@ -119,6 +120,8 @@ const visibleTimelineEvents = new Set([
   "context.preflight.overflow",
   "context.provider.overflow",
   "context.recovery.compaction",
+  "context.auto.compaction",
+  "context.manual.compaction",
   "duplicate.successful.command.suppressed",
   "external.files.changed",
   "interrupted.history.repaired",
@@ -264,6 +267,7 @@ function App() {
   const [loading, setLoading] = useState(true);
   const [deleteTarget, setDeleteTarget] = useState<SessionSummary | null>(null);
   const [deletingSession, setDeletingSession] = useState(false);
+  const [compactingContext, setCompactingContext] = useState(false);
   const creatingSession = useRef<Promise<string> | null>(null);
   const selectedSessionId = useRef<string | null>(null);
 
@@ -408,6 +412,22 @@ function App() {
     setFileView(await api(`/api/v1/workspace/file?path=${encodeURIComponent(path)}`));
   });
 
+  const compactContext = async () => {
+    if (!session || isRunning || compactingContext) return;
+    setCompactingContext(true);
+    try {
+      await api(`/api/v1/sessions/${session.session_id}/compact`, {
+        method: "POST",
+        body: JSON.stringify({ aggressive: false }),
+      });
+      await refreshSession(session.session_id);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setCompactingContext(false);
+    }
+  };
+
   const approval = session?.run?.pending_approval || null;
   const isRunning = ["queued", "running", "awaiting_approval", "stopping"].includes(session?.run?.status || "");
   const planReady = session?.plan?.status === "ready" || session?.plan?.status === "stale";
@@ -526,6 +546,9 @@ function App() {
           setReasoningPolicy={(value) => updateOptions({ reasoningPolicy: value })}
           setReasoningEffort={(value) => updateOptions({ reasoningEffort: value })}
           settings={boot.settings}
+          compactingContext={compactingContext}
+          canCompact={Boolean(session) && !isRunning}
+          onCompact={() => void compactContext()}
           onActivate={() => { void invoke(async () => { await ensureSession(); }); }}
           onStop={() => invoke(() => api(`/api/v1/sessions/${session!.session_id}/stop`, { method: "POST", body: "{}" }))}
           onSubmit={submit}
@@ -882,7 +905,7 @@ function ComposerReasoningSlider({ policy, value, onPolicyChange, onChange }: {
   </div>;
 }
 
-const Composer = memo(function Composer({ disabled, isRunning, mode, setMode, planReady, autoPlan, setAutoPlan, approvalMode, setApprovalMode, skills, selectedSkill, setSelectedSkill, reasoningPolicy, setReasoningPolicy, reasoningEffort, setReasoningEffort, settings, onActivate, onStop, onSubmit }: {
+const Composer = memo(function Composer({ disabled, isRunning, mode, setMode, planReady, autoPlan, setAutoPlan, approvalMode, setApprovalMode, skills, selectedSkill, setSelectedSkill, reasoningPolicy, setReasoningPolicy, reasoningEffort, setReasoningEffort, settings, compactingContext, canCompact, onCompact, onActivate, onStop, onSubmit }: {
   disabled: boolean;
   isRunning: boolean;
   mode: "execute" | "planning";
@@ -900,6 +923,9 @@ const Composer = memo(function Composer({ disabled, isRunning, mode, setMode, pl
   reasoningEffort: ReasoningEffort;
   setReasoningEffort: (effort: ReasoningEffort) => void;
   settings: Bootstrap["settings"];
+  compactingContext: boolean;
+  canCompact: boolean;
+  onCompact: () => void;
   onActivate: () => void;
   onStop: () => Promise<void> | void;
   onSubmit: (task: string, delivery: RunDelivery) => Promise<void> | void;
@@ -966,6 +992,14 @@ const Composer = memo(function Composer({ disabled, isRunning, mode, setMode, pl
           <ComposerIconSelect label="Approval mode" value={approvalMode} options={approvalOptions} className={approvalMode === "always-ask" ? "warning" : ""} onChange={setApprovalMode} />
           <ComposerReasoningSlider policy={reasoningPolicy} value={reasoningEffort} onPolicyChange={setReasoningPolicy} onChange={setReasoningEffort} />
           <ComposerIconSelect label="Global Skill" value={selectedSkill} options={skillOptions} className={selectedSkill ? "active" : "muted"} onChange={setSelectedSkill} />
+          <button
+            className="composer-control compact-control"
+            type="button"
+            aria-label="Compact conversation context"
+            title={isRunning ? "Stop the current run before compacting context" : "Compact older conversation context"}
+            disabled={!canCompact || compactingContext}
+            onClick={onCompact}
+          >{compactingContext ? <LoaderCircle className="spin" size={iconSize} /> : <Minimize2 size={iconSize} />}</button>
         </div>
         <div className="composer-model" title={`${settings.base_url} · ${settings.context_limit.toLocaleString()} token context`}><Bot size={13} /><span>{settings.model}</span><i>·</i><span>{settings.context_limit.toLocaleString()}</span></div>
       </div>
@@ -1356,6 +1390,19 @@ function presentEvent(event: AgentEvent, pendingApprovalId: string | null): Even
       return { title: "Context needs compression", summary: clipped(textValue(payload.reason) || "The request exceeded its safe context budget"), detail: `recovery attempt ${textValue(payload.attempt) || "1"}` };
     case "context.recovery.compaction":
       return { title: "Context compressed", summary: `${textValue(payload.removed_messages) || "Some"} older messages summarized or removed`, detail: textValue(payload.remaining_messages) ? `${textValue(payload.remaining_messages)} messages remain` : "" };
+    case "context.auto.compaction":
+      return {
+        title: "Context compressed automatically",
+        summary: `${textValue(payload.removed_messages) || "Some"} older messages summarized or removed`,
+        detail: [
+          textValue(payload.remaining_messages) ? `${textValue(payload.remaining_messages)} messages remain` : "",
+          textValue(payload.pressure) ? `${humanize(textValue(payload.pressure))} context pressure` : "",
+        ].filter(Boolean).join(" · "),
+      };
+    case "context.manual.compaction":
+      return payload.changed === false
+        ? { title: "Context already compact", summary: "No older messages needed to be removed", detail: `${textValue(payload.remaining_messages) || "0"} messages remain` }
+        : { title: "Context compressed manually", summary: `${textValue(payload.removed_messages) || "Some"} older messages summarized or removed`, detail: `${textValue(payload.remaining_messages) || "0"} messages remain` };
     case "model.stream.usage.unavailable":
       return {
         title: "Streaming usage unavailable",

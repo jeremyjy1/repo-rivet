@@ -3,6 +3,8 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from repo_rivet.memory.models import Message
+from repo_rivet.session.store import FileSessionStore
 from repo_rivet.web.app import create_app
 
 
@@ -124,6 +126,46 @@ def test_delete_session_permanently_removes_saved_conversation(
     assert all(item["session_id"] != session_id for item in client.get("/api/v1/sessions").json())
     assert not (tmp_path / "home" / "sessions" / session_id).exists()
     assert not (tmp_path / "home" / "trash").exists()
+
+
+def test_manual_context_compaction_persists_and_reports_result(
+    web_client: tuple[TestClient, str],
+    tmp_path: Path,
+) -> None:
+    client, token = web_client
+    csrf = _authenticate(client, token)
+    write_headers = {
+        "Origin": "http://testserver",
+        "X-CSRF-Token": csrf,
+    }
+    created = client.post(
+        "/api/v1/sessions",
+        headers=write_headers,
+        json={"name": "Long conversation"},
+    ).json()
+    session_id = created["session_id"]
+    sessions = FileSessionStore(root=tmp_path / "home")
+    loaded = sessions.load(session_id)
+    loaded.memory.messages.extend(
+        Message(role="assistant", content=f"message {index}") for index in range(20)
+    )
+    loaded.store.save_state(loaded.memory, status=loaded.memory.status)
+
+    response = client.post(
+        f"/api/v1/sessions/{session_id}/compact",
+        headers=write_headers,
+        json={"aggressive": False},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "changed": True,
+        "aggressive": False,
+        "removed_messages": 10,
+        "remaining_messages": 10,
+        "compaction_count": 1,
+    }
+    assert len(sessions.load(session_id).memory.messages) == 10
 
 
 def test_workspace_file_endpoint_rejects_path_traversal(

@@ -232,7 +232,8 @@ def test_compaction_preserves_original_task_and_structured_unresolved_issue() ->
             Message(role="assistant", content=f"old message {index} " + "x" * 800)
         )
 
-    messages = ContextManager().build(
+    manager = ContextManager()
+    messages = manager.build(
         memory=memory,
         state_summary="state",
         remaining_steps=5,
@@ -241,6 +242,7 @@ def test_compaction_preserves_original_task_and_structured_unresolved_issue() ->
 
     assert len(memory.messages) <= 4
     assert memory.compaction_count == 1
+    assert manager.last_pressure != "normal"
     assert "preserve this original task exactly" in messages[1]["content"]
     assert any("failing test must remain" in str(message.get("content")) for message in messages)
 

@@ -81,6 +81,20 @@ def test_auto_plan_review_events_have_stable_browser_names(tmp_path: Path) -> No
     ]
 
 
+def test_context_compaction_events_have_stable_browser_names(tmp_path: Path) -> None:
+    path = tmp_path / "events.jsonl"
+    rows = [
+        {"timestamp": "auto", "event": "context_auto_compaction", "data": {}},
+        {"timestamp": "manual", "event": "context_manual_compaction", "data": {}},
+    ]
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+    assert [event.type for event in read_events(path, "session-a")] == [
+        "context.auto.compaction",
+        "context.manual.compaction",
+    ]
+
+
 def test_event_history_is_loaded_in_bounded_pages(tmp_path: Path) -> None:
     path = tmp_path / "events.jsonl"
     rows = [
