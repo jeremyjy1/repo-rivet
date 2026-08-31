@@ -1127,8 +1127,7 @@ def test_completed_provider_reasoning_is_retained_only_for_live_follow_up() -> N
         for message in model.requests[1]["messages"]
     )
     assert all(
-        "reasoning_content" not in message
-        for message in memory.model_dump(mode="json")["messages"]
+        "reasoning_content" not in message for message in memory.model_dump(mode="json")["messages"]
     )
 
 
