@@ -1543,7 +1543,79 @@ def test_reused_workspace_edit_tells_model_to_choose_a_distinct_action() -> None
     )
 
 
-def test_reused_completed_plan_edit_forces_decision_for_next_file() -> None:
+def test_replayed_subset_of_successful_edit_does_not_block_final_verification() -> None:
+    old_snapshot = "a" * 64
+    new_snapshot = "b" * 64
+    first = call(
+        "edit-1",
+        "edit_file",
+        {
+            "path": "incidentlens/cli.py",
+            "snapshot_id": old_snapshot,
+            "operations": [
+                {
+                    "op": "replace",
+                    "start_line": 25,
+                    "end_line": 26,
+                    "new_lines": [
+                        '    if arguments.format == "json":',
+                        '        print(json.dumps(summary), end="")',
+                    ],
+                }
+            ],
+        },
+    )
+    repeated_subset = call(
+        "edit-2",
+        "edit_file",
+        {
+            "path": "incidentlens/cli.py",
+            "snapshot_id": old_snapshot,
+            "operations": [
+                {
+                    "op": "replace",
+                    "start_line": 26,
+                    "end_line": 26,
+                    "new_lines": ['        print(json.dumps(summary), end="")'],
+                }
+            ],
+        },
+    )
+    model = FakeModelClient(
+        [
+            ModelResponse(
+                tool_calls=[verification_plan(), decision("decision-1", "edit_file"), first]
+            ),
+            ModelResponse(tool_calls=[repeated_subset]),
+            ModelResponse(content="The implementation is ready for verification."),
+        ]
+    )
+    tools = FakeToolRegistry(
+        [
+            ToolResult(
+                ok=True,
+                output="edited",
+                metadata={
+                    "path": "incidentlens/cli.py",
+                    "new_snapshot_id": new_snapshot,
+                    "workspace_revision": 1,
+                },
+            ),
+            passed_verification_result(),
+        ]
+    )
+    events = RecordingSink()
+    memory = MemoryState(session_id="replayed-edit-subset")
+
+    result = controller(model, tools, event_logger=events).run("fix JSON output", memory=memory)
+
+    assert result.status == "success", result.reason
+    assert [item.name for item in tools.calls] == ["edit_file", "run_verification"]
+    assert not any(name == "action_blocked" for name, _ in events.events)
+    assert any(name == "action_result_reused" for name, _ in events.events)
+
+
+def test_reused_completed_plan_edit_restarts_context_for_next_file() -> None:
     memory = MemoryState(session_id="planned-reused-edit")
     memory.workflow_mode = WorkflowMode.EXECUTE
     memory.plan_artifact = PlanArtifact.model_validate(
@@ -1596,9 +1668,11 @@ def test_reused_completed_plan_edit_forces_decision_for_next_file() -> None:
     second = call("edit-config-1", "edit_file", {"path": "config.py", "operations": []})
     model = FakeModelClient(
         [
-            ModelResponse(tool_calls=[verification_plan(), decision("d1", "edit_file"), first]),
-            ModelResponse(tool_calls=[duplicate]),
-            ModelResponse(tool_calls=[decision("d2", "edit_file")]),
+            ModelResponse(tool_calls=[verification_plan(), first]),
+            ModelResponse(
+                reasoning_content="Continue editing app.py from the previous step.",
+                tool_calls=[duplicate],
+            ),
             ModelResponse(tool_calls=[second]),
             ModelResponse(tool_calls=[call("verify-1", "run_verification", {"check_id": "tests"})]),
             ModelResponse(content="Both planned changes are verified."),
@@ -1636,11 +1710,19 @@ def test_reused_completed_plan_edit_forces_decision_for_next_file() -> None:
         "edit_file",
         "run_verification",
     ]
-    assert model.requests[2]["options"].required_tool == "record_decision"
+    assert model.requests[2]["options"] is None
     assert any(
         '"step_id":"edit-config"' in str(message.get("content"))
         for message in model.requests[2]["messages"]
     )
+    checkpoints = [
+        message
+        for message in model.requests[2]["messages"]
+        if message.get("role") == "system"
+        and "Provider protocol checkpoint" in str(message.get("content"))
+    ]
+    assert any("app.py" in message["content"] for message in checkpoints)
+    assert any("already applied" in message["content"] for message in checkpoints)
 
 
 def test_stale_edit_snapshot_is_refreshed_without_consuming_repetition_budget() -> None:

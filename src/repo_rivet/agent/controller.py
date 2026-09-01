@@ -3284,12 +3284,18 @@ class AgentController:
                     and isinstance(repeated_path, str)
                     and repeated_path not in current_step.target_files
                 )
-                if moved_to_different_plan_target and self.reasoning_manager.config.enabled:
-                    # Provider thinking can replay the just-completed edit when consecutive
-                    # plan steps use the same tool name. One forced decision turn makes the
-                    # new target explicit without executing or counting the duplicate edit.
+                if moved_to_different_plan_target:
+                    # The reviewed plan already authorizes its current step. Forcing another
+                    # decision here is both redundant and harmful for providers that cannot
+                    # combine thinking with a named tool choice: they may replay the stale edit
+                    # after thinking is disabled. Checkpoint that stale continuation and let the
+                    # next normal reasoning turn follow the exact current-step contract.
                     state.pending_decision = None
-                    state.required_protocol_tool = "record_decision"
+                    state.required_protocol_tool = None
+                    memory.verification_plan_recovery_decision = None
+                    self._discard_provider_reasoning_for_tool_call(memory, call.id)
+                    state.sanitize_unreplayable_provider_history = True
+                    memory.provider_requires_reasoning_content = True
                 self._append_system_feedback(
                     state,
                     memory,
@@ -3310,8 +3316,9 @@ class AgentController:
                         ),
                         "instruction": (
                             "Do not submit this workspace change again. Continue with the exact "
-                            "current plan step shown above. Record a new decision for that step "
-                            "first when required. If a verification check failed, inspect its "
+                            "current plan step shown above. The user-reviewed plan already "
+                            "authorizes that step, so do not record another decision. If a "
+                            "verification check failed, inspect its "
                             "saved evidence and use a distinct repair; if the registered criteria "
                             "are wrong, replace the verification plan before rerunning the check."
                         ),
@@ -3392,6 +3399,21 @@ class AgentController:
         state.record_protocol_failure(reason)
         self._save_memory(memory, state, status=self._active_memory_status(state))
         return True, None
+
+    @staticmethod
+    def _discard_provider_reasoning_for_tool_call(
+        memory: MemoryState,
+        tool_call_id: str,
+    ) -> None:
+        """Make one stale provider tool turn eligible for factual checkpointing."""
+        for message in reversed(memory.messages):
+            calls = message.tool_calls or []
+            if any(
+                isinstance(raw_call, dict) and raw_call.get("id") == tool_call_id
+                for raw_call in calls
+            ):
+                message.reasoning_content = None
+                return
 
     def _record_suppressed_action(
         self,

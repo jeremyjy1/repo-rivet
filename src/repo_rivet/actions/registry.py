@@ -59,6 +59,17 @@ class ActionRegistry:
             (item for item in reversed(list(runtime.actions.values())) if item.semantic_key == key),
             None,
         )
+        if previous is None and call.name == "edit_file":
+            previous = next(
+                (
+                    item
+                    for item in reversed(list(runtime.actions.values()))
+                    if ActionIdentity.applied_edit_covers(call, item, context=context)
+                ),
+                None,
+            )
+            if previous is not None:
+                return ProposalClassification(DuplicateDisposition.REUSE_RESULT, key, previous)
         if previous is None:
             return ProposalClassification(DuplicateDisposition.EXECUTE_NEW, key)
         if previous.result is not None and not previous.result_delivered_to_model:

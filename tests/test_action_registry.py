@@ -88,3 +88,83 @@ def test_failed_action_requires_an_alternative_not_external_replay() -> None:
 
     assert classification.disposition == DuplicateDisposition.REQUIRE_ALTERNATIVE
     assert classification.previous is record
+
+
+def test_applied_edit_subset_is_reused_while_result_snapshot_is_current() -> None:
+    old_snapshot = "a" * 64
+    new_snapshot = "b" * 64
+    memory = MemoryState(session_id="session")
+    memory.current_snapshots["app.py"] = new_snapshot
+    runtime = AgentRuntimeState.create("session", workspace_revision=1)
+    applied = ToolCall(
+        id="edit-1",
+        name="edit_file",
+        arguments={
+            "path": "app.py",
+            "snapshot_id": old_snapshot,
+            "operations": [
+                {
+                    "op": "replace",
+                    "start_line": 10,
+                    "end_line": 11,
+                    "new_lines": ["first", "second"],
+                }
+            ],
+        },
+    )
+    key = ActionIdentity.build(
+        applied,
+        context=memory,
+        revisions=runtime.revisions,
+        plan_step_id=None,
+    )
+    record = ActionRegistry.build_record(
+        applied,
+        semantic_key=key,
+        revisions=runtime.revisions,
+        plan_step_id=None,
+    )
+    record.status = ActionStatus.SUCCEEDED
+    record.result = ActionResultSnapshot(
+        ok=True,
+        output="edited",
+        metadata={"path": "app.py", "new_snapshot_id": new_snapshot},
+    )
+    record.result_applied = True
+    record.result_delivered_to_model = True
+    runtime.actions[record.action_id] = record
+    repeated_subset = ToolCall(
+        id="edit-2",
+        name="edit_file",
+        arguments={
+            "path": "app.py",
+            "snapshot_id": old_snapshot,
+            "operations": [
+                {
+                    "op": "replace",
+                    "start_line": 11,
+                    "end_line": 11,
+                    "new_lines": ["second"],
+                }
+            ],
+        },
+    )
+
+    classification = ActionRegistry().classify(
+        repeated_subset,
+        runtime=runtime,
+        context=memory,
+        plan_step_id=None,
+    )
+
+    assert classification.disposition == DuplicateDisposition.REUSE_RESULT
+    assert classification.previous is record
+
+    memory.current_snapshots["app.py"] = "c" * 64
+    changed = ActionRegistry().classify(
+        repeated_subset,
+        runtime=runtime,
+        context=memory,
+        plan_step_id=None,
+    )
+    assert changed.disposition == DuplicateDisposition.EXECUTE_NEW
