@@ -122,11 +122,7 @@ class ReadToolOutputTool(BaseTool[ReadToolOutputArguments]):
             store = self.child_store
             memory = self.child_memory
         observation = next(
-            (
-                event
-                for event in memory.observation_events
-                if event.event_id == reference
-            ),
+            (event for event in memory.observation_events if event.event_id == reference),
             None,
         )
         if observation is None:

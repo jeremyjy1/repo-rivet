@@ -110,9 +110,7 @@ def controller(
 def test_mutating_tool_without_decision_is_rejected_before_executor() -> None:
     first = ToolCall(id="command-1", name="run_command", arguments={"command": "true"})
     retry = ToolCall(id="command-2", name="run_command", arguments={"command": "true"})
-    tools = FakeToolRegistry(
-        [ToolResult(ok=True, output="passed", metadata={"exit_code": 0})]
-    )
+    tools = FakeToolRegistry([ToolResult(ok=True, output="passed", metadata={"exit_code": 0})])
     agent, memory = controller(
         [
             ModelResponse(tool_calls=[first]),
@@ -129,9 +127,7 @@ def test_mutating_tool_without_decision_is_rejected_before_executor() -> None:
     assert tools.calls == [retry]
     assert len(memory.observation_events) == 1
     tool_payload = next(
-        message.content or ""
-        for message in memory.messages
-        if message.tool_call_id == "command-1"
+        message.content or "" for message in memory.messages if message.tool_call_id == "command-1"
     )
     assert "decision_validation_failed" in tool_payload
 

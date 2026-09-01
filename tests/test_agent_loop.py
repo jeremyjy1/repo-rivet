@@ -535,9 +535,7 @@ def test_failed_automatic_verification_requires_repair_before_same_revision_retr
         for message in model.requests[3]["messages"]
         if message.get("role") == "tool" and message.get("tool_call_id") == "repeat"
     )
-    assert "already failed at the unchanged workspace revision" in str(
-        blocked.get("content")
-    )
+    assert "already failed at the unchanged workspace revision" in str(blocked.get("content"))
     assert any(
         event_type == "verification_repair_required" and data.get("check_id") == "tests"
         for event_type, data in events.events
@@ -1535,9 +1533,7 @@ def test_reused_workspace_edit_tells_model_to_choose_a_distinct_action() -> None
     assert result.status == "success"
     assert [item.name for item in tools.calls] == ["write_file", "run_verification"]
     duplicate_result = next(
-        message.content or ""
-        for message in memory.messages
-        if message.tool_call_id == "write-2"
+        message.content or "" for message in memory.messages if message.tool_call_id == "write-2"
     )
     assert "already applied" in duplicate_result
     assert "Do not repeat the edit" in duplicate_result
@@ -1604,9 +1600,7 @@ def test_reused_completed_plan_edit_forces_decision_for_next_file() -> None:
             ModelResponse(tool_calls=[duplicate]),
             ModelResponse(tool_calls=[decision("d2", "edit_file")]),
             ModelResponse(tool_calls=[second]),
-            ModelResponse(
-                tool_calls=[call("verify-1", "run_verification", {"check_id": "tests"})]
-            ),
+            ModelResponse(tool_calls=[call("verify-1", "run_verification", {"check_id": "tests"})]),
             ModelResponse(content="Both planned changes are verified."),
         ]
     )

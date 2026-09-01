@@ -3969,8 +3969,7 @@ class AgentController:
             and action.status == ActionStatus.FAILED
             and action.revisions.workspace == state.workspace_revision
             and isinstance(action.normalized_arguments.get("command"), str)
-            and " ".join(str(action.normalized_arguments["command"]).split())
-            in normalized_summary
+            and " ".join(str(action.normalized_arguments["command"]).split()) in normalized_summary
             for action in state.runtime.actions.values()
         )
 

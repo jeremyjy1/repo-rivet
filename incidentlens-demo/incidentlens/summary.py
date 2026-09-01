@@ -28,9 +28,7 @@ def render_markdown(summary: dict[str, object]) -> str:
     slow_services = summary["slow_services"]
     assert isinstance(by_level, dict)
     assert isinstance(slow_services, list)
-    level_rows = "\n".join(
-        f"| {level} | {count} |" for level, count in by_level.items()
-    )
+    level_rows = "\n".join(f"| {level} | {count} |" for level, count in by_level.items())
     services = ", ".join(str(item) for item in slow_services) or "none"
     return (
         "# Incident Summary\n\n"
