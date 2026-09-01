@@ -1,0 +1,4 @@
+2026-08-31T10:00:00Z|checkout|INFO|120|request accepted
+2026-08-31T10:00:01Z|payments|error|1450|gateway timeout
+2026-08-31T10:00:02Z|checkout|WARN|900|retry scheduled
+2026-08-31T10:00:03Z|search|ERROR|1800|index unavailable

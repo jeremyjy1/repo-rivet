@@ -4,6 +4,7 @@ from typing import cast
 
 import pytest
 
+from repo_rivet.actions.models import ActionStatus
 from repo_rivet.agent.controller import AgentController
 from repo_rivet.approval.engine import ApprovalEngine
 from repo_rivet.approval.grant_store import ApprovalGrantStore
@@ -107,20 +108,30 @@ def controller(
 
 
 def test_mutating_tool_without_decision_is_rejected_before_executor() -> None:
-    write = ToolCall(id="write-1", name="write_file", arguments={"path": "app.py"})
-    tools = FakeToolRegistry([])
+    first = ToolCall(id="command-1", name="run_command", arguments={"command": "true"})
+    retry = ToolCall(id="command-2", name="run_command", arguments={"command": "true"})
+    tools = FakeToolRegistry(
+        [ToolResult(ok=True, output="passed", metadata={"exit_code": 0})]
+    )
     agent, memory = controller(
-        [ModelResponse(tool_calls=[write]), ModelResponse(content="No change was made.")],
+        [
+            ModelResponse(tool_calls=[first]),
+            ModelResponse(tool_calls=[decision("command-decision", "run_command")]),
+            ModelResponse(tool_calls=[retry]),
+            ModelResponse(content="The command completed."),
+        ],
         tools,
     )
 
-    result = agent.run("change app.py", memory=memory)
+    result = agent.run("run the command", memory=memory)
 
     assert result.status == "success"
-    assert tools.calls == []
-    assert memory.observation_events == []
+    assert tools.calls == [retry]
+    assert len(memory.observation_events) == 1
     tool_payload = next(
-        message.content or "" for message in memory.messages if message.tool_call_id == "write-1"
+        message.content or ""
+        for message in memory.messages
+        if message.tool_call_id == "command-1"
     )
     assert "decision_validation_failed" in tool_payload
 
@@ -556,8 +567,40 @@ def test_cross_turn_decision_is_one_shot_and_must_match() -> None:
         for message in memory.messages
         if message.tool_call_id == "write-mismatch"
     )
-    assert "Decision declared run_command" in mismatch_payload
+    assert "immediately required tool is run_command" in mismatch_payload
     assert all(event.tool_call_id != "write-mismatch" for event in memory.observation_events)
+
+
+def test_pending_decision_rejects_repeated_decision_without_losing_action_authority() -> None:
+    action = ToolCall(
+        id="command-required",
+        name="run_command",
+        arguments={"command": "python -m pytest -q"},
+    )
+    tools = FakeToolRegistry([ToolResult(ok=True, output="passed", metadata={"exit_code": 0})])
+    first_decision = decision("decision-first", "run_command")
+    repeated_decision = decision("decision-repeated", "run_command")
+    agent, memory = controller(
+        [
+            ModelResponse(tool_calls=[first_decision]),
+            ModelResponse(tool_calls=[repeated_decision]),
+            ModelResponse(tool_calls=[action]),
+            ModelResponse(content="The command completed successfully."),
+        ],
+        tools,
+    )
+
+    result = agent.run("verify", memory=memory)
+
+    assert result.status == "success"
+    assert tools.calls == [action]
+    assert len(memory.reasoning_events) == 1
+    repeated_payload = next(
+        message.content or ""
+        for message in memory.messages
+        if message.tool_call_id == "decision-repeated"
+    )
+    assert "immediately required tool is run_command" in repeated_payload
 
 
 def test_reasoning_manager_bounds_history_compacts_decisions_and_redacts_secrets() -> None:
@@ -823,7 +866,7 @@ def test_failed_action_blocks_identical_replay_but_allows_distinct_recovery() ->
     blocked_payload = next(
         message.content or "" for message in memory.messages if message.tool_call_id == "command-2"
     )
-    assert "recovery state forbids repeating" in blocked_payload
+    assert "exact command already failed" in blocked_payload
 
 
 def test_task_decision_cannot_bypass_independent_human_approval(tmp_path: Path) -> None:
@@ -869,4 +912,8 @@ def test_task_decision_cannot_bypass_independent_human_approval(tmp_path: Path) 
     )
     assert not write_observation.ok
     assert memory.runtime is not None
-    assert memory.runtime.recovery is not None
+    assert memory.runtime.recovery is None
+    write_action = next(
+        action for action in memory.runtime.actions.values() if action.tool_call_id == "write-1"
+    )
+    assert write_action.status == ActionStatus.CANCELLED

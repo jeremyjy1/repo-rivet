@@ -50,7 +50,11 @@ _ACTION_TRANSITIONS: dict[ActionStatus, set[ActionStatus]] = {
     ActionStatus.DISPATCHED: {ActionStatus.RUNNING, ActionStatus.OBSERVED},
     ActionStatus.RUNNING: {ActionStatus.OBSERVED, ActionStatus.INTERRUPTED_UNKNOWN},
     ActionStatus.OBSERVED: {ActionStatus.PREPARED, ActionStatus.APPLIED},
-    ActionStatus.APPLIED: {ActionStatus.SUCCEEDED, ActionStatus.FAILED},
+    ActionStatus.APPLIED: {
+        ActionStatus.SUCCEEDED,
+        ActionStatus.FAILED,
+        ActionStatus.CANCELLED,
+    },
 }
 
 
@@ -226,11 +230,19 @@ def reduce(state: AgentRuntimeState, event: DomainEvent) -> AgentRuntimeState:
         semantic_key = event.payload.get("semantic_key")
         if isinstance(semantic_key, str) and semantic_key:
             action.semantic_key = semantic_key
+        execution_attempted = bool(event.payload.get("execution_attempted", True))
         succeeded = bool(event.payload.get("succeeded"))
-        _transition_action(
-            action,
-            ActionStatus.SUCCEEDED if succeeded else ActionStatus.FAILED,
-        )
+        if not execution_attempted:
+            _transition_action(action, ActionStatus.CANCELLED)
+            # Argument, policy, or precondition rejection happened before the external
+            # effect. A corrected proposal is safe to classify again and must not poison
+            # the failed-action recovery state.
+            action.retryable = True
+        else:
+            _transition_action(
+                action,
+                ActionStatus.SUCCEEDED if succeeded else ActionStatus.FAILED,
+            )
         value.pending_observation_ids = [
             item for item in value.pending_observation_ids if item != action.result_event_id
         ]

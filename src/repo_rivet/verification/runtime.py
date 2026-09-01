@@ -196,6 +196,16 @@ class VerificationRuntime:
         self.path_policy.resolve(check.command.cwd)
         for artifact in check.criteria.required_artifacts:
             self.path_policy.resolve(artifact)
+        if (
+            check.required
+            and check.kind in {VerificationKind.TEST, VerificationKind.BUILD}
+            and 0 not in check.criteria.expected_exit_codes
+        ):
+            raise ValueError(
+                f"required {check.kind.value} check {check.check_id} must accept exit code 0; "
+                "record an expected pre-repair failure with run_command or mark that check "
+                "non-required"
+            )
         if check.kind in {VerificationKind.BEHAVIOR, VerificationKind.CUSTOM} and not (
             check.criteria.has_output_oracle or check.criteria.required_artifacts
         ):

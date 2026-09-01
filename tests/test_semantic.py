@@ -372,6 +372,10 @@ def test_semantic_tool_is_read_only_and_available_while_planning(tmp_path: Path)
         schema for schema in registry.schemas() if schema["function"]["name"] == "semantic_query"
     )
     assert "Compiler diagnostics" in tool["function"]["description"]
+    assert "Do not pass query to definition or references" in tool["function"]["description"]
+    properties = tool["function"]["parameters"]["properties"]
+    assert "used only by workspace_symbols" in properties["query"]["description"]
+    assert "Exact symbol name" in properties["symbol"]["description"]
 
 
 def test_semantic_tool_returns_compact_context_without_unrelated_snapshots(

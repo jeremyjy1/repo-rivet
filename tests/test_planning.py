@@ -6,6 +6,8 @@ import pytest
 from pydantic import SecretStr
 
 from repo_rivet.agent.controller import AgentController
+from repo_rivet.agent.runtime import AgentRuntimeState
+from repo_rivet.agent.state import SessionState
 from repo_rivet.agent.termination import TerminationConfig, TerminationPolicy
 from repo_rivet.config import ApiConfig
 from repo_rivet.editing.document import TextDocument
@@ -601,6 +603,53 @@ def test_controller_normalizes_exact_verify_command_to_registered_check(tmp_path
     assert normalized["normalized_tool"] == "run_verification"
     assert normalized["check_id"] == "tests"
     assert not any(name == "action_blocked" for name, _ in events.events)
+
+
+def test_controller_normalizes_registered_check_without_implementation_plan(
+    tmp_path: Path,
+) -> None:
+    memory = MemoryState(session_id="verification-alias")
+    registry = create_default_registry(tmp_path)
+    registry.verification_runtime.bind(memory)
+    plan = registry.verification_runtime.register_plan(
+        {
+            "requirements": ["tests"],
+            "checks": [
+                {
+                    "check_id": "tests",
+                    "title": "Exact registered command",
+                    "kind": "test",
+                    "command": {"program": "true", "args": [], "cwd": "."},
+                    "criteria": {"expected_exit_codes": [0]},
+                    "required": True,
+                    "provenance": "model",
+                }
+            ],
+        }
+    )
+    state = SessionState(
+        task="verify",
+        runtime=AgentRuntimeState.create("verification-alias"),
+        verification_plan=plan,
+        required_protocol_tool="run_command",
+    )
+    agent = AgentController(
+        model_client=FakeModelClient([]),
+        tool_registry=registry,
+    )
+
+    normalized = agent._normalize_registered_verification_action(
+        ToolCall(
+            id="verify-as-command",
+            name="run_command",
+            arguments={"command": "true", "cwd": "."},
+        ),
+        state=state,
+    )
+
+    assert normalized.name == "run_verification"
+    assert normalized.arguments == {"check_id": "tests"}
+    assert state.required_protocol_tool == "run_verification"
 
 
 def test_execute_plan_keeps_stable_capability_envelope_for_controller_validation(

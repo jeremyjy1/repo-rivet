@@ -196,6 +196,7 @@ def test_events_distinguish_unexecuted_rejections_from_real_failures() -> None:
     model = FakeModelClient(
         [
             ModelResponse(tool_calls=[rejected]),
+            ModelResponse(tool_calls=[decision("inspect-decision", "read_file")]),
             ModelResponse(tool_calls=[failed_read]),
             ModelResponse(content="The requested operations did not change the workspace."),
         ]
@@ -478,7 +479,11 @@ def test_agent_automatically_runs_registered_checks_before_finishing() -> None:
     )
     tools = FakeToolRegistry(
         [
-            ToolResult(ok=True, output="written"),
+            ToolResult(
+                ok=True,
+                output="written",
+                metadata={"path": "app.py", "snapshot_id": "snapshot-app"},
+            ),
             passed_verification_result(),
         ]
     )
@@ -495,12 +500,16 @@ def test_agent_automatically_runs_registered_checks_before_finishing() -> None:
 
 def test_failed_automatic_verification_requires_repair_before_same_revision_retry() -> None:
     write = call("write", "write_file", {"path": "app.py", "content": "new"})
-    repeated_check = call("repeat", "run_verification", {"check_id": "tests"})
+    repeated_decision = decision("repeat", "run_verification")
+    inspect_decision = decision("inspect-decision", "read_file")
+    inspect = call("inspect", "read_file", {"path": "app.py"})
     model = FakeModelClient(
         [
             ModelResponse(tool_calls=[verification_plan(), decision("d1", "write_file"), write]),
             ModelResponse(content="Implementation is ready for verification."),
-            ModelResponse(tool_calls=[repeated_check]),
+            ModelResponse(tool_calls=[repeated_decision]),
+            ModelResponse(tool_calls=[inspect_decision]),
+            ModelResponse(tool_calls=[inspect]),
             ModelResponse(content="The failing test requires a source repair first."),
         ]
     )
@@ -508,6 +517,7 @@ def test_failed_automatic_verification_requires_repair_before_same_revision_retr
         [
             ToolResult(ok=True, output="written"),
             failed_verification_result(),
+            ToolResult(ok=True, output="source"),
         ]
     )
     events = RecordingSink()
@@ -515,13 +525,19 @@ def test_failed_automatic_verification_requires_repair_before_same_revision_retr
     result = controller(model, tools, event_logger=events).run("fix the bug")
 
     assert result.status == "incomplete"
-    assert [item.name for item in tools.calls] == ["write_file", "run_verification"]
+    assert [item.name for item in tools.calls] == [
+        "write_file",
+        "run_verification",
+        "read_file",
+    ]
     blocked = next(
         message
         for message in model.requests[3]["messages"]
         if message.get("role") == "tool" and message.get("tool_call_id") == "repeat"
     )
-    assert "Do not rerun it before a relevant workspace change" in str(blocked.get("content"))
+    assert "already failed at the unchanged workspace revision" in str(
+        blocked.get("content")
+    )
     assert any(
         event_type == "verification_repair_required" and data.get("check_id") == "tests"
         for event_type, data in events.events
@@ -530,6 +546,92 @@ def test_failed_automatic_verification_requires_repair_before_same_revision_retr
         "verification_failed" in str(message.get("content"))
         for message in model.requests[2]["messages"]
     )
+
+
+def test_new_verification_plan_does_not_replay_an_observed_failed_command() -> None:
+    raw_check = call(
+        "raw-check",
+        "run_command",
+        {"command": "python -m pytest -q", "cwd": "."},
+    )
+    replay = call(
+        "replay-check",
+        "run_command",
+        {"command": "python -m pytest -q", "cwd": "."},
+    )
+    reflection = call(
+        "failure-reflection",
+        "record_decision",
+        {
+            "phase": "reflection",
+            "current_goal": "Repair the observed test failure",
+            "summary": "The unchanged test command already failed; repair the source first.",
+            "evidence_refs": [],
+            "confidence": 0.9,
+        },
+    )
+    repeated_decision = call(
+        "repeat-run-decision",
+        "record_decision",
+        {
+            "phase": "decision",
+            "current_goal": "Reproduce the failure",
+            "summary": "Run the same test command again.",
+            "next_tool": "run_command",
+            "next_tool_argument_summary": "python -m pytest -q",
+            "expected_result": "The already observed failure repeats",
+            "confidence": 0.8,
+        },
+    )
+    write = call("repair", "write_file", {"path": "app.py", "content": "fixed"})
+    model = FakeModelClient(
+        [
+            ModelResponse(tool_calls=[decision("run-decision", "run_command"), raw_check]),
+            ModelResponse(tool_calls=[repeated_decision]),
+            ModelResponse(tool_calls=[verification_plan()]),
+            ModelResponse(tool_calls=[replay]),
+            ModelResponse(tool_calls=[reflection]),
+            ModelResponse(tool_calls=[decision("repair-decision", "write_file"), write]),
+            ModelResponse(content="The source is repaired and the tests pass."),
+        ]
+    )
+    tools = FakeToolRegistry(
+        [
+            ToolResult(
+                ok=True,
+                output="1 failed",
+                metadata={"exit_code": 1},
+            ),
+            ToolResult(
+                ok=True,
+                output="written",
+                metadata={"path": "app.py", "snapshot_id": "snapshot-fixed"},
+            ),
+            passed_verification_result(),
+        ]
+    )
+    memory = MemoryState(session_id="pre-repair-verification")
+
+    result = controller(model, tools).run("fix the failing test", memory=memory)
+
+    assert result.status == "success"
+    assert [item.name for item in tools.calls] == [
+        "run_command",
+        "write_file",
+        "run_verification",
+    ]
+    replay_result = next(
+        message.content or ""
+        for message in memory.messages
+        if message.tool_call_id == "replay-check"
+    )
+    assert "exact command already failed" in replay_result
+    repeated_decision_result = next(
+        message.content or ""
+        for message in memory.messages
+        if message.tool_call_id == "repeat-run-decision"
+    )
+    assert "failure has been reproduced" in repeated_decision_result
 
 
 def test_started_verification_runs_remaining_required_checks_without_model_round_trips() -> None:
@@ -1402,6 +1504,149 @@ def test_successful_command_is_not_executed_twice_at_same_workspace_revision() -
     )
     assert any(name == "action_result_reused" for name, _ in events.events)
     assert {schema["function"]["name"] for schema in model.requests[2]["tools"]} == set()
+
+
+def test_reused_workspace_edit_tells_model_to_choose_a_distinct_action() -> None:
+    first = call("write-1", "write_file", {"path": "app.py", "content": "new"})
+    duplicate = call("write-2", "write_file", {"path": "app.py", "content": "new"})
+    model = FakeModelClient(
+        [
+            ModelResponse(
+                tool_calls=[verification_plan(), decision("decision-1", "write_file"), first]
+            ),
+            ModelResponse(tool_calls=[decision("decision-2", "write_file"), duplicate]),
+            ModelResponse(content="The existing edit is complete."),
+        ]
+    )
+    tools = FakeToolRegistry(
+        [
+            ToolResult(
+                ok=True,
+                output="written",
+                metadata={"path": "app.py", "snapshot_id": "snapshot-app"},
+            ),
+            passed_verification_result(),
+        ]
+    )
+    memory = MemoryState(session_id="reused-workspace-edit")
+
+    result = controller(model, tools).run("fix the bug", memory=memory)
+
+    assert result.status == "success"
+    assert [item.name for item in tools.calls] == ["write_file", "run_verification"]
+    duplicate_result = next(
+        message.content or ""
+        for message in memory.messages
+        if message.tool_call_id == "write-2"
+    )
+    assert "already applied" in duplicate_result
+    assert "Do not repeat the edit" in duplicate_result
+    assert any(
+        "workspace_change_already_applied" in str(message.get("content"))
+        for message in model.requests[2]["messages"]
+    )
+
+
+def test_reused_completed_plan_edit_forces_decision_for_next_file() -> None:
+    memory = MemoryState(session_id="planned-reused-edit")
+    memory.workflow_mode = WorkflowMode.EXECUTE
+    memory.plan_artifact = PlanArtifact.model_validate(
+        {
+            "goal": "Update two files and verify them",
+            "evidence_refs": ["obs-app", "obs-config"],
+            "steps": [
+                {
+                    "step_id": "edit-app",
+                    "title": "Edit app",
+                    "intent": "Apply the first change",
+                    "evidence_refs": ["obs-app"],
+                    "operation": "edit",
+                    "target_files": ["app.py"],
+                    "risk": "low",
+                },
+                {
+                    "step_id": "edit-config",
+                    "title": "Edit config",
+                    "intent": "Apply the second change",
+                    "evidence_refs": ["obs-config"],
+                    "operation": "edit",
+                    "target_files": ["config.py"],
+                    "risk": "low",
+                },
+                {
+                    "step_id": "verify-tests",
+                    "title": "Run tests",
+                    "intent": "Verify both changes",
+                    "evidence_refs": ["obs-app", "obs-config"],
+                    "operation": "verify",
+                    "verification_ids": ["tests"],
+                    "risk": "low",
+                },
+            ],
+            "verification": [
+                {
+                    "check_id": "tests",
+                    "title": "Run tests",
+                    "success_criteria": "The test command exits successfully",
+                }
+            ],
+            "plan_id": "plan-two-files",
+            "status": PlanStatus.EXECUTING,
+            "workspace_revision": 0,
+        }
+    )
+    first = call("edit-app-1", "edit_file", {"path": "app.py", "operations": []})
+    duplicate = call("edit-app-2", "edit_file", {"path": "app.py", "operations": []})
+    second = call("edit-config-1", "edit_file", {"path": "config.py", "operations": []})
+    model = FakeModelClient(
+        [
+            ModelResponse(tool_calls=[verification_plan(), decision("d1", "edit_file"), first]),
+            ModelResponse(tool_calls=[duplicate]),
+            ModelResponse(tool_calls=[decision("d2", "edit_file")]),
+            ModelResponse(tool_calls=[second]),
+            ModelResponse(
+                tool_calls=[call("verify-1", "run_verification", {"check_id": "tests"})]
+            ),
+            ModelResponse(content="Both planned changes are verified."),
+        ]
+    )
+    tools = FakeToolRegistry(
+        [
+            ToolResult(
+                ok=True,
+                output="edited app",
+                metadata={
+                    "path": "app.py",
+                    "workspace_revision": 1,
+                    "snapshot_id": "snapshot-app",
+                },
+            ),
+            ToolResult(
+                ok=True,
+                output="edited config",
+                metadata={
+                    "path": "config.py",
+                    "workspace_revision": 2,
+                    "snapshot_id": "snapshot-config",
+                },
+            ),
+            passed_verification_result(check_id="tests", revision=2),
+        ]
+    )
+
+    result = controller(model, tools).run("execute the approved plan", memory=memory)
+
+    assert result.status == "success", result.reason
+    assert [item.name for item in tools.calls] == [
+        "edit_file",
+        "edit_file",
+        "run_verification",
+    ]
+    assert model.requests[2]["options"].required_tool == "record_decision"
+    assert any(
+        '"step_id":"edit-config"' in str(message.get("content"))
+        for message in model.requests[2]["messages"]
+    )
 
 
 def test_stale_edit_snapshot_is_refreshed_without_consuming_repetition_budget() -> None:

@@ -124,6 +124,50 @@ def test_action_lifecycle_persists_approval_execution_and_observation() -> None:
     assert_state_invariants(kernel.state)
 
 
+def test_unexecuted_observation_cancels_action_without_entering_failed_state() -> None:
+    kernel = RuntimeKernel(AgentRuntimeState.create("session"))
+    kernel.dispatch(
+        DomainEventKind.RUN_ACTIVATED,
+        payload={"phase": WorkflowPhase.DECIDING.value},
+    )
+    record = action(kernel.state)
+    kernel.dispatch(
+        DomainEventKind.ACTION_PROPOSED,
+        correlation_id=record.action_id,
+        payload={"action": record.model_dump(mode="json")},
+    )
+    kernel.dispatch(DomainEventKind.ACTION_PREPARED, correlation_id=record.action_id)
+    kernel.dispatch(
+        DomainEventKind.ACTION_OBSERVED,
+        correlation_id=record.action_id,
+        payload={
+            "result": ActionResultSnapshot(
+                ok=False,
+                output="",
+                error="invalid arguments",
+                metadata={"execution_attempted": False},
+            ).model_dump(mode="json")
+        },
+    )
+    kernel.dispatch(
+        DomainEventKind.OBSERVATION_APPLIED,
+        correlation_id=record.action_id,
+        payload={
+            "succeeded": False,
+            "execution_attempted": False,
+            "workspace_revision": 0,
+            "next_phase": WorkflowPhase.DECIDING.value,
+        },
+    )
+
+    cancelled = kernel.state.actions[record.action_id]
+    assert cancelled.status == ActionStatus.CANCELLED
+    assert cancelled.retryable
+    assert kernel.state.phase == WorkflowPhase.DECIDING
+    assert kernel.state.current_action_id is None
+    assert_state_invariants(kernel.state)
+
+
 def test_delegation_dispatch_uses_subagent_result_wait_state() -> None:
     kernel = RuntimeKernel(AgentRuntimeState.create("session"))
     kernel.dispatch(

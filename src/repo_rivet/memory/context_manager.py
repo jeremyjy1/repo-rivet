@@ -28,7 +28,8 @@ directory-creation step or repeat a create target.
 Use delete_path for deletions. It can delete files, symlinks, and empty directories; set
 recursive=true only when intentionally deleting a non-empty directory. Never use a shell delete
 command. Inspect targets first, and never delete the workspace root or repository metadata.
-Treat command failures as observations, diagnose them, and continue when possible.
+Use workspace-relative paths ("." is root), never absolute paths. Treat expected pre-repair
+command failures as evidence; do not rerun them unchanged or use them as final verification.
 If a tool request is denied, do not repeat the same request; choose a safer alternative or stop.
 When request_plan is available and the task has uncertain, multi-file, architectural, migration,
 or recovery scope, call request_plan before any state-changing action. Use it as the only operation

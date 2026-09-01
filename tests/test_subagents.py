@@ -250,6 +250,44 @@ def test_parent_evidence_readers_only_expose_explicit_delegated_facts(tmp_path: 
     assert "not delegated" in str(denied.error)
 
 
+def test_child_can_reopen_its_own_persisted_observation(tmp_path: Path) -> None:
+    parent_store = MemoryStore(tmp_path / "parent-session")
+    parent_memory = MemoryState(session_id="parent")
+    child_store = MemoryStore(tmp_path / "child-session")
+    child_memory = MemoryState(session_id="child")
+    output_ref = child_store.save_tool_output(
+        ToolCall(id="read-1", name="read_file", arguments={"path": "tests/test_app.py"}),
+        ToolResult(ok=True, output="summary", raw_output="full child file contents"),
+        step=1,
+    )
+    assert output_ref is not None
+    child_memory.observation_events.append(
+        ObservationEvent(
+            event_id="obs-child-read",
+            session_id="child",
+            step=1,
+            tool_call_id="read-1",
+            tool_name="read_file",
+            ok=True,
+            result_summary="Read tests/test_app.py.",
+            output_ref=output_ref,
+        )
+    )
+
+    tool = ReadToolOutputTool(
+        parent_store,
+        parent_memory,
+        [],
+        child_store=child_store,
+        child_memory=child_memory,
+    )
+
+    result = tool.execute({"evidence_ref": "obs-child-read"})
+
+    assert result.ok
+    assert result.output == "full child file contents"
+
+
 def test_scoped_path_policy_rejects_files_outside_delegation(tmp_path: Path) -> None:
     (tmp_path / "src").mkdir()
     (tmp_path / "tests").mkdir()

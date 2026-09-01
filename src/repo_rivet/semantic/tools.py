@@ -13,11 +13,13 @@ from repo_rivet.tools.base import BaseTool, ToolResult
 class SemanticQueryTool(BaseTool[SemanticQueryArguments]):
     name = "semantic_query"
     description = (
-        "Query the snapshot-bound lightweight code index. Supports file symbols, workspace "
-        "symbols, ranked definition candidates, syntax-filtered reference candidates, and "
-        "Tree-sitter syntax diagnostics for C/C++, Python, JavaScript, and TypeScript. Results "
-        "include confidence and warnings; low-confidence candidates are navigation evidence, "
-        "not permission to edit. Compiler diagnostics still require registered verification."
+        "Query the snapshot-bound lightweight code index. Argument forms: "
+        "symbols requires path; workspace_symbols requires query (or symbol); definition and "
+        "references require symbol, or path+line+column; diagnostics accepts an optional path. "
+        "Do not pass query to definition or references. Supports C/C++, Python, JavaScript, and "
+        "TypeScript. Results include confidence and warnings; low-confidence candidates are "
+        "navigation evidence, not permission to edit. Compiler diagnostics still require "
+        "registered verification."
     )
     arguments_type = SemanticQueryArguments
     capabilities = frozenset({Capability.FILESYSTEM_READ})

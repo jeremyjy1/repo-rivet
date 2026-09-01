@@ -166,12 +166,44 @@ class SemanticLocation(BaseModel):
 class SemanticQueryArguments(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    action: SemanticAction
-    path: str | None = None
-    line: int | None = Field(default=None, ge=1)
-    column: int | None = Field(default=None, ge=1)
-    symbol: str | None = Field(default=None, min_length=1, max_length=200)
-    query: str | None = Field(default=None, min_length=1, max_length=200)
+    action: SemanticAction = Field(
+        description=(
+            "symbols lists one file; workspace_symbols searches names; definition and "
+            "references resolve a symbol or source position; diagnostics checks syntax"
+        )
+    )
+    path: str | None = Field(
+        default=None,
+        description=(
+            "Workspace-relative file. Required for symbols and for position-based definition "
+            "or references; optional for diagnostics."
+        ),
+    )
+    line: int | None = Field(
+        default=None,
+        ge=1,
+        description="One-based source line; use together with path and column.",
+    )
+    column: int | None = Field(
+        default=None,
+        ge=1,
+        description="One-based source column; use together with path and line.",
+    )
+    symbol: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=200,
+        description=(
+            "Exact symbol name for definition or references. This is the non-positional "
+            "alternative to path+line+column."
+        ),
+    )
+    query: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=200,
+        description="Name fragment used only by workspace_symbols.",
+    )
     precision: QueryPrecision = QueryPrecision.AUTO
 
     @model_validator(mode="after")

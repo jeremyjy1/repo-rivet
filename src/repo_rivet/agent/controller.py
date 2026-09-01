@@ -1549,7 +1549,73 @@ class AgentController:
             )
             return None
 
-        calls = [self._normalize_registered_plan_action(call, state=state) for call in calls]
+        calls = [
+            self._normalize_registered_verification_action(call, state=state) for call in calls
+        ]
+
+        required_protocol_tool = self._required_model_tool(state)
+        verification_recovery_controls_tool = required_protocol_tool == (
+            "register_verification"
+        ) and (
+            state.verification_plan_revision_required
+            or state.verification_plan_recovery_attempts > 0
+            and state.verification_plan is None
+        )
+        if (
+            required_protocol_tool is not None
+            and not verification_recovery_controls_tool
+            and not any(call.name == required_protocol_tool for call in calls)
+        ):
+            error_code = (
+                "verification_plan_missing"
+                if required_protocol_tool == "register_verification"
+                and state.verification_plan is None
+                else "required_tool_mismatch"
+            )
+            error = (
+                f"The immediately required tool is {required_protocol_tool}; the returned "
+                "tools were not executed. Do not repeat or replace the pending decision."
+            )
+            for call in calls:
+                self._log(
+                    "tool_call",
+                    step=state.step_count,
+                    tool_call_id=call.id,
+                    name=call.name,
+                    arguments=call.arguments,
+                )
+                result = ToolResult(
+                    ok=False,
+                    output="",
+                    error=error,
+                    error_code=error_code,
+                    retryable=True,
+                    metadata={"execution_attempted": False},
+                )
+                if call.name in {
+                    "record_decision",
+                    "register_verification",
+                    "submit_plan",
+                    "update_plan",
+                }:
+                    self._record_meta_result(call, result, state=state, memory=memory)
+                else:
+                    self._record_blocked_action(call, result, state=state, memory=memory)
+            state.record_protocol_failure(error)
+            self._append_system_feedback(
+                state,
+                memory,
+                {
+                    "error": error_code,
+                    "required_next_action": required_protocol_tool,
+                    "instruction": (
+                        f"Call {required_protocol_tool} now as the only primary action. The "
+                        "previous decision remains valid and must not be recorded again."
+                    ),
+                },
+            )
+            self._save_memory(memory, state, status=self._active_memory_status(state))
+            return self._check_termination(state=state, memory=memory)
 
         request_plan_calls = [call for call in calls if call.name == "request_plan"]
         if request_plan_calls:
@@ -1714,6 +1780,15 @@ class AgentController:
         elif reasoning_calls:
             if not self.reasoning_manager.config.enabled:
                 reasoning_error = "Structured decision recording is disabled for this runtime."
+            elif self._decision_repeats_failed_execution(
+                reasoning_calls[0],
+                state=state,
+            ):
+                reasoning_error = (
+                    "The decision repeats a command or verification that already failed at "
+                    "the unchanged workspace revision. The failure has been reproduced; "
+                    "choose a read-only inspection or a repair action instead."
+                )
             else:
                 try:
                     reasoning_event = self.reasoning_manager.record(
@@ -1829,6 +1904,7 @@ class AgentController:
         plan_step_violation_call: ToolCall | None = None
         multiple_primary_actions = False
         multiple_mutating_actions = False
+        decision_protocol_error = False
         structured_tool_recovery_violation = False
         verification_plan_missing_for_file_change = False
         unchanged_verification_retry: VerificationResult | None = None
@@ -1898,16 +1974,25 @@ class AgentController:
                 ):
                     break
                 unchanged_verification_retry = self._unchanged_failed_verification(call, state)
-                if unchanged_verification_retry is None:
+                if unchanged_verification_retry is not None:
+                    check_id = unchanged_verification_retry.check_id
+                    validation_error = (
+                        f"Verification check {check_id} already "
+                        f"{unchanged_verification_retry.status.value} at workspace revision "
+                        f"{state.workspace_revision}. Do not rerun it before relevant workspace "
+                        "changes. Inspect the existing failure evidence with read-only tools. If "
+                        "the approved plan has no repair step for the cause, call update_plan "
+                        "alone to add one before editing."
+                    )
+                    break
+                failed_command = self._failed_command_replayed_as_verification(call, state=state)
+                if failed_command is None:
                     continue
-                check_id = unchanged_verification_retry.check_id
                 validation_error = (
-                    f"Verification check {check_id} already "
-                    f"{unchanged_verification_retry.status.value} at workspace revision "
-                    f"{state.workspace_revision}. Do not rerun it before relevant workspace "
-                    "changes. Inspect the existing failure evidence with read-only tools. If "
-                    "the approved plan has no repair step for the cause, call update_plan alone "
-                    "to add one before editing."
+                    f"Verification check {call.arguments.get('check_id')} is the same command "
+                    "that already failed at this workspace revision. Registering the check did "
+                    "not change the workspace. Diagnose and repair the observed failure before "
+                    "running it again."
                 )
                 break
         if validation_error is None and (
@@ -1923,6 +2008,7 @@ class AgentController:
                 )
             except DecisionValidationError as decision_exception:
                 validation_error = str(decision_exception)
+                decision_protocol_error = True
         if (
             validation_error is None
             and state.verification_plan is None
@@ -1937,7 +2023,9 @@ class AgentController:
             )
         if validation_error is not None and not verification_plan_missing_for_file_change:
             state.record_protocol_failure(validation_error)
-        else:
+        elif proposal_classification is None or proposal_classification.disposition == (
+            DuplicateDisposition.EXECUTE_NEW
+        ):
             state.consecutive_protocol_failures = 0
 
         if verification_plan_missing_for_file_change:
@@ -1947,7 +2035,11 @@ class AgentController:
             state.pending_decision = decision_for_validation
             memory.verification_plan_recovery_decision = decision_for_validation
 
-        if multiple_mutating_actions or (multiple_primary_actions and mutating_calls):
+        if (
+            decision_protocol_error
+            or multiple_mutating_actions
+            or (multiple_primary_actions and mutating_calls)
+        ):
             self._arm_action_protocol_recovery(
                 mutating_calls,
                 reasoning_event=reasoning_event,
@@ -2676,7 +2768,7 @@ class AgentController:
             self._save_memory(memory, state, status=self._active_memory_status(state))
         return None
 
-    def _normalize_registered_plan_action(
+    def _normalize_registered_verification_action(
         self,
         call: ToolCall,
         *,
@@ -2684,38 +2776,51 @@ class AgentController:
     ) -> ToolCall:
         """Canonicalize an exact registered check before policy and plan validation."""
         artifact = self.plan_runtime.memory.plan_artifact if self.plan_runtime.memory else None
-        step = artifact.current_step if artifact is not None else None
-        if (
-            artifact is None
-            or artifact.status != PlanStatus.EXECUTING
-            or step is None
-            or step.operation not in {PlanOperation.COMMAND, PlanOperation.VERIFY}
-            or len(step.verification_ids) != 1
-            or call.name != "run_command"
-        ):
+        active_step = (
+            artifact.current_step
+            if artifact is not None and artifact.status == PlanStatus.EXECUTING
+            else None
+        )
+        if call.name != "run_command" or state.verification_plan is None:
             return call
         command = call.arguments.get("command")
         cwd = call.arguments.get("cwd", ".")
-        check_id = step.verification_ids[0]
         if not isinstance(command, str) or not isinstance(cwd, str):
             return call
-        try:
-            matches = self.verification_runtime.command_matches(
-                check_id,
-                command=command,
-                cwd=cwd,
-            )
-        except ValueError:
+        candidate_ids = (
+            list(active_step.verification_ids)
+            if active_step is not None
+            and active_step.operation in {PlanOperation.COMMAND, PlanOperation.VERIFY}
+            and active_step.verification_ids
+            else [check.check_id for check in state.verification_plan.checks]
+        )
+        matching_ids: list[str] = []
+        for check_id in candidate_ids:
+            try:
+                if self.verification_runtime.command_matches(
+                    check_id,
+                    command=command,
+                    cwd=cwd,
+                ):
+                    matching_ids.append(check_id)
+            except ValueError:
+                continue
+        if len(matching_ids) != 1:
             return call
-        if not matches:
-            return call
+        check_id = matching_ids[0]
         normalized = ToolCall(
             id=call.id,
             name="run_verification",
             arguments={"check_id": check_id},
         )
+        if state.required_protocol_tool == "run_command":
+            state.required_protocol_tool = "run_verification"
         self._log(
-            "plan_action_normalized",
+            (
+                "plan_action_normalized"
+                if active_step is not None
+                else "verification_action_normalized"
+            ),
             step=state.step_count,
             tool_call_id=call.id,
             requested_tool=call.name,
@@ -3016,6 +3121,7 @@ class AgentController:
             context=memory,
             revisions=runtime.revisions,
         )
+        execution_attempted = (result.metadata or {}).get("execution_attempted") is not False
         action_succeeded = self._action_succeeded(call, result)
         self._dispatch_runtime_event(
             state,
@@ -3023,12 +3129,13 @@ class AgentController:
             correlation_id=action_id,
             payload={
                 "succeeded": action_succeeded,
+                "execution_attempted": execution_attempted,
                 "new_knowledge": True,
                 "workspace_revision": state.workspace_revision,
                 "semantic_key": semantic_key,
                 "next_phase": (
                     WorkflowPhase.DECIDING.value
-                    if action_succeeded
+                    if action_succeeded or not execution_attempted
                     else WorkflowPhase.RECOVERING.value
                 ),
             },
@@ -3050,7 +3157,7 @@ class AgentController:
                     DomainEventKind.RECOVERY_CLEARED,
                     payload={"phase": WorkflowPhase.DECIDING.value},
                 )
-        else:
+        elif execution_attempted:
             runtime = state.runtime
             assert runtime is not None
             failed = runtime.actions[action_id]
@@ -3118,6 +3225,10 @@ class AgentController:
         ):
             result = previous.result.to_result()
             metadata = dict(result.metadata or {})
+            reused_workspace_mutation = (
+                disposition == DuplicateDisposition.REUSE_RESULT
+                and self.tool_registry.modifies_workspace_files(call.name)
+            )
             metadata.update(
                 {
                     "execution_attempted": False,
@@ -3127,7 +3238,13 @@ class AgentController:
             )
             result = ToolResult(
                 ok=result.ok,
-                output=result.output,
+                output=(
+                    "This exact workspace change was already applied and remains valid. "
+                    "The tool was not executed again. Do not repeat the edit; inspect the "
+                    "current verification evidence and choose a distinct next action."
+                    if reused_workspace_mutation
+                    else result.output
+                ),
                 error=result.error,
                 metadata=metadata,
                 raw_output=result.raw_output,
@@ -3147,6 +3264,59 @@ class AgentController:
                 tool=call.name,
                 disposition=disposition.value,
             )
+            if reused_workspace_mutation:
+                failed_checks = sorted(
+                    result.check_id
+                    for result in state.verification_results.values()
+                    if result.workspace_revision == state.workspace_revision
+                    and result.status in {VerificationStatus.FAILED, VerificationStatus.ERROR}
+                )
+                current_step = (
+                    memory.plan_artifact.current_step
+                    if memory.plan_artifact is not None
+                    and memory.plan_artifact.status == PlanStatus.EXECUTING
+                    else None
+                )
+                repeated_path = call.arguments.get("path")
+                moved_to_different_plan_target = (
+                    current_step is not None
+                    and bool(current_step.target_files)
+                    and isinstance(repeated_path, str)
+                    and repeated_path not in current_step.target_files
+                )
+                if moved_to_different_plan_target and self.reasoning_manager.config.enabled:
+                    # Provider thinking can replay the just-completed edit when consecutive
+                    # plan steps use the same tool name. One forced decision turn makes the
+                    # new target explicit without executing or counting the duplicate edit.
+                    state.pending_decision = None
+                    state.required_protocol_tool = "record_decision"
+                self._append_system_feedback(
+                    state,
+                    memory,
+                    {
+                        "event": "workspace_change_already_applied",
+                        "tool": call.name,
+                        "workspace_revision": state.workspace_revision,
+                        "failed_verification_checks": failed_checks,
+                        "current_plan_step": (
+                            {
+                                "step_id": current_step.step_id,
+                                "operation": current_step.operation.value,
+                                "target_files": current_step.target_files,
+                                "verification_ids": current_step.verification_ids,
+                            }
+                            if current_step is not None
+                            else None
+                        ),
+                        "instruction": (
+                            "Do not submit this workspace change again. Continue with the exact "
+                            "current plan step shown above. Record a new decision for that step "
+                            "first when required. If a verification check failed, inspect its "
+                            "saved evidence and use a distinct repair; if the registered criteria "
+                            "are wrong, replace the verification plan before rerunning the check."
+                        ),
+                    },
+                )
             self._save_memory(memory, state, status=self._active_memory_status(state))
             return True, None
 
@@ -3166,6 +3336,19 @@ class AgentController:
                 "This verification check already failed at the current workspace revision. "
                 "Do not rerun it before a relevant workspace change; inspect its evidence "
                 "and repair the cause."
+            )
+        elif (
+            call.name == "run_command"
+            and previous is not None
+            and previous.status == ActionStatus.FAILED
+            and disposition
+            in {DuplicateDisposition.REQUIRE_ALTERNATIVE, DuplicateDisposition.BLOCK}
+        ):
+            command = previous.normalized_arguments.get("command", "the command")
+            reason = (
+                f"This exact command already failed at the current workspace revision: "
+                f"{command}. Its result is available as evidence, so reproduction is complete. "
+                "Do not run it again; inspect or repair the cause before another command."
             )
         if previous is not None and disposition == DuplicateDisposition.REQUIRE_ALTERNATIVE:
             recovery = self.action_registry.recovery_for(
@@ -3206,6 +3389,7 @@ class AgentController:
                 "instruction": reason,
             },
         )
+        state.record_protocol_failure(reason)
         self._save_memory(memory, state, status=self._active_memory_status(state))
         return True, None
 
@@ -3755,6 +3939,74 @@ class AgentController:
         ):
             return None
         return result
+
+    @staticmethod
+    def _decision_repeats_failed_execution(
+        call: ToolCall,
+        *,
+        state: SessionState,
+    ) -> bool:
+        """Reject a decision that would immediately replay unchanged failed evidence."""
+        if call.name != "record_decision":
+            return False
+        if call.arguments.get("phase") != ReasoningPhase.DECISION.value:
+            return False
+        next_tool = call.arguments.get("next_tool")
+        if next_tool == "run_verification":
+            return any(
+                result.workspace_revision == state.workspace_revision
+                and result.status in {VerificationStatus.FAILED, VerificationStatus.ERROR}
+                for result in state.verification_results.values()
+            )
+        if next_tool != "run_command" or state.runtime is None:
+            return False
+        argument_summary = call.arguments.get("next_tool_argument_summary")
+        if not isinstance(argument_summary, str):
+            return False
+        normalized_summary = " ".join(argument_summary.split())
+        return any(
+            action.tool_name == "run_command"
+            and action.status == ActionStatus.FAILED
+            and action.revisions.workspace == state.workspace_revision
+            and isinstance(action.normalized_arguments.get("command"), str)
+            and " ".join(str(action.normalized_arguments["command"]).split())
+            in normalized_summary
+            for action in state.runtime.actions.values()
+        )
+
+    def _failed_command_replayed_as_verification(
+        self,
+        call: ToolCall,
+        *,
+        state: SessionState,
+    ) -> ActionRecord | None:
+        """Find a same-revision raw command failure covered by a newly registered check."""
+        if call.name != "run_verification" or state.runtime is None:
+            return None
+        check_id = call.arguments.get("check_id")
+        if not isinstance(check_id, str):
+            return None
+        for action in reversed(list(state.runtime.actions.values())):
+            if (
+                action.tool_name != "run_command"
+                or action.status != ActionStatus.FAILED
+                or action.revisions.workspace != state.workspace_revision
+            ):
+                continue
+            command = action.normalized_arguments.get("command")
+            cwd = action.normalized_arguments.get("cwd", ".")
+            if not isinstance(command, str) or not isinstance(cwd, str):
+                continue
+            try:
+                if self.verification_runtime.command_matches(
+                    check_id,
+                    command=command,
+                    cwd=cwd,
+                ):
+                    return action
+            except ValueError:
+                return None
+        return None
 
     def _handle_final_response(
         self,
@@ -4507,6 +4759,22 @@ class AgentController:
         memory: MemoryState,
     ) -> None:
         """Turn a rejected mutating batch into one constrained recovery sequence."""
+        current_step = (
+            memory.plan_artifact.current_step
+            if memory.plan_artifact is not None
+            and memory.plan_artifact.status == PlanStatus.EXECUTING
+            else None
+        )
+        contract = self._plan_step_action_contract(current_step)
+        required_tool = contract.get("tool") if contract is not None else None
+        if isinstance(required_tool, str):
+            # An approved plan step is already the action authority. Batch recovery must
+            # constrain the provider to that step, not invent an unnecessary decision turn.
+            state.pending_decision = None
+            memory.verification_plan_recovery_decision = None
+            state.required_protocol_tool = required_tool
+            return
+
         matching_calls = (
             [
                 call
@@ -4536,17 +4804,7 @@ class AgentController:
             state.required_protocol_tool = "record_decision"
             return
 
-        current_step = (
-            memory.plan_artifact.current_step
-            if memory.plan_artifact is not None
-            and memory.plan_artifact.status == PlanStatus.EXECUTING
-            else None
-        )
-        contract = self._plan_step_action_contract(current_step)
-        required_tool = contract.get("tool") if contract is not None else None
-        if isinstance(required_tool, str):
-            state.required_protocol_tool = required_tool
-        elif len(calls) == 1:
+        if len(calls) == 1:
             state.required_protocol_tool = calls[0].name
 
     def _completed_plan_step_for_call(

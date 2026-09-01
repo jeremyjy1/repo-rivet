@@ -20,11 +20,16 @@ repair through the normal editing, approval, and verification controls.
 # Procedure
 
 1. Identify the existing test entry point and capture the reported failure or reproduce it when
-   execution is appropriate and dependencies are already available.
+   execution is appropriate and dependencies are already available. A pre-repair command expected
+   to fail is observation evidence, not a required final verification check.
 2. Read the failing test and the smallest implementation surface it exercises.
 3. State a bounded diagnosis tied to observed output and source evidence.
 4. Register a required `test` verification check with a deterministic oracle before claiming the
-   repair is complete. Add build or behavior checks only when they independently match the task.
+   repair is complete. Registration is metadata, not execution: if the same command already
+   reproduced the failure at the current workspace revision, repair first and run it only after
+   the workspace changes. Required test and build checks must accept exit code 0; use `run_command`
+   or `required=false` for an expected non-zero reproduction. Add build or behavior checks only
+   when they independently match the task.
 5. Edit only the files supported by the diagnosis, using current snapshots and seen ranges.
 6. Run the narrow failing check first, then the relevant broader suite when its cost is reasonable.
 7. After the last edit, ensure required results belong to the current workspace revision and inspect

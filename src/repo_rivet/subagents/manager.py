@@ -63,8 +63,12 @@ You are not the parent agent and must not broaden or complete the parent task.
 Use only the tools provided to inspect the explicitly allowed paths. You cannot modify files,
 run commands, request approval, ask the user, or spawn another subagent. Treat the objective and
 deliverable as a strict contract. Every material finding must cite an evidence_ref returned by a
-tool. Do not invent evidence, snapshots, files, or verification results. Finish only by calling
-submit_subagent_report exactly once. A normal text response is not a valid report.
+tool. When the task names exact allowed files, read those paths instead of guessing alternatives.
+Once the requested evidence is sufficient, submit the report without redundant searches or
+rereads. Keep the complete serialized report below 4,000 characters; prefer a few concise,
+evidence-backed findings over a catalog of every assertion. Do not invent evidence, snapshots,
+files, or verification results. Finish only by calling submit_subagent_report exactly once. A
+normal text response is not a valid report.
 """
 
 
@@ -201,8 +205,6 @@ class SubagentManager:
             scope_paths=request.scope_paths,
         )
         collector = SubagentReportCollector(request.delegation_id)
-        registry = self._registry(request, child_directory, collector)
-        child_events = CompositeEventSink(child_store)
         config = profile_runtime_config(
             request.profile,
             request.scope_paths,
@@ -214,14 +216,22 @@ class SubagentManager:
             session_id=subagent_id,
             config=MemoryConfig(
                 recent_message_limit=8,
-                max_context_tokens=12_000,
-                active_prompt_limit=12_000,
+                max_context_tokens=20_000,
+                active_prompt_limit=20_000,
                 reserved_output_tokens=2_048,
                 reserved_tool_result_tokens=512,
                 max_tool_output_chars=8_000,
             ),
             workspace_revision=request.base_workspace_revision,
         )
+        registry = self._registry(
+            request,
+            child_directory,
+            collector,
+            child_store=child_store,
+            child_memory=memory,
+        )
+        child_events = CompositeEventSink(child_store)
         controller = AgentController(
             model_client=self.model_client_factory(child_events),
             tool_registry=registry,
@@ -348,6 +358,9 @@ class SubagentManager:
         request: DelegationRequest,
         child_directory: Path,
         collector: SubagentReportCollector,
+        *,
+        child_store: MemoryStore,
+        child_memory: MemoryState,
     ) -> ToolRegistry:
         policy = ScopedWorkspacePathPolicy(
             self.workspace,
@@ -375,6 +388,8 @@ class SubagentManager:
                 self.parent_store,
                 self._memory(),
                 request.evidence_refs,
+                child_store=child_store,
+                child_memory=child_memory,
             ),
             "read_verification_result": ReadVerificationResultTool(
                 self._memory(),

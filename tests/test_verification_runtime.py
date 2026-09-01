@@ -139,6 +139,17 @@ def test_build_fails_when_compiler_exits_nonzero(
     assert result.metadata["verification_result"]["status"] == "failed"
 
 
+@pytest.mark.parametrize("kind", ["test", "build"])
+def test_required_test_or_build_rejects_expected_failure_exit_code(
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    value = runtime(tmp_path)
+
+    with pytest.raises(ValueError, match="must accept exit code 0"):
+        register(value, kind=kind, criteria={"expected_exit_codes": [1]})
+
+
 def test_smoke_check_can_pass_from_declared_exit_criteria(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

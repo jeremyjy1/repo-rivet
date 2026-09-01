@@ -82,12 +82,13 @@ class ReadToolOutputArguments(BaseModel):
 
 
 class ReadToolOutputTool(BaseTool[ReadToolOutputArguments]):
-    """Read a bounded persisted output explicitly delegated by the parent."""
+    """Read bounded delegated parent evidence or evidence produced by this child."""
 
     name = "read_tool_output"
     description = (
-        "Read the persisted full output for one parent observation listed in evidence_refs. "
-        "The result is bounded and cannot access arbitrary parent-session files."
+        "Read the persisted full output for either a parent observation listed in evidence_refs "
+        "or an observation produced earlier in this child run. The result is bounded and cannot "
+        "access arbitrary session files."
     )
     arguments_type = ReadToolOutputArguments
 
@@ -96,19 +97,34 @@ class ReadToolOutputTool(BaseTool[ReadToolOutputArguments]):
         parent_store: MemoryStore,
         parent_memory: MemoryState,
         allowed_evidence_refs: list[str],
+        *,
+        child_store: MemoryStore | None = None,
+        child_memory: MemoryState | None = None,
     ) -> None:
         self.parent_store = parent_store
         self.parent_memory = parent_memory
         self.allowed_evidence_refs = frozenset(allowed_evidence_refs)
+        self.child_store = child_store
+        self.child_memory = child_memory
 
     def run(self, arguments: ReadToolOutputArguments) -> ToolResult:
         reference = arguments.evidence_ref
+        store = self.parent_store
+        memory = self.parent_memory
         if reference not in self.allowed_evidence_refs:
-            raise ValueError(f"Evidence was not delegated to this subagent: {reference}")
+            child_observations = (
+                self.child_memory.observation_events if self.child_memory is not None else []
+            )
+            if not any(event.event_id == reference for event in child_observations):
+                raise ValueError(f"Evidence was not delegated to this subagent: {reference}")
+            if self.child_store is None or self.child_memory is None:
+                raise ValueError(f"Child evidence store is unavailable: {reference}")
+            store = self.child_store
+            memory = self.child_memory
         observation = next(
             (
                 event
-                for event in self.parent_memory.observation_events
+                for event in memory.observation_events
                 if event.event_id == reference
             ),
             None,
@@ -117,10 +133,10 @@ class ReadToolOutputTool(BaseTool[ReadToolOutputArguments]):
             raise ValueError(f"Delegated evidence is not a tool observation: {reference}")
         if not observation.output_ref:
             raise ValueError(f"Delegated observation has no persisted full output: {reference}")
-        output_path = (self.parent_store.session_dir / observation.output_ref).resolve()
+        output_path = (store.session_dir / observation.output_ref).resolve()
         allowed_roots = (
-            self.parent_store.command_output_dir.resolve(),
-            self.parent_store.file_snapshot_dir.resolve(),
+            store.command_output_dir.resolve(),
+            store.file_snapshot_dir.resolve(),
         )
         if not any(output_path.is_relative_to(root) for root in allowed_roots):
             raise ValueError(f"Invalid persisted output reference: {reference}")
